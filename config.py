@@ -38,8 +38,12 @@ WORD_MODELS = [
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
 ]
-CHUNK_SIZE         = 25
 MAX_WORD_TOKENS    = 65_536
+MAX_WORD_WORKERS   = 4         # số chunk dịch song song
+CHUNK_RETRIES      = 3         # số lần retry mỗi chunk khi lỗi
+TARGET_CHUNK_CHARS = 8_000     # mục tiêu ký tự / chunk (adaptive)
+MIN_CHUNK_BLOCKS   = 8         # tối thiểu paragraph / chunk
+MAX_CHUNK_BLOCKS   = 40        # tối đa paragraph / chunk
 NO_TRANSLATE_ROLES = {"header", "footer"}
 
 # ── Ngôn ngữ ──────────────────────────────────────────────────────────────────

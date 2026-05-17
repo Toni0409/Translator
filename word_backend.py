@@ -1,22 +1,29 @@
 """
-Word backend: extract DOCX paragraphs, gọi Gemini (có fallback chain),
-ghi lại DOCX giữ nguyên format runs.
+Word backend: extract DOCX paragraphs, gọi Gemini (fallback chain + retry +
+parallel chunks), ghi lại DOCX giữ nguyên format runs.
 
 3 nhóm logic:
-1. Extract  : `extract_docx_blocks`, `iter_all_paragraphs`, `_detect_role`
-2. Translate: `translate_chunk`, `call_gemini` (model fallback)
+1. Extract  : `extract_docx_blocks`, `iter_all_paragraphs`, `_detect_role`,
+              `chunk_blocks` (adaptive theo char count)
+2. Translate: `translate_chunk` (raw, raises), `translate_chunk_with_retry`,
+              `translate_parallel` (background worker entry)
 3. Render   : `apply_translations`, `replace_paragraph_text_keep_format`
 """
 import io
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from docx import Document
 
-from config import WORD_MODELS, MAX_WORD_TOKENS, NO_TRANSLATE_ROLES
-from gemini import generate, parse_json_loose
+from config import (
+    WORD_MODELS, MAX_WORD_TOKENS, NO_TRANSLATE_ROLES,
+    CHUNK_RETRIES, TARGET_CHUNK_CHARS, MIN_CHUNK_BLOCKS, MAX_CHUNK_BLOCKS,
+)
+from gemini import generate, usage_tokens, parse_json_loose
 
 
-# Module-level cache cho model đang work (persist giữa các Streamlit rerun)
+# Module-level cache cho model đang work (persist giữa các Streamlit rerun + thread)
 _working_model: list = [None]
 
 
@@ -173,10 +180,42 @@ def build_doc_context(blocks: list[dict]) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TRANSLATE
+# ADAPTIVE CHUNKING — chia theo char count, có min/max paragraph count
 # ══════════════════════════════════════════════════════════════════════════════
-def call_gemini(client, prompt: str) -> str:
-    """Gọi Gemini với fallback chain. Cache model đang work để skip retry."""
+def chunk_blocks(blocks: list[dict],
+                 target_chars: int = TARGET_CHUNK_CHARS,
+                 min_count: int   = MIN_CHUNK_BLOCKS,
+                 max_count: int   = MAX_CHUNK_BLOCKS) -> list[list[dict]]:
+    """
+    Chia list block thành chunks sao cho:
+    - Mỗi chunk có tổng char ~ target_chars
+    - Tối thiểu min_count, tối đa max_count paragraph / chunk
+    """
+    chunks: list[list[dict]] = []
+    current: list[dict]      = []
+    cur_chars = 0
+    for b in blocks:
+        size = len(b["text"]) + 30   # +overhead JSON wrapping
+        full = (cur_chars + size > target_chars and len(current) >= min_count) \
+               or len(current) >= max_count
+        if current and full:
+            chunks.append(current)
+            current, cur_chars = [], 0
+        current.append(b)
+        cur_chars += size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GEMINI CALL với fallback chain + token tracking
+# ══════════════════════════════════════════════════════════════════════════════
+def call_gemini(client, prompt: str) -> tuple[str, int, int]:
+    """
+    Gọi Gemini với fallback chain. Trả về (text, in_tokens, out_tokens).
+    Raise RuntimeError nếu tất cả model đều fail.
+    """
     models = ([_working_model[0]] if _working_model[0] else []) + \
              [m for m in WORD_MODELS if m != _working_model[0]]
     last_err = "no models"
@@ -188,8 +227,9 @@ def call_gemini(client, prompt: str) -> str:
             if not text:
                 last_err = "empty response"
                 continue
+            in_t, out_t = usage_tokens(resp)
             _working_model[0] = model
-            return text
+            return text, in_t, out_t
         except Exception as e:
             last_err = str(e)
     raise RuntimeError(f"All Word models failed: {last_err}")
@@ -199,14 +239,16 @@ def get_working_model() -> str | None:
     return _working_model[0]
 
 
-def translate_chunk(client, chunk: list[dict], target_lang: str, doc_context: str) -> dict:
-    """Dịch 1 chunk (list block) → dict[block_id -> translated_text]."""
+# ══════════════════════════════════════════════════════════════════════════════
+# TRANSLATE chunk (raw + retry)
+# ══════════════════════════════════════════════════════════════════════════════
+def _build_chunk_prompt(chunk: list[dict], target_lang: str, doc_context: str) -> str:
     payload = json.dumps(
         [{"id": b["id"], "text": b["text"], "role": b.get("role", "paragraph")}
          for b in chunk],
         ensure_ascii=False,
     )
-    prompt = f"""Translate these Word document blocks into {target_lang}.
+    return f"""Translate these Word document blocks into {target_lang}.
 
 Document context:
 {doc_context}
@@ -230,20 +272,96 @@ Format:
 
 Blocks:
 {payload}"""
+
+
+def translate_chunk(client, chunk: list[dict], target_lang: str,
+                    doc_context: str) -> tuple[dict, int, int]:
+    """
+    Dịch 1 chunk → (translations_dict, in_tokens, out_tokens).
+    RAISE exception nếu API fail. Block bị model bỏ sót → fallback giữ text gốc.
+    """
+    prompt = _build_chunk_prompt(chunk, target_lang, doc_context)
+    raw, in_t, out_t = call_gemini(client, prompt)
+    parsed = parse_json_loose(raw) or []
+    if not isinstance(parsed, list):
+        parsed = []
+    result = {}
+    for item in parsed:
+        if isinstance(item, dict) and item.get("id") and item.get("text") is not None:
+            result[item["id"]] = str(item["text"])
+    for b in chunk:
+        result.setdefault(b["id"], b["text"])
+    return result, in_t, out_t
+
+
+def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
+                               doc_context: str,
+                               retries: int = CHUNK_RETRIES
+                               ) -> tuple[dict, int, int, str | None]:
+    """
+    Wrapper với exponential backoff. Trả về (translations, in_t, out_t, error).
+    Nếu hết retries → fallback giữ text gốc + error message.
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            t, in_t, out_t = translate_chunk(client, chunk, target_lang, doc_context)
+            return t, in_t, out_t, None
+        except Exception as e:
+            last_err = str(e)
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)   # 1s, 2s, 4s
+    return {b["id"]: b["text"] for b in chunk}, 0, 0, last_err
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARALLEL TRANSLATION — entry point cho background thread
+# ══════════════════════════════════════════════════════════════════════════════
+def translate_parallel(holder: dict, client,
+                       chunks: list[list[dict]],
+                       target_lang: str, doc_context: str,
+                       max_workers: int):
+    """
+    Background worker: dịch nhiều chunk song song với ThreadPoolExecutor.
+
+    `holder` (dict shared với main thread) sẽ được update:
+    - translations  : dict {block_id -> translated_text}
+    - tok_in/tok_out: cumulative tokens
+    - chunk_done    : số chunk đã xong
+    - chunk_log     : list per-chunk result (đẩy thêm khi mỗi chunk xong)
+    - done          : True khi xong tất cả
+    - error         : str nếu fatal error
+    """
     try:
-        raw    = call_gemini(client, prompt)
-        parsed = parse_json_loose(raw) or []
-        if not isinstance(parsed, list):
-            parsed = []
-        result = {}
-        for item in parsed:
-            if isinstance(item, dict) and item.get("id") and item.get("text") is not None:
-                result[item["id"]] = str(item["text"])
-        for b in chunk:
-            result.setdefault(b["id"], b["text"])  # fallback giữ text gốc
-        return result
-    except Exception:
-        return {b["id"]: b["text"] for b in chunk}
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(translate_chunk_with_retry,
+                          client, c, target_lang, doc_context): (i, c)
+                for i, c in enumerate(chunks)
+            }
+            for future in as_completed(futures):
+                idx, chunk = futures[future]
+                try:
+                    result, in_t, out_t, err = future.result()
+                except Exception as e:
+                    result, in_t, out_t, err = (
+                        {b["id"]: b["text"] for b in chunk}, 0, 0, str(e)
+                    )
+                holder["translations"].update(result)
+                holder["tok_in"]  += in_t
+                holder["tok_out"] += out_t
+                holder["chunk_log"].append({
+                    "idx":   idx,
+                    "size":  len(chunk),
+                    "in_t":  in_t,
+                    "out_t": out_t,
+                    "error": err,
+                })
+                holder["chunk_done"] += 1
+        holder["done"] = True
+    except Exception as e:
+        holder["error"] = str(e)
+        holder["done"]  = True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -270,3 +388,18 @@ def apply_translations(original_bytes: bytes, blocks: list[dict],
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
+
+
+def find_missed(blocks: list[dict], translations: dict) -> list[dict]:
+    """
+    Trả về list block chưa được dịch (translation rỗng hoặc bằng text gốc).
+    Bỏ qua header/footer.
+    """
+    missed = []
+    for b in blocks:
+        if b["role"] in NO_TRANSLATE_ROLES:
+            continue
+        tr = translations.get(b["id"], "")
+        if not tr or tr == b["text"]:
+            missed.append(b)
+    return missed

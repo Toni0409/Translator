@@ -1,5 +1,14 @@
-"""UI helpers dùng chung cho cả 2 tab: timer box, log adder, stat box."""
+"""UI helpers dùng chung cho cả 2 tab: timer box, log adder, stat box, cost."""
 from datetime import datetime
+
+from config import PRICE_INPUT, PRICE_OUTPUT, USD_TO_VND
+
+
+def calc_cost(tok_in: int, tok_out: int) -> tuple[float, float]:
+    """Quy đổi token → (USD, VND). PDF + Word dùng chung công thức."""
+    usd = ((tok_in / 1e6) * PRICE_INPUT + (tok_out / 1e6) * PRICE_OUTPUT) * 10
+    vnd = usd * USD_TO_VND
+    return usd, vnd
 
 
 def timer_box_html(elapsed: float, status: str,

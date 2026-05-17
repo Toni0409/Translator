@@ -6,24 +6,16 @@ import tempfile
 import streamlit as st
 import fitz
 
-from config import (
-    LANGUAGES, PRICE_INPUT, PRICE_OUTPUT, USD_TO_VND, PDF_DELAY, PDF_MODEL,
-)
+from config import LANGUAGES, PDF_DELAY, PDF_MODEL
 from gemini import get_client
 from ui_common import (
     timer_box_html, timer_done_html, timer_error_html,
-    stat_box_html, make_log_adder,
+    stat_box_html, make_log_adder, calc_cost,
 )
 from pdf_backend import (
     extract_line_groups, parse_page_range, find_font,
     translate_page, write_translated_pdf,
 )
-
-
-def _calc_cost(tok_in: int, tok_out: int) -> tuple[float, float]:
-    usd = ((tok_in / 1e6) * PRICE_INPUT + (tok_out / 1e6) * PRICE_OUTPUT) * 10
-    vnd = usd * USD_TO_VND
-    return usd, vnd
 
 
 def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s):
@@ -35,7 +27,7 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s):
                                      col_usd.empty(), col_vnd.empty())
 
     def render_stats(pages_done, total_pg, total_lines, tok_in, tok_out):
-        usd, vnd = _calc_cost(tok_in, tok_out)
+        usd, vnd = calc_cost(tok_in, tok_out)
         ph_pg.markdown(stat_box_html(f"{pages_done}/{total_pg}", "Trang"), unsafe_allow_html=True)
         ph_ln.markdown(stat_box_html(f"{total_lines:,}", "Dòng text"), unsafe_allow_html=True)
         ph_usd.markdown(stat_box_html(f"${usd:.4f}", "USD"), unsafe_allow_html=True)
@@ -123,7 +115,7 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s):
         write_translated_pdf(src_path, dst_path, all_groups, all_trans, font_path)
 
         elapsed  = time.time() - t0
-        usd, vnd = _calc_cost(tok_in, tok_out)
+        usd, vnd = calc_cost(tok_in, tok_out)
         render_stats(len(targets), total_pg, total_lines, tok_in, tok_out)
         prog.progress(100, text="✅ Hoàn thành!")
         timer_ph.markdown(

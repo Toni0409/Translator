@@ -4,8 +4,9 @@ App Streamlit dịch file **PDF** và **Microsoft Word (.docx)** sang nhiều ng
 bằng **Gemini**, giữ nguyên layout / format gốc.
 
 - 📄 **PDF**: extract text spans → dịch → ghi lại đúng vị trí + font + màu + bold
-- 📝 **Word**: extract paragraph → dịch theo chunk (model fallback) → giữ nguyên run format
-- 🔐 Password protection · ⏱ Live timer · 🔁 Retry với exponential backoff
+- 📝 **Word**: extract paragraph → dịch chunk **song song (4 luồng)** với per-chunk retry
+  → giữ format → **preview + sửa inline** + **rescan đoạn bỏ sót**
+- 🔐 Password protection · ⏱ Live timer · 🔁 Exponential backoff · 💵 Cost tracking
 
 ---
 
@@ -82,10 +83,28 @@ streamlit_app.py
 | Đổi Gemini model | `config.py` → `PDF_MODEL`, `WORD_MODELS` |
 | Thêm ngôn ngữ | `config.py` → `LANGUAGES`, `LANG_EN` |
 | Đổi giá / tỉ giá | `config.py` → `PRICE_INPUT`, `PRICE_OUTPUT`, `USD_TO_VND` |
-| Đổi chunk size Word | `config.py` → `CHUNK_SIZE` |
+| Đổi chunk size Word | `config.py` → `TARGET_CHUNK_CHARS`, `MIN_CHUNK_BLOCKS`, `MAX_CHUNK_BLOCKS` |
+| Đổi số luồng song song Word | `config.py` → `MAX_WORD_WORKERS` |
+| Đổi số lần retry mỗi chunk | `config.py` → `CHUNK_RETRIES` |
 | Đổi theme / màu | `styles.py` |
 | Tinh chỉnh prompt PDF | `pdf_backend.py` → `translate_page` |
 | Tinh chỉnh prompt Word | `word_backend.py` → `translate_chunk` |
+
+---
+
+## ⚡ Tab Word — chi tiết tính năng
+
+| Feature | Mô tả |
+|---|---|
+| **Parallel chunks** | `ThreadPoolExecutor` dịch 4 chunk cùng lúc → giảm thời gian ~4× |
+| **Adaptive chunking** | Chia theo ký tự (~8k chars/chunk) thay vì fixed 25 paragraphs |
+| **Per-chunk retry** | Mỗi chunk fail sẽ retry tối đa 3 lần với backoff 1s/2s/4s |
+| **Model fallback** | `gemini-2.5-flash-lite` → `flash` → `2.0-flash` → ... |
+| **Token + cost** | Cộng dồn input/output tokens → quy đổi USD/VND realtime |
+| **Inline edit** | Sau khi dịch, hiện bảng `data_editor` — sửa trực tiếp bản dịch |
+| **Quét bỏ sót** | Phát hiện đoạn API fail (translation == original) → dịch lại |
+| **Auto-detect role** | Heading / TOC / bullet / table_cell → prompt phù hợp từng loại |
+| **Skip header/footer** | Giữ nguyên (cấu hình tại `NO_TRANSLATE_ROLES`) |
 
 ---
 
@@ -95,6 +114,7 @@ streamlit_app.py
 - `google-genai` — Gemini SDK
 - `pymupdf` (fitz) — PDF parsing + writing
 - `python-docx` — DOCX parsing + writing
+- `pandas` — data_editor cho tab Word
 
 ---
 
