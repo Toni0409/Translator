@@ -45,27 +45,111 @@ def _int_to_rgb(c: int) -> tuple[float, float, float]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TABLE DETECTION — qua PyMuPDF page.find_tables()
+# ══════════════════════════════════════════════════════════════════════════════
+def detect_tables_on_page(page) -> list[dict]:
+    """
+    Phát hiện bảng trên page bằng `page.find_tables()`.
+    Trả về list of dicts:
+        [{'bbox': (x0,y0,x1,y1),
+          'cells': [{'bbox': (...), 'row': r, 'col': c}, ...],
+          'rows': N, 'cols': M}]
+    Trả [] nếu PyMuPDF version cũ hoặc không có bảng.
+    """
+    try:
+        finder = page.find_tables()
+    except Exception:
+        return []
+
+    try:
+        table_list = list(finder)
+    except Exception:
+        table_list = []
+
+    out = []
+    for tab in table_list:
+        try:
+            tbbox = tuple(tab.bbox)
+        except Exception:
+            continue
+        cells: list[dict] = []
+        rows = cols = 0
+        # Newer PyMuPDF: tab.rows[i].cells[j] = bbox tuple
+        try:
+            for r_idx, row in enumerate(tab.rows):
+                for c_idx, cbb in enumerate(row.cells):
+                    if cbb:
+                        cells.append({"bbox": tuple(cbb), "row": r_idx, "col": c_idx})
+                rows = max(rows, r_idx + 1)
+                cols = max(cols, len(row.cells))
+        except (AttributeError, TypeError):
+            # Fallback: tab.cells = flat list of bbox tuples
+            try:
+                for cbb in tab.cells:
+                    if cbb:
+                        cells.append({"bbox": tuple(cbb), "row": -1, "col": -1})
+            except Exception:
+                pass
+        if cells:
+            out.append({"bbox": tbbox, "cells": cells, "rows": rows, "cols": cols})
+    return out
+
+
+def find_cell_info(line_bbox: tuple, tables: list[dict]) -> dict | None:
+    """
+    Map 1 line bbox → cell info nó nằm trong (nếu có).
+    Trả về {'table': N, 'row': R, 'col': C} (1-based) hoặc None.
+    Dùng tâm dòng để check, tolerance với bbox overlap.
+    """
+    cx = (line_bbox[0] + line_bbox[2]) / 2
+    cy = (line_bbox[1] + line_bbox[3]) / 2
+    for ti, table in enumerate(tables):
+        tx0, ty0, tx1, ty1 = table["bbox"]
+        if not (tx0 <= cx <= tx1 and ty0 <= cy <= ty1):
+            continue
+        for cell in table["cells"]:
+            cx0, cy0, cx1, cy1 = cell["bbox"]
+            if cx0 <= cx <= cx1 and cy0 <= cy <= cy1:
+                return {
+                    "table": ti + 1,
+                    "row":   cell["row"] + 1 if cell["row"] >= 0 else 0,
+                    "col":   cell["col"] + 1 if cell["col"] >= 0 else 0,
+                }
+        # Trong table nhưng không khớp cell → vẫn đánh dấu là cell mơ hồ
+        return {"table": ti + 1, "row": 0, "col": 0}
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # EXTRACT
 # ══════════════════════════════════════════════════════════════════════════════
 def extract_line_groups(pdf_path: str, page_nums: list[int] | None = None):
     """
     Trích các "line group" từ PDF — mỗi group là 1 dòng text với bbox, font size,
-    color, bold flag. Trả về (dict[page_idx -> list[group]], total_pages).
+    color, bold flag, và optional `cell` info {table, row, col}.
+
+    Trả về (groups_per_page, total_pages, table_stats):
+      - groups_per_page : dict[page_idx -> list[group]]
+      - total_pages     : int
+      - table_stats     : dict[page_idx -> {'tables': N, 'cell_lines': M}]
     """
-    result = {}
-    doc    = fitz.open(pdf_path)
-    total  = len(doc)
-    targets = page_nums if page_nums else list(range(total))
+    result:      dict = {}
+    table_stats: dict = {}
+    doc          = fitz.open(pdf_path)
+    total        = len(doc)
+    targets      = page_nums if page_nums else list(range(total))
 
     for pi in targets:
         if not (0 <= pi < total):
             continue
-        page = doc[pi]
-        data = page.get_text(
+        page   = doc[pi]
+        tables = detect_tables_on_page(page)
+        data   = page.get_text(
             "dict",
             flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_MEDIABOX_CLIP,
         )
         groups = []
+        cell_lines = 0
         for block in data["blocks"]:
             if block.get("type") != 0:
                 continue
@@ -76,22 +160,33 @@ def extract_line_groups(pdf_path: str, page_nums: list[int] | None = None):
                 merged = "".join(sp["text"] for sp in spans).strip()
                 if not merged:
                     continue
+                bbox = (
+                    min(sp["bbox"][0] for sp in spans),
+                    min(sp["bbox"][1] for sp in spans),
+                    max(sp["bbox"][2] for sp in spans),
+                    max(sp["bbox"][3] for sp in spans),
+                )
+                cell = find_cell_info(bbox, tables) if tables else None
+                if cell:
+                    cell_lines += 1
                 groups.append({
-                    "bbox": (
-                        min(sp["bbox"][0] for sp in spans),
-                        min(sp["bbox"][1] for sp in spans),
-                        max(sp["bbox"][2] for sp in spans),
-                        max(sp["bbox"][3] for sp in spans),
-                    ),
+                    "bbox": bbox,
                     "text": merged,
                     "size": max(sp["size"] for sp in spans),
                     "rgb":  _int_to_rgb(spans[0]["color"]),
                     "bold": any(bool(sp["flags"] & (1 << 4)) for sp in spans),
+                    "cell": cell,
                 })
-        result[pi] = groups
+
+        # Sort theo (y0, x0) — reading order tự nhiên: top-to-bottom, left-to-right.
+        # Trong table, các cell cùng row có y0 gần nhau → sắp xếp tốt theo cột.
+        groups.sort(key=lambda g: (round(g["bbox"][1], 1), g["bbox"][0]))
+
+        result[pi]      = groups
+        table_stats[pi] = {"tables": len(tables), "cell_lines": cell_lines}
 
     doc.close()
-    return result, total
+    return result, total, table_stats
 
 
 def parse_page_range(s: str, total: int) -> list[int]:
@@ -233,14 +328,37 @@ def call_gemini_live(client, prompt: str, timer_ph, t0: float, page_start: float
             raise err
 
 
+def _format_group_for_prompt(i: int, g: dict) -> str:
+    """Format 1 line group cho prompt — thêm (T# R# C#) nếu là cell trong bảng."""
+    cell = g.get("cell")
+    if cell and cell["row"] > 0 and cell["col"] > 0:
+        return f"[{i}] (T{cell['table']} R{cell['row']} C{cell['col']}) {g['text']}"
+    elif cell:
+        return f"[{i}] (T{cell['table']}) {g['text']}"
+    return f"[{i}] {g['text']}"
+
+
 def translate_page(client, groups: list, target_lang: str, page_idx: int,
                    timer_ph, t0: float, page_start: float,
                    log_lines: list, log_ph):
     """Dịch 1 trang PDF (1 list line groups) → list[str] cùng độ dài."""
-    numbered = "\n".join(f"[{i}] {g['text']}" for i, g in enumerate(groups))
+    numbered     = "\n".join(_format_group_for_prompt(i, g) for i, g in enumerate(groups))
+    has_tables   = any(g.get("cell") for g in groups)
+    table_hint   = (
+        "\nMột số dòng có dạng (T# R# C#) — đó là cell trong bảng "
+        "(T = số bảng, R = row, C = column).\n"
+        "Khi dịch các cell bảng:\n"
+        "- Cell cùng cột → dịch consistent, dùng cùng thuật ngữ\n"
+        "- Header row (R1) → dịch ngắn gọn, súc tích như tiêu đề cột\n"
+        "- Giá trị số / ngày tháng / đơn vị (mm, kg, V, %) → GIỮ NGUYÊN\n"
+        "- Mã / serial / model code → GIỮ NGUYÊN\n"
+        if has_tables else ""
+    )
     prompt = (
         f"Dịch sang {target_lang}. Giữ nguyên số thứ tự [0]...[{len(groups)-1}].\n"
-        f"Trả về JSON object, ĐẦY ĐỦ từ \"0\" đến \"{len(groups)-1}\", không bỏ sót:\n"
+        f"{table_hint}"
+        f"Trả về JSON object, ĐẦY ĐỦ từ \"0\" đến \"{len(groups)-1}\", không bỏ sót.\n"
+        f"KHÔNG kèm prefix (T# R# C#) trong bản dịch — chỉ trả về text đã dịch:\n"
         f"{{\"0\": \"bản dịch\", \"1\": \"bản dịch\", ...}}\n"
         f"Chỉ JSON, không giải thích.\n\n"
         f"{numbered}"

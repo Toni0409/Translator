@@ -24,7 +24,7 @@ from ui_common import (
 from word_backend import (
     extract_docx_blocks, build_doc_context, chunk_blocks,
     translate_parallel, apply_translations, find_missed,
-    get_working_model,
+    get_working_model, count_by_role,
 )
 
 
@@ -142,12 +142,18 @@ def _run_full_translation(uploaded_docx, lang_word):
 
         add_log("🔍 Phân tích cấu trúc tài liệu...")
         blocks       = extract_docx_blocks(docx_bytes)
+        stats        = count_by_role(blocks)
         translatable = [b for b in blocks if b["role"] not in NO_TRANSLATE_ROLES]
-        hf_count     = len(blocks) - len(translatable)
-        toc_count    = sum(1 for b in blocks if b["role"] == "toc")
         total_chars  = sum(len(b["text"]) for b in translatable)
-        add_log(f"✅ {len(blocks):,} đoạn ({total_chars:,} ký tự): "
-                f"{len(translatable):,} cần dịch, {toc_count} TOC, {hf_count} header/footer")
+
+        add_log(f"✅ {stats['total']:,} đoạn ({total_chars:,} ký tự body)")
+        add_log(f"   • Body cần dịch:    {stats['body']:,}")
+        add_log(f"   • Header (real):    {stats['header']:,}")
+        add_log(f"   • Footer (real):    {stats['footer']:,}")
+        add_log(f"   • Body lặp (H/F-like): {stats['body_repeated']:,} "
+                f"(phát hiện qua text lặp ≥3 lần)")
+        if stats['hf_total'] > 0:
+            add_log(f"⏭  Tạm thời bỏ qua {stats['hf_total']:,} H/F — bấm nút riêng sau khi xong")
 
         doc_context = build_doc_context(blocks)
         target_lang = LANG_EN[lang_word]
@@ -276,6 +282,76 @@ def _run_rescan():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# HEADER/FOOTER TRANSLATION — chạy khi user bấm nút "Dịch H/F"
+# ══════════════════════════════════════════════════════════════════════════════
+def _run_hf_translation():
+    """Dịch tất cả H/F + body_repeated block chưa được dịch."""
+    blocks       = st.session_state["word_blocks"]
+    translations = st.session_state["word_translations"]
+    doc_context  = st.session_state["word_doc_context"]
+    target_lang  = LANG_EN[st.session_state["word_lang"]]
+
+    hf_missed = find_missed(blocks, translations, hf_only=True)
+    if not hf_missed:
+        st.info("✨ Tất cả Header/Footer đã được dịch!")
+        return
+
+    st.markdown(f"### 🌐 Dịch Header & Footer — {len(hf_missed):,} đoạn")
+    timer_ph = st.empty()
+    col_hf, col_ck, col_usd, col_vnd = st.columns(4)
+    ph_hf, ph_ck, ph_usd, ph_vnd = (col_hf.empty(), col_ck.empty(),
+                                     col_usd.empty(), col_vnd.empty())
+
+    def render_stats(total_bl, num_chunks, done_chunks, tok_in, tok_out):
+        usd, vnd = calc_cost(tok_in, tok_out)
+        ph_hf.markdown(stat_box_html(f"{total_bl:,}", "H/F đoạn"), unsafe_allow_html=True)
+        ph_ck.markdown(stat_box_html(f"{done_chunks}/{num_chunks}", "Chunk"), unsafe_allow_html=True)
+        ph_usd.markdown(stat_box_html(f"${usd:.4f}", "USD thêm"), unsafe_allow_html=True)
+        ph_vnd.markdown(stat_box_html(f"{vnd:,.0f}₫", "VND thêm"), unsafe_allow_html=True)
+
+    render_stats(0, 0, 0, 0, 0)
+    prog = st.progress(0, text="Đang chuẩn bị...")
+
+    st.markdown("### 📋 Nhật ký dịch H/F")
+    log_ph    = st.empty()
+    log_lines = []
+    add_log   = make_log_adder(log_lines, log_ph)
+    add_log(f"🌐 Bắt đầu dịch {len(hf_missed):,} đoạn Header/Footer")
+
+    chunks     = chunk_blocks(hf_missed)
+    num_chunks = len(chunks)
+    add_log(f"📦 Chia thành {num_chunks} chunk — {MAX_WORD_WORKERS} luồng")
+
+    try:
+        new_translations, tok_in, tok_out, elapsed = _run_translation(
+            chunks, target_lang, doc_context,
+            timer_ph, prog, render_stats, add_log,
+            len(hf_missed), prefix_label="Dịch H/F",
+        )
+
+        translations.update(new_translations)
+        st.session_state["word_translations"] = translations
+        st.session_state["word_tok_in"]      += tok_in
+        st.session_state["word_tok_out"]     += tok_out
+
+        usd, vnd = calc_cost(tok_in, tok_out)
+        prog.progress(100, text="✅ Dịch H/F xong!")
+        timer_ph.markdown(
+            timer_done_html(elapsed, f"Dịch {len(hf_missed):,} H/F xong!"),
+            unsafe_allow_html=True,
+        )
+        add_log("─" * 44)
+        add_log(f"🎉 Xong {len(hf_missed):,} H/F trong {elapsed:.1f}s")
+        add_log(f"💵 Chi phí thêm: ${usd:.4f} USD ≈ {vnd:,.0f} VND")
+        st.success(f"✅ Đã dịch {len(hf_missed):,} đoạn Header/Footer!")
+
+    except Exception as e:
+        add_log(f"❌ Lỗi: {e}")
+        st.error(f"❌ Lỗi dịch H/F: {e}")
+        timer_ph.markdown(timer_error_html(str(e)), unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PREVIEW & INLINE EDIT
 # ══════════════════════════════════════════════════════════════════════════════
 ROLE_LABEL = {
@@ -286,8 +362,9 @@ ROLE_LABEL = {
     "table_cell":      "Cell",
     "note":            "Note",
     "toc":             "TOC",
-    "header":          "Header",
-    "footer":          "Footer",
+    "header":          "📌 Header",
+    "footer":          "📌 Footer",
+    "body_repeated":   "🔁 Lặp lại",
 }
 
 
@@ -295,13 +372,19 @@ def _render_editor():
     blocks       = st.session_state["word_blocks"]
     translations = st.session_state["word_translations"]
 
-    translatable = [b for b in blocks if b["role"] not in NO_TRANSLATE_ROLES]
-
-    only_missed = st.checkbox("📍 Chỉ hiển thị đoạn chưa dịch",
-                              key="word_only_missed_filter")
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        only_missed = st.checkbox("📍 Chỉ hiển thị đoạn chưa dịch",
+                                  key="word_only_missed_filter")
+    with col_f2:
+        show_hf = st.checkbox("📌 Hiện cả Header/Footer",
+                              value=True, key="word_show_hf_filter")
 
     display_blocks = []
-    for b in translatable:
+    for b in blocks:
+        is_hf = b["role"] in NO_TRANSLATE_ROLES
+        if is_hf and not show_hf:
+            continue
         tr = translations.get(b["id"], "")
         is_missed = (not tr) or tr == b["text"]
         if only_missed and not is_missed:
@@ -322,10 +405,11 @@ def _render_editor():
         for b in display_blocks
     ])
 
-    # Editor key thay đổi khi filter / rescan để widget state không bị lệch row index
-    suffix     = "missed" if only_missed else "all"
+    # Editor key thay đổi khi filter / rescan / HF translate để widget state không bị lệch
+    parts      = ["missed" if only_missed else "all",
+                  "hf" if show_hf else "nohf"]
     version    = st.session_state.get("word_editor_version", 0)
-    editor_key = f"word_editor_v{version}_{suffix}"
+    editor_key = f"word_editor_v{version}_{'_'.join(parts)}"
 
     edited = st.data_editor(
         df,
@@ -363,7 +447,8 @@ def _clear_state():
         st.session_state.pop(k, None)
     # Reset editor widget state — clear cả filter + version
     for k in list(st.session_state.keys()):
-        if k.startswith("word_editor") or k == "word_only_missed_filter":
+        if k.startswith("word_editor") or k in ("word_only_missed_filter",
+                                                  "word_show_hf_filter"):
             st.session_state.pop(k, None)
     st.session_state["word_editor_version"] = 0
 
@@ -395,39 +480,67 @@ def render():
             ".docx", f"_translated_{st.session_state['word_lang'][:2]}.docx"
         )
 
-        # Render button trong column, nhưng run rescan OUTSIDE để progress full-width
-        rescan_clicked = False
-        col_dl, col_rs = st.columns([2, 1])
-        with col_dl:
-            st.download_button(
-                label="⬇️  Tải Word đã dịch",
-                data=translated_bytes,
-                file_name=out_name,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-            )
-        with col_rs:
+        # Download — full width
+        st.download_button(
+            label="⬇️  Tải Word đã dịch",
+            data=translated_bytes,
+            file_name=out_name,
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
+
+        # Đếm còn sót body + H/F để hiển thị label button + warning
+        blocks       = st.session_state["word_blocks"]
+        translations = st.session_state["word_translations"]
+        missed_body  = find_missed(blocks, translations, hf_only=False)
+        missed_hf    = find_missed(blocks, translations, hf_only=True)
+        total_hf     = sum(1 for b in blocks if b["role"] in NO_TRANSLATE_ROLES)
+
+        # Row 2 buttons: rescan + translate H/F (chỉ show nếu có H/F)
+        rescan_clicked = hf_clicked = False
+        if total_hf > 0:
+            col_rs, col_hf = st.columns(2)
+            with col_rs:
+                rescan_clicked = st.button(
+                    f"🔍  Quét bỏ sót ({len(missed_body)})",
+                    disabled=(len(missed_body) == 0),
+                    use_container_width=True, key="word_rescan_btn",
+                    help="Dịch lại các đoạn body API fail",
+                )
+            with col_hf:
+                hf_clicked = st.button(
+                    f"🌐  Dịch Header / Footer ({len(missed_hf)}/{total_hf})",
+                    disabled=(len(missed_hf) == 0),
+                    use_container_width=True, key="word_hf_btn",
+                    help="Dịch tất cả Header, Footer và đoạn lặp trong body",
+                )
+        else:
             rescan_clicked = st.button(
-                "🔍  Quét bỏ sót", use_container_width=True,
-                key="word_rescan_btn",
-                help="Dịch lại các đoạn API fail hoặc bị bỏ sót",
+                f"🔍  Quét bỏ sót ({len(missed_body)})",
+                disabled=(len(missed_body) == 0),
+                use_container_width=True, key="word_rescan_btn",
             )
 
-        missed_count = len(find_missed(
-            st.session_state["word_blocks"],
-            st.session_state["word_translations"],
-        ))
-        if missed_count > 0:
-            st.warning(f"⚠️ Còn {missed_count:,} đoạn chưa dịch (hoặc dịch fail). "
+        # Warnings
+        if len(missed_body) > 0:
+            st.warning(f"⚠️ Còn {len(missed_body):,} đoạn body chưa dịch. "
                        f"Bấm **Quét bỏ sót** để dịch lại.")
+        if total_hf > 0 and len(missed_hf) > 0:
+            st.info(f"📌 {len(missed_hf):,}/{total_hf:,} Header/Footer chưa dịch "
+                    f"(mặc định bỏ qua). Bấm **Dịch Header/Footer** nếu muốn dịch.")
 
         with st.expander("📋  Xem & sửa bản dịch inline", expanded=False):
             _render_editor()
 
-        # Rescan chạy ở cuối → progress UI render full-width dưới editor
+        # Run heavy ops cuối hàm → progress UI full-width
         if rescan_clicked:
             _run_rescan()
-            # Reset editor widget state để row index không bị lệch sau khi missed list thay đổi
+            st.session_state["word_editor_version"] = (
+                st.session_state.get("word_editor_version", 0) + 1
+            )
+            st.rerun()
+        if hf_clicked:
+            _run_hf_translation()
             st.session_state["word_editor_version"] = (
                 st.session_state.get("word_editor_version", 0) + 1
             )

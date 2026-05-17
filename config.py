@@ -44,7 +44,14 @@ CHUNK_RETRIES      = 3         # số lần retry mỗi chunk khi lỗi
 TARGET_CHUNK_CHARS = 8_000     # mục tiêu ký tự / chunk (adaptive)
 MIN_CHUNK_BLOCKS   = 8         # tối thiểu paragraph / chunk
 MAX_CHUNK_BLOCKS   = 40        # tối đa paragraph / chunk
-NO_TRANSLATE_ROLES = {"header", "footer"}
+
+# H/F detection: text lặp lại ≥ HF_REPEAT_THRESHOLD lần (và dài ≥ HF_REPEAT_MIN_CHARS)
+# → đánh dấu là body_repeated (mặc định không dịch — bấm nút mới dịch)
+HF_REPEAT_THRESHOLD = 3
+HF_REPEAT_MIN_CHARS = 10
+
+# Roles KHÔNG dịch mặc định ở lần đầu — user phải bấm nút riêng để dịch
+NO_TRANSLATE_ROLES = {"header", "footer", "body_repeated"}
 
 # ── Ngôn ngữ ──────────────────────────────────────────────────────────────────
 LANGUAGES = ["Tiếng Việt", "Tiếng Anh", "Tiếng Nhật", "Tiếng Trung", "Tiếng Pháp", "Tiếng Đức"]

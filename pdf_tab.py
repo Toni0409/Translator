@@ -60,11 +60,19 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s):
                    if pages_s.strip() else list(range(total_pg)))
         add_log(f"📄 {total_pg} trang tổng, sẽ dịch {len(targets)} trang")
 
-        prog.progress(5, text="Trích xuất text...")
-        add_log("🔍 Trích xuất text từ PDF...")
-        all_groups, _ = extract_line_groups(src_path, targets)
-        total_lines   = sum(len(v) for v in all_groups.values())
-        add_log(f"✅ {total_lines} dòng text")
+        prog.progress(5, text="Trích xuất text + phát hiện bảng...")
+        add_log("🔍 Trích xuất text + phát hiện bảng từ PDF...")
+        all_groups, _, table_stats = extract_line_groups(src_path, targets)
+        total_lines    = sum(len(v) for v in all_groups.values())
+        total_tables   = sum(s["tables"] for s in table_stats.values())
+        total_cells    = sum(s["cell_lines"] for s in table_stats.values())
+        pages_w_tables = sum(1 for s in table_stats.values() if s["tables"] > 0)
+        add_log(f"✅ {total_lines:,} dòng text")
+        if total_tables > 0:
+            add_log(f"📊 Phát hiện {total_tables} bảng trên {pages_w_tables} trang "
+                    f"({total_cells:,} dòng nằm trong cell) — sẽ kèm context (T# R# C#) khi dịch")
+        else:
+            add_log("📊 Không phát hiện bảng — dịch text thường")
         render_stats(0, total_pg, total_lines, 0, 0)
         add_log(f"🤖 Kết nối {PDF_MODEL}")
 

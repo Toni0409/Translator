@@ -12,6 +12,7 @@ parallel chunks), ghi lại DOCX giữ nguyên format runs.
 import io
 import json
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from docx import Document
@@ -19,6 +20,7 @@ from docx import Document
 from config import (
     WORD_MODELS, MAX_WORD_TOKENS, NO_TRANSLATE_ROLES,
     CHUNK_RETRIES, TARGET_CHUNK_CHARS, MIN_CHUNK_BLOCKS, MAX_CHUNK_BLOCKS,
+    HF_REPEAT_THRESHOLD, HF_REPEAT_MIN_CHARS,
 )
 from gemini import generate, usage_tokens, parse_json_loose
 
@@ -111,8 +113,47 @@ def _detect_role(para, in_table: bool, in_header: bool, in_footer: bool) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 # EXTRACT
 # ══════════════════════════════════════════════════════════════════════════════
+def _mark_repeating_as_hf(blocks: list[dict],
+                          threshold: int = HF_REPEAT_THRESHOLD,
+                          min_chars: int = HF_REPEAT_MIN_CHARS) -> int:
+    """
+    Phát hiện block trong body có text lặp lại ≥ threshold lần
+    (text dài ≥ min_chars) → đánh dấu role = 'body_repeated'.
+
+    Đây là heuristic phổ biến để bắt header/footer ẩn trong body
+    (vd: tiêu đề chapter chạy trên mỗi trang, watermark "Confidential",
+    section banner...).
+
+    Trả về số block bị đánh dấu.
+    """
+    counter: Counter = Counter()
+    for b in blocks:
+        if b["role"] in ("header", "footer"):
+            continue   # đã là H/F thật
+        if len(b["text"]) < min_chars:
+            continue   # text quá ngắn, dễ false positive
+        counter[b["text"]] += 1
+
+    repeating_texts = {t for t, c in counter.items() if c >= threshold}
+    marked = 0
+    for b in blocks:
+        if b["role"] in ("header", "footer"):
+            continue
+        if b["text"] in repeating_texts:
+            b["role"] = "body_repeated"
+            marked += 1
+    return marked
+
+
 def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
-    """Đọc DOCX → list block {id, text, role, para_idx}."""
+    """
+    Đọc DOCX → list block {id, text, role, para_idx}.
+
+    Role:
+    - header / footer     : nằm trong section.header / section.footer
+    - body_repeated       : text lặp lại ≥ 3 lần trong body (heuristic H/F)
+    - section_heading / title / bullet / table_cell / note / toc / paragraph
+    """
     doc = Document(io.BytesIO(docx_bytes))
 
     table_para_set:  set = set()
@@ -154,7 +195,23 @@ def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
             pid in footer_para_set,
         )
         blocks.append({"id": f"p{idx}", "text": text, "role": role, "para_idx": idx})
+
+    _mark_repeating_as_hf(blocks)
     return blocks
+
+
+def count_by_role(blocks: list[dict]) -> dict:
+    """Stat helper: đếm số block theo từng role + tổng theo nhóm."""
+    counter = Counter(b["role"] for b in blocks)
+    return {
+        "total":       len(blocks),
+        "body":        sum(c for r, c in counter.items() if r not in NO_TRANSLATE_ROLES),
+        "header":      counter.get("header", 0),
+        "footer":      counter.get("footer", 0),
+        "body_repeated": counter.get("body_repeated", 0),
+        "hf_total":    sum(counter.get(r, 0) for r in NO_TRANSLATE_ROLES),
+        "by_role":     dict(counter),
+    }
 
 
 def build_doc_context(blocks: list[dict]) -> str:
@@ -266,6 +323,7 @@ Rules:
 - For heading/section_heading: concise technical, match source brevity.
 - For table_cell: concise, consistent across row.
 - For note: keep WARNING/NOTE/CAUTION label verbatim.
+- For header/footer/body_repeated: concise like a page header/footer; preserve page numbers ("Page 1 of 10"), dates, document IDs verbatim.
 
 Format:
 [{{"id":"...","text":"translated text"}}]
@@ -369,13 +427,15 @@ def translate_parallel(holder: dict, client,
 # ══════════════════════════════════════════════════════════════════════════════
 def apply_translations(original_bytes: bytes, blocks: list[dict],
                        translations: dict) -> bytes:
-    """Áp dụng translations vào DOCX gốc → trả về bytes DOCX mới."""
+    """
+    Áp dụng translations vào DOCX gốc → trả về bytes DOCX mới.
+    Block nào có translation trong dict thì apply, không phân biệt role —
+    để H/F translation cũng được apply khi user bấm nút "Dịch H/F".
+    """
     doc         = Document(io.BytesIO(original_bytes))
     idx_to_para = {idx: para for idx, para in enumerate(iter_all_paragraphs(doc))}
 
     for block in blocks:
-        if block.get("role") in NO_TRANSLATE_ROLES:
-            continue
         tr   = translations.get(block["id"])
         para = idx_to_para.get(block.get("para_idx"))
         if not tr or para is None:
@@ -390,16 +450,22 @@ def apply_translations(original_bytes: bytes, blocks: list[dict],
     return buf.getvalue()
 
 
-def find_missed(blocks: list[dict], translations: dict) -> list[dict]:
+def _is_untranslated(b: dict, translations: dict) -> bool:
+    tr = translations.get(b["id"], "")
+    return (not tr) or tr == b["text"]
+
+
+def find_missed(blocks: list[dict], translations: dict,
+                hf_only: bool = False) -> list[dict]:
     """
-    Trả về list block chưa được dịch (translation rỗng hoặc bằng text gốc).
-    Bỏ qua header/footer.
+    Trả về list block chưa dịch (translation rỗng hoặc bằng text gốc).
+
+    - hf_only=False (default): chỉ body — bỏ qua H/F, body_repeated
+    - hf_only=True            : chỉ H/F + body_repeated, dùng cho nút "Dịch H/F"
     """
-    missed = []
-    for b in blocks:
-        if b["role"] in NO_TRANSLATE_ROLES:
-            continue
-        tr = translations.get(b["id"], "")
-        if not tr or tr == b["text"]:
-            missed.append(b)
-    return missed
+    if hf_only:
+        in_set = lambda r: r in NO_TRANSLATE_ROLES
+    else:
+        in_set = lambda r: r not in NO_TRANSLATE_ROLES
+    return [b for b in blocks
+            if in_set(b["role"]) and _is_untranslated(b, translations)]
