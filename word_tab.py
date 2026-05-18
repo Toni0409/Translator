@@ -1264,20 +1264,29 @@ def render():
         with st.expander("🖼 OCR & dịch text trong ảnh (tuỳ chọn)", expanded=False):
             st.caption(
                 "Quét tất cả ảnh trong DOCX, OCR chữ và dịch sang ngôn ngữ đích. "
-                "Có thể tốn thêm chi phí Gemini Vision."
+                "Xử lý song song — có thể tốn thêm chi phí Gemini Vision."
             )
             if st.button("🔍 Quét và dịch ảnh", key="word_ocr_btn"):
                 from word_backend import extract_images_from_docx, ocr_and_translate_images
-                with st.spinner("Đang OCR + dịch ảnh..."):
-                    imgs = extract_images_from_docx(st.session_state["word_docx_bytes"])
-                    if not imgs:
-                        st.info("Không có ảnh trong DOCX.")
-                    else:
-                        results = ocr_and_translate_images(
-                            get_client(), imgs,
-                            LANG_EN[st.session_state["word_lang"]],
-                        )
-                        st.session_state["word_image_ocr"] = (imgs, results)
+                imgs = extract_images_from_docx(st.session_state["word_docx_bytes"])
+                if not imgs:
+                    st.info("Không có ảnh trong DOCX.")
+                else:
+                    progress_bar = st.progress(0, text=f"Đang OCR 0/{len(imgs)} ảnh...")
+                    _ocr_counter = [0]
+
+                    def _on_progress(done, total):
+                        _ocr_counter[0] = done
+                        progress_bar.progress(done / total,
+                                              text=f"Đang OCR {done}/{total} ảnh...")
+
+                    results = ocr_and_translate_images(
+                        get_client(), imgs,
+                        LANG_EN[st.session_state["word_lang"]],
+                        progress_callback=_on_progress,
+                    )
+                    progress_bar.empty()
+                    st.session_state["word_image_ocr"] = (imgs, results)
 
             if "word_image_ocr" in st.session_state:
                 imgs, results = st.session_state["word_image_ocr"]
@@ -1292,8 +1301,32 @@ def render():
                         c1.image(img["data"], width=200, caption=img["filename"])
                         c2.markdown(f"**OCR (gốc):**\n```\n{r['ocr']}\n```")
                         c2.markdown(f"**Dịch:**\n```\n{r['translation']}\n```")
-                if shown == 0:
+                        if r.get("error"):
+                            c2.warning(f"⚠️ Lỗi: {r['error']}")
+
+                errors = [r for r in results.values() if r.get("error") and not r.get("has_text")]
+                if shown == 0 and not errors:
                     st.info(f"Đã quét {len(imgs)} ảnh — không phát hiện text.")
+                if errors:
+                    st.warning(f"⚠️ {len(errors)} ảnh gặp lỗi khi OCR.")
+
+                if shown > 0:
+                    if st.checkbox("📎 Chèn bản dịch OCR vào file DOCX output", key="word_ocr_insert"):
+                        from word_backend import insert_ocr_captions_into_docx
+                        base_bytes = _get_cached_translated_bytes()
+                        ocr_docx = insert_ocr_captions_into_docx(base_bytes, imgs, results)
+                        out_name = st.session_state["word_filename"].replace(
+                            ".docx",
+                            f"_translated_{st.session_state['word_lang'][:2]}_ocr.docx",
+                        )
+                        st.download_button(
+                            label="⬇️  Tải Word đã dịch + OCR caption",
+                            data=ocr_docx,
+                            file_name=out_name,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True,
+                            key="word_ocr_download",
+                        )
 
         translated_bytes = _get_cached_translated_bytes()
         out_name = st.session_state["word_filename"].replace(
