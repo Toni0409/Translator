@@ -1,11 +1,11 @@
 """
-Streamlit UI cho tab Word.
+Streamlit UI cho tab Word — 2-phase flow.
 
-Flow:
-1. Upload .docx → extract → glossary → chunk adaptive
-2. Translate song song (ThreadPoolExecutor) + per-chunk retry
-3. Save state vào session_state (blocks, translations, docx_bytes, glossary, ...)
-4. Hiển thị: success summary + download + rescan missed + edit inline
+Phase 1 (Phân tích):
+  extract → glossary build → show stats + glossary editor + TM preview
+
+Phase 2 (Dịch):
+  TM lookup → chunk còn lại → translate parallel → merge TM + new → apply
 """
 import time
 import threading
@@ -25,6 +25,7 @@ from word_backend import (
     extract_docx_blocks, build_doc_context, build_glossary, chunk_blocks,
     translate_parallel, apply_translations, find_missed,
     get_working_model, count_by_role,
+    tm_lookup, tm_store,
 )
 
 
@@ -33,13 +34,20 @@ SS_KEYS = (
     "word_blocks", "word_translations", "word_docx_bytes",
     "word_filename", "word_lang", "word_doc_context",
     "word_tok_in", "word_tok_out", "word_elapsed", "word_num_chunks",
-    "word_summary", "word_glossary",
+    "word_summary", "word_glossary", "word_analysis",
 )
+# Note: "word_tm" intentionally KHÔNG ở đây — persist xuyên suốt nhiều docs/session
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UI HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+def _ensure_tm() -> dict:
+    if "word_tm" not in st.session_state:
+        st.session_state["word_tm"] = {}
+    return st.session_state["word_tm"]
+
+
 def _make_job_ui(heading: str, stat_col1_label: str,
                  log_heading: str = "### 📋 Nhật ký"):
     """Build standard job UI. Returns (timer_ph, prog, render_stats, add_log)."""
@@ -66,8 +74,7 @@ def _make_job_ui(heading: str, stat_col1_label: str,
 
 def _finalize_job(timer_ph, prog, add_log,
                   elapsed: float, count: int, label: str,
-                  tok_in: int, tok_out: int):
-    """Render final progress + summary log after a translation job completes."""
+                  tok_in: int, tok_out: int, tm_added: int = 0):
     usd, vnd = calc_cost(tok_in, tok_out)
     prog.progress(100, text=f"✅ {label} xong!")
     timer_ph.markdown(
@@ -76,6 +83,8 @@ def _finalize_job(timer_ph, prog, add_log,
     )
     add_log("─" * 44)
     add_log(f"🎉 Xong {count:,} đoạn trong {elapsed:.1f}s")
+    if tm_added:
+        add_log(f"💾 TM: lưu thêm {tm_added} entry")
     add_log(f"💵 Chi phí: ${usd:.4f} USD ≈ {vnd:,.0f} VND")
 
 
@@ -138,7 +147,6 @@ def _run_translation(chunks, target_lang, doc_context,
         dot += 1
         time.sleep(0.5)
 
-    # Flush remaining log entries
     while last_logged < len(holder["chunk_log"]):
         entry = holder["chunk_log"][last_logged]
         if entry["error"]:
@@ -155,57 +163,210 @@ def _run_translation(chunks, target_lang, doc_context,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FULL TRANSLATION (lần đầu)
+# PHASE 1 — PHÂN TÍCH (extract + glossary build)
 # ══════════════════════════════════════════════════════════════════════════════
-def _run_full_translation(uploaded_docx, lang_word):
-    timer_ph, prog, render_stats, add_log = _make_job_ui(
-        "### 📊 Tiến độ", "Đoạn văn", "### 📋 Nhật ký hoạt động",
-    )
+def _run_analysis(uploaded_docx, lang_word):
+    """
+    Phase 1: extract + build glossary + TM preview.
+    Lưu kết quả vào session_state["word_analysis"], xong rerun để show editor.
+    """
+    st.markdown("### 🔬 Phân tích tài liệu")
+    log_ph    = st.empty()
+    log_lines: list = []
+    add_log   = make_log_adder(log_lines, log_ph)
+
     try:
         docx_bytes = uploaded_docx.read()
-        add_log(f"📄 Đã nhận file: {uploaded_docx.name}")
+        add_log(f"📄 File: {uploaded_docx.name}")
 
-        add_log("🔍 Phân tích cấu trúc tài liệu...")
         blocks       = extract_docx_blocks(docx_bytes)
         stats        = count_by_role(blocks)
         translatable = [b for b in blocks if b["role"] not in NO_TRANSLATE_ROLES]
         total_chars  = sum(len(b["text"]) for b in translatable)
+        textbox_cnt  = sum(1 for b in blocks if b["role"] == "textbox")
+        table_cnt    = sum(1 for b in blocks if b.get("table_cell"))
 
         add_log(f"✅ {stats['total']:,} đoạn ({total_chars:,} ký tự body)")
         add_log(f"   • Body cần dịch:       {stats['body']:,}")
-        add_log(f"   • Header (real):       {stats['header']:,}")
-        add_log(f"   • Footer (real):       {stats['footer']:,}")
-        add_log(f"   • Body lặp (H/F-like): {stats['body_repeated']:,} "
-                f"(phát hiện qua text lặp ≥3 lần)")
-        if stats["hf_total"] > 0:
-            add_log(f"⏭  Tạm thời bỏ qua {stats['hf_total']:,} H/F — bấm nút riêng sau khi xong")
+        add_log(f"   • Header/Footer (skip):{stats['hf_total']:,}")
+        if textbox_cnt > 0:
+            add_log(f"   • Text-box / shape:    {textbox_cnt:,} (NEW — sẽ dịch)")
+        if table_cnt > 0:
+            add_log(f"   • Cell bảng:           {table_cnt:,} → table-aware (T#R#C# context)")
 
-        doc_context = build_doc_context(blocks)
         target_lang = LANG_EN[lang_word]
-        chunks      = chunk_blocks(translatable)
-        num_chunks  = len(chunks)
-        add_log(f"📦 Chia thành {num_chunks} chunk "
-                f"(adaptive ~{total_chars // max(num_chunks, 1):,} chars/chunk)")
 
-        add_log("📚 Xây dựng bảng thuật ngữ (glossary)...")
+        # TM preview
+        tm           = _ensure_tm()
+        tm_cached, _ = tm_lookup(translatable, tm, target_lang)
+        if tm_cached:
+            add_log(f"💾 TM: {len(tm_cached):,}/{len(translatable):,} đoạn dùng cache (skip API)")
+        else:
+            add_log(f"💾 TM: 0 hit (TM hiện có {len(tm):,} entry)")
+
+        # Glossary build
+        add_log("📚 Build glossary từ thuật ngữ lặp lại...")
         client   = get_client()
         glossary = build_glossary(client, blocks, target_lang)
         if glossary:
-            add_log(f"📖 Glossary: {len(glossary)} thuật ngữ — dịch nhất quán cross-chunk")
+            add_log(f"📖 Tìm thấy {len(glossary)} thuật ngữ — review/sửa ở dưới rồi dịch")
         else:
-            add_log("📖 Không tìm thấy thuật ngữ lặp — bỏ qua glossary")
+            add_log("📖 Không có thuật ngữ lặp đủ ngưỡng — bỏ qua glossary")
 
-        add_log(f"⚡ Dịch song song {MAX_WORD_WORKERS} luồng")
+        st.session_state["word_analysis"] = {
+            "blocks":       blocks,
+            "translatable": translatable,
+            "stats":        stats,
+            "total_chars":  total_chars,
+            "textbox_cnt":  textbox_cnt,
+            "table_cnt":    table_cnt,
+            "tm_hits":      len(tm_cached),
+            "doc_context":  build_doc_context(blocks),
+            "glossary":     glossary,
+            "docx_bytes":   docx_bytes,
+            "filename":     uploaded_docx.name,
+            "lang":         lang_word,
+            "target_lang":  target_lang,
+        }
+        # Clear old kết quả từ lần dịch trước
+        for k in ("word_blocks", "word_translations", "word_summary"):
+            st.session_state.pop(k, None)
+        st.session_state.pop("word_translated_bytes_cache", None)
+        add_log("✅ Phân tích xong — kéo xuống review glossary + bấm **Dịch**")
+        time.sleep(0.3)
+        st.rerun()
 
-        translations, tok_in, tok_out, elapsed = _run_translation(
-            chunks, target_lang, doc_context,
-            timer_ph, prog, render_stats, add_log,
-            len(translatable), prefix_label="Dịch",
-            glossary=glossary,
+    except Exception as e:
+        add_log(f"❌ Lỗi: {e}")
+        st.error(f"❌ Phân tích fail: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 1 — RENDER (stats + glossary editor + Dịch button)
+# ══════════════════════════════════════════════════════════════════════════════
+def _render_analysis_panel():
+    a = st.session_state["word_analysis"]
+
+    st.markdown("### 📊 Kết quả phân tích")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown(stat_box_html(f"{a['stats']['body']:,}", "Body cần dịch"),
+                unsafe_allow_html=True)
+    c2.markdown(stat_box_html(f"{a['stats']['hf_total']:,}", "Header/Footer"),
+                unsafe_allow_html=True)
+    c3.markdown(stat_box_html(f"{a['textbox_cnt']:,}", "Text-box"),
+                unsafe_allow_html=True)
+    c4.markdown(stat_box_html(f"{a['table_cnt']:,}", "Cell bảng"),
+                unsafe_allow_html=True)
+
+    if a["tm_hits"] > 0:
+        pct = 100 * a["tm_hits"] / max(len(a["translatable"]), 1)
+        st.success(
+            f"💾 **Translation Memory**: {a['tm_hits']:,}/{len(a['translatable']):,} đoạn "
+            f"({pct:.1f}%) sẽ dùng cache cũ — không gọi API."
         )
 
-        add_log(f"✅ Dịch xong {len(translatable):,} đoạn trong {elapsed:.1f}s")
-        add_log(f"🤖 Model: {get_working_model()}")
+    # Glossary editor
+    with st.expander(
+        f"📚 Glossary ({len(a['glossary'])} thuật ngữ) — bấm để review / sửa",
+        expanded=False,
+    ):
+        if not a["glossary"]:
+            st.info("Không có thuật ngữ lặp lại đủ ngưỡng (≥3 lần). Vẫn dịch được — chỉ là không có guarantee consistency.")
+        else:
+            st.caption(
+                "💡 Sửa bản dịch để bắt buộc terminology cụ thể. "
+                "Xóa cell **Bản dịch** (để trống) để loại entry khỏi glossary. "
+                "Có thể thêm dòng mới."
+            )
+            df = pd.DataFrame([
+                {"Thuật ngữ gốc": k, "Bản dịch": v}
+                for k, v in a["glossary"].items()
+            ])
+            edited = st.data_editor(
+                df,
+                column_config={
+                    "Thuật ngữ gốc": st.column_config.TextColumn(width="medium"),
+                    "Bản dịch":      st.column_config.TextColumn(width="medium"),
+                },
+                use_container_width=True, hide_index=True,
+                num_rows="dynamic",
+                key="word_glossary_editor",
+            )
+            # Sync edits back
+            new_gloss = {}
+            for _, row in edited.iterrows():
+                en = (row.get("Thuật ngữ gốc") or "").strip() if row.get("Thuật ngữ gốc") else ""
+                vi = (row.get("Bản dịch") or "").strip() if row.get("Bản dịch") else ""
+                if en and vi:
+                    new_gloss[en] = vi
+            a["glossary"] = new_gloss
+            st.session_state["word_analysis"] = a
+
+    # Dịch button — nói rõ còn bao nhiêu sau TM
+    n_remain = len(a["translatable"]) - a["tm_hits"]
+    label = (f"▶  Dịch {n_remain:,} đoạn"
+             if n_remain > 0
+             else f"▶  Apply {a['tm_hits']:,} TM hit (không gọi API)")
+    if st.button(label, use_container_width=True, type="primary",
+                 key="word_translate_phase2_btn"):
+        _run_full_translation()
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 2 — DỊCH (consume analysis, run translation, merge TM + new)
+# ══════════════════════════════════════════════════════════════════════════════
+def _run_full_translation():
+    """Phase 2: dùng analysis đã extract + glossary đã edit → translate."""
+    a = st.session_state["word_analysis"]
+    blocks       = a["blocks"]
+    translatable = a["translatable"]
+    target_lang  = a["target_lang"]
+    doc_context  = a["doc_context"]
+    glossary     = a["glossary"]
+    docx_bytes   = a["docx_bytes"]
+    tm           = _ensure_tm()
+
+    timer_ph, prog, render_stats, add_log = _make_job_ui(
+        "### 📊 Tiến độ dịch", "Đoạn văn", "### 📋 Nhật ký",
+    )
+
+    try:
+        cached, remaining = tm_lookup(translatable, tm, target_lang)
+        if cached:
+            add_log(f"💾 TM hit: {len(cached):,}/{len(translatable):,} đoạn — skip API")
+        add_log(f"📝 Sẽ gọi API cho {len(remaining):,} đoạn")
+
+        translations = dict(cached)   # khởi đầu với TM hits
+        tok_in = tok_out = 0
+        elapsed = 0.0
+        num_chunks = 0
+        tm_added = 0
+
+        if remaining:
+            chunks     = chunk_blocks(remaining)
+            num_chunks = len(chunks)
+            avg_chars  = sum(len(b["text"]) for b in remaining) // max(num_chunks, 1)
+            add_log(f"📦 Chia thành {num_chunks} chunk (~{avg_chars:,} chars/chunk)")
+            if glossary:
+                add_log(f"📖 Áp dụng glossary {len(glossary)} thuật ngữ")
+            add_log(f"⚡ Dịch song song {MAX_WORD_WORKERS} luồng")
+
+            new_translations, tok_in, tok_out, elapsed = _run_translation(
+                chunks, target_lang, doc_context,
+                timer_ph, prog, render_stats, add_log,
+                len(remaining), prefix_label="Dịch",
+                glossary=glossary,
+            )
+            translations.update(new_translations)
+            tm_added = tm_store(remaining, new_translations, tm, target_lang)
+            add_log(f"🤖 Model: {get_working_model()}")
+        else:
+            timer_ph.markdown(
+                timer_done_html(0, f"Apply {len(cached):,} TM hit — không gọi API!"),
+                unsafe_allow_html=True,
+            )
+            prog.progress(100, text="✅ Full TM hit!")
 
         usd, vnd = calc_cost(tok_in, tok_out)
         render_stats(len(translatable), num_chunks, num_chunks, tok_in, tok_out)
@@ -215,16 +376,19 @@ def _run_full_translation(uploaded_docx, lang_word):
             unsafe_allow_html=True,
         )
         add_log("─" * 44)
-        add_log(f"🎉 Xong {len(translatable):,} đoạn / {num_chunks} chunk trong {elapsed:.1f}s")
-        add_log(f"💰 Token: {tok_in:,} in + {tok_out:,} out")
+        add_log(f"🎉 Xong {len(translatable):,} đoạn "
+                f"(💾 {len(cached):,} TM + 🔄 {len(remaining):,} API) — {elapsed:.1f}s")
+        if tm_added:
+            add_log(f"💾 TM: lưu thêm {tm_added} entry — tổng {len(tm):,}")
+        if tok_in or tok_out:
+            add_log(f"💰 Token: {tok_in:,} in + {tok_out:,} out")
         add_log(f"💵 Chi phí: ${usd:.4f} USD ≈ {vnd:,.0f} VND")
 
-        # Save to session_state
         st.session_state["word_blocks"]       = blocks
         st.session_state["word_translations"] = translations
         st.session_state["word_docx_bytes"]   = docx_bytes
-        st.session_state["word_filename"]     = uploaded_docx.name
-        st.session_state["word_lang"]         = lang_word
+        st.session_state["word_filename"]     = a["filename"]
+        st.session_state["word_lang"]         = a["lang"]
         st.session_state["word_doc_context"]  = doc_context
         st.session_state["word_tok_in"]       = tok_in
         st.session_state["word_tok_out"]      = tok_out
@@ -232,95 +396,75 @@ def _run_full_translation(uploaded_docx, lang_word):
         st.session_state["word_num_chunks"]   = num_chunks
         st.session_state["word_glossary"]     = glossary
         st.session_state["word_summary"]      = (
-            f"✅ Dịch xong {len(translatable):,} đoạn trong {elapsed:.1f}s  "
-            f"|  ${usd:.4f} USD ≈ {vnd:,.0f} VND"
+            f"✅ Dịch xong {len(translatable):,} đoạn  "
+            f"(💾 {len(cached):,} TM + 🔄 {len(remaining):,} API)  "
+            f"|  {elapsed:.1f}s  |  ${usd:.4f} USD ≈ {vnd:,.0f} VND"
         )
         st.session_state["word_translations_version"] = 1
+        st.session_state.pop("word_analysis", None)  # đã consume
 
     except Exception as e:
         add_log(f"❌ Lỗi: {e}")
-        st.error(f"❌ Có lỗi xảy ra: {e}")
+        st.error(f"❌ Lỗi dịch: {e}")
         timer_ph.markdown(timer_error_html(str(e)), unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RESCAN — chỉ dịch lại các đoạn bị bỏ sót
+# RESCAN + H/F — share TM logic
 # ══════════════════════════════════════════════════════════════════════════════
-def _run_rescan():
-    blocks       = st.session_state["word_blocks"]
-    translations = st.session_state["word_translations"]
-    doc_context  = st.session_state["word_doc_context"]
-    target_lang  = LANG_EN[st.session_state["word_lang"]]
-    glossary     = st.session_state.get("word_glossary")
-
-    missed = find_missed(blocks, translations)
+def _run_partial(missed: list, label: str, heading: str, log_heading: str,
+                 stat_label: str, success_msg: str):
+    """Generic partial-translation runner (rescan / H-F). Có TM lookup."""
     if not missed:
-        st.info("✨ Không có đoạn nào còn sót — tất cả đã dịch!")
+        st.info("✨ Không có đoạn nào cần xử lý!")
         return
 
-    timer_ph, prog, render_stats, add_log = _make_job_ui(
-        f"### 🔍 Quét bỏ sót — {len(missed):,} đoạn",
-        "Đoạn còn sót", "### 📋 Nhật ký quét",
-    )
-    chunks = chunk_blocks(missed)
-    add_log(f"🔍 Tìm thấy {len(missed):,} đoạn chưa dịch / dịch fail")
-    add_log(f"📦 Chia thành {len(chunks)} chunk — dịch lại với {MAX_WORD_WORKERS} luồng")
+    doc_context = st.session_state["word_doc_context"]
+    target_lang = LANG_EN[st.session_state["word_lang"]]
+    glossary    = st.session_state.get("word_glossary")
+    tm          = _ensure_tm()
+    translations = st.session_state["word_translations"]
 
-    try:
-        new_translations, tok_in, tok_out, elapsed = _run_translation(
-            chunks, target_lang, doc_context,
-            timer_ph, prog, render_stats, add_log,
-            len(missed), prefix_label="Quét",
-            glossary=glossary,
-        )
-        translations.update(new_translations)
+    cached, remaining = tm_lookup(missed, tm, target_lang)
+
+    timer_ph, prog, render_stats, add_log = _make_job_ui(
+        heading, stat_label, log_heading,
+    )
+    if cached:
+        add_log(f"💾 TM hit: {len(cached):,}/{len(missed):,} đoạn dùng cache")
+    add_log(f"📝 Cần gọi API cho {len(remaining):,} đoạn")
+
+    # Apply TM hits ngay
+    if cached:
+        translations.update(cached)
+
+    if not remaining:
+        # Full TM hit — không cần API
         st.session_state["word_translations"] = translations
-        st.session_state["word_tok_in"]      += tok_in
-        st.session_state["word_tok_out"]     += tok_out
         st.session_state["word_translations_version"] = (
             st.session_state.get("word_translations_version", 0) + 1
         )
-        _finalize_job(timer_ph, prog, add_log, elapsed, len(missed), "Quét", tok_in, tok_out)
-        st.success(f"✅ Đã dịch thêm {len(missed):,} đoạn bị bỏ sót!")
-
-    except Exception as e:
-        add_log(f"❌ Lỗi: {e}")
-        st.error(f"❌ Lỗi rescan: {e}")
-        timer_ph.markdown(timer_error_html(str(e)), unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# HEADER/FOOTER TRANSLATION — chạy khi user bấm nút "Dịch H/F"
-# ══════════════════════════════════════════════════════════════════════════════
-def _run_hf_translation():
-    """Dịch tất cả H/F + body_repeated block chưa được dịch."""
-    blocks       = st.session_state["word_blocks"]
-    translations = st.session_state["word_translations"]
-    doc_context  = st.session_state["word_doc_context"]
-    target_lang  = LANG_EN[st.session_state["word_lang"]]
-    glossary     = st.session_state.get("word_glossary")
-
-    hf_missed = find_missed(blocks, translations, hf_only=True)
-    if not hf_missed:
-        st.info("✨ Tất cả Header/Footer đã được dịch!")
+        prog.progress(100, text="✅ Full TM hit!")
+        timer_ph.markdown(
+            timer_done_html(0, f"Apply {len(cached):,} TM hit!"),
+            unsafe_allow_html=True,
+        )
+        add_log(f"🎉 Toàn bộ {len(missed):,} đoạn dùng TM — không gọi API")
+        st.success(f"✅ {len(missed):,} đoạn từ TM cache — chi phí $0!")
         return
 
-    timer_ph, prog, render_stats, add_log = _make_job_ui(
-        f"### 🌐 Dịch Header & Footer — {len(hf_missed):,} đoạn",
-        "H/F đoạn", "### 📋 Nhật ký dịch H/F",
-    )
-    chunks = chunk_blocks(hf_missed)
-    add_log(f"🌐 Bắt đầu dịch {len(hf_missed):,} đoạn Header/Footer")
+    chunks = chunk_blocks(remaining)
     add_log(f"📦 Chia thành {len(chunks)} chunk — {MAX_WORD_WORKERS} luồng")
 
     try:
         new_translations, tok_in, tok_out, elapsed = _run_translation(
             chunks, target_lang, doc_context,
             timer_ph, prog, render_stats, add_log,
-            len(hf_missed), prefix_label="Dịch H/F",
+            len(remaining), prefix_label=label,
             glossary=glossary,
         )
         translations.update(new_translations)
+        tm_added = tm_store(remaining, new_translations, tm, target_lang)
         st.session_state["word_translations"] = translations
         st.session_state["word_tok_in"]      += tok_in
         st.session_state["word_tok_out"]     += tok_out
@@ -328,24 +472,47 @@ def _run_hf_translation():
             st.session_state.get("word_translations_version", 0) + 1
         )
         _finalize_job(timer_ph, prog, add_log, elapsed,
-                      len(hf_missed), "Dịch H/F", tok_in, tok_out)
-        st.success(f"✅ Đã dịch {len(hf_missed):,} đoạn Header/Footer!")
+                      len(missed), label, tok_in, tok_out, tm_added=tm_added)
+        st.success(success_msg.format(n=len(missed)))
 
     except Exception as e:
         add_log(f"❌ Lỗi: {e}")
-        st.error(f"❌ Lỗi dịch H/F: {e}")
+        st.error(f"❌ Lỗi: {e}")
         timer_ph.markdown(timer_error_html(str(e)), unsafe_allow_html=True)
+
+
+def _run_rescan():
+    blocks       = st.session_state["word_blocks"]
+    translations = st.session_state["word_translations"]
+    missed       = find_missed(blocks, translations)
+    _run_partial(
+        missed,
+        label="Quét",
+        heading=f"### 🔍 Quét bỏ sót — {len(missed):,} đoạn",
+        log_heading="### 📋 Nhật ký quét",
+        stat_label="Đoạn còn sót",
+        success_msg="✅ Đã dịch thêm {n:,} đoạn bị bỏ sót!",
+    )
+
+
+def _run_hf_translation():
+    blocks       = st.session_state["word_blocks"]
+    translations = st.session_state["word_translations"]
+    hf_missed    = find_missed(blocks, translations, hf_only=True)
+    _run_partial(
+        hf_missed,
+        label="Dịch H/F",
+        heading=f"### 🌐 Dịch Header & Footer — {len(hf_missed):,} đoạn",
+        log_heading="### 📋 Nhật ký dịch H/F",
+        stat_label="H/F đoạn",
+        success_msg="✅ Đã dịch {n:,} đoạn Header/Footer!",
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CACHED TRANSLATED BYTES
 # ══════════════════════════════════════════════════════════════════════════════
 def _get_cached_translated_bytes() -> bytes:
-    """
-    Cache apply_translations bằng version counter.
-    Tránh rebuild DOCX mỗi Streamlit rerun khi translations chưa thay đổi.
-    Version tăng sau mỗi lần translations được update (rescan, H/F, editor).
-    """
     version = st.session_state.get("word_translations_version", 0)
     cached  = st.session_state.get("word_translated_bytes_cache")
     if cached and cached.get("version") == version:
@@ -370,6 +537,7 @@ ROLE_LABEL = {
     "table_cell":      "Cell",
     "note":            "Note",
     "toc":             "TOC",
+    "textbox":         "🔲 Text-box",
     "header":          "📌 Header",
     "footer":          "📌 Footer",
     "body_repeated":   "🔁 Lặp lại",
@@ -403,17 +571,23 @@ def _render_editor():
         st.info("✨ Tất cả đoạn đã dịch — không có gì để hiển thị.")
         return
 
+    def _label(b):
+        base = ROLE_LABEL.get(b["role"], b["role"])
+        tc   = b.get("table_cell")
+        if tc:
+            return f"{base} (T{tc[0]}R{tc[1]}C{tc[2]})"
+        return base
+
     df = pd.DataFrame([
         {
             "ID":       b["id"],
-            "Vai trò":  ROLE_LABEL.get(b["role"], b["role"]),
+            "Vai trò":  _label(b),
             "Gốc":      b["text"],
             "Bản dịch": translations.get(b["id"], ""),
         }
         for b in display_blocks
     ])
 
-    # Editor key thay đổi khi filter / rescan / HF translate để widget state không bị lệch
     parts      = ["missed" if only_missed else "all",
                   "hf" if show_hf else "nohf"]
     version    = st.session_state.get("word_editor_version", 0)
@@ -434,7 +608,6 @@ def _render_editor():
         key=editor_key,
     )
 
-    # Sync edits back vào session_state mỗi rerun
     changes = 0
     for _, row in edited.iterrows():
         bid     = row["ID"]
@@ -458,12 +631,13 @@ def _clear_state():
         st.session_state.pop(k, None)
     st.session_state.pop("word_translated_bytes_cache", None)
     st.session_state.pop("word_translations_version", None)
-    # Reset editor widget state
     for k in list(st.session_state.keys()):
         if k.startswith("word_editor") or k in ("word_only_missed_filter",
-                                                  "word_show_hf_filter"):
+                                                  "word_show_hf_filter",
+                                                  "word_glossary_editor"):
             st.session_state.pop(k, None)
     st.session_state["word_editor_version"] = 0
+    # KHÔNG xóa "word_tm" — TM persist xuyên suốt session
 
 
 def render():
@@ -471,19 +645,64 @@ def render():
     uploaded_docx = st.file_uploader("📝 Chọn file Word cần dịch",
                                       type=["docx"], key="word_uploader")
     lang_word = st.selectbox("🌐 Ngôn ngữ đích", LANGUAGES, key="word_lang_select")
+
+    # TM status sidebar info
+    tm_size = len(st.session_state.get("word_tm", {}))
+    if tm_size > 0:
+        cols = st.columns([3, 1])
+        cols[0].caption(f"💾 Translation Memory hiện có **{tm_size:,}** entries (persist trong session)")
+        if cols[1].button("🗑 Xóa TM", help="Reset Translation Memory",
+                          key="word_tm_clear"):
+            st.session_state.pop("word_tm", None)
+            st.rerun()
+
     st.divider()
 
-    if st.button("▶  Bắt đầu dịch Word",
-                 disabled=(uploaded_docx is None), key="word_run"):
-        _clear_state()
-        _run_full_translation(uploaded_docx, lang_word)
+    # ── PHASE 1: Phân tích ────────────────────────────────────────────────
+    col_a, col_b = st.columns(2)
+    with col_a:
+        analyze_clicked = st.button(
+            "🔬  Phân tích + Glossary",
+            disabled=(uploaded_docx is None),
+            use_container_width=True, key="word_analyze",
+            help="Extract paragraphs + build glossary từ thuật ngữ lặp lại",
+        )
+    with col_b:
+        # Quick mode: phân tích + dịch luôn (skip glossary review)
+        quick_clicked = st.button(
+            "⚡  Phân tích & dịch luôn",
+            disabled=(uploaded_docx is None),
+            use_container_width=True, key="word_quick",
+            help="Dùng glossary auto-build, không cần review",
+        )
 
-    # ── Kết quả + thao tác sau dịch ─────────────────────────────────────────
+    if analyze_clicked:
+        _clear_state()
+        _run_analysis(uploaded_docx, lang_word)
+
+    if quick_clicked:
+        _clear_state()
+        _run_analysis(uploaded_docx, lang_word)
+        # Sau analysis xong, session_state["word_analysis"] đã có
+        # Trigger Phase 2 ngay — nhưng cần rerun trước để UI hiển thị analysis
+        # Quick mode set flag → Phase 1 done → render() check flag → run Phase 2
+        st.session_state["word_quick_mode"] = True
+
+    # ── PHASE 1 RESULT: stats + glossary editor + Dịch button ───────────
+    if "word_analysis" in st.session_state:
+        st.divider()
+        # Quick mode: trigger Phase 2 ngay
+        if st.session_state.pop("word_quick_mode", False):
+            _run_full_translation()
+            st.rerun()
+        else:
+            _render_analysis_panel()
+
+    # ── PHASE 2 RESULT: download + rescan + H/F + editor ────────────────
     if "word_translations" in st.session_state:
         st.divider()
         st.success(st.session_state["word_summary"])
 
-        # Use cache — avoid rebuilding DOCX on every Streamlit rerun
         translated_bytes = _get_cached_translated_bytes()
         out_name = st.session_state["word_filename"].replace(
             ".docx", f"_translated_{st.session_state['word_lang'][:2]}.docx"
@@ -511,14 +730,14 @@ def render():
                     f"🔍  Quét bỏ sót ({len(missed_body)})",
                     disabled=(len(missed_body) == 0),
                     use_container_width=True, key="word_rescan_btn",
-                    help="Dịch lại các đoạn body API fail",
+                    help="Dịch lại các đoạn body API fail (TM auto)",
                 )
             with col_hf:
                 hf_clicked = st.button(
                     f"🌐  Dịch Header / Footer ({len(missed_hf)}/{total_hf})",
                     disabled=(len(missed_hf) == 0),
                     use_container_width=True, key="word_hf_btn",
-                    help="Dịch tất cả Header, Footer và đoạn lặp trong body",
+                    help="Dịch Header, Footer và đoạn lặp trong body (TM auto)",
                 )
         else:
             rescan_clicked = st.button(
@@ -531,13 +750,12 @@ def render():
             st.warning(f"⚠️ Còn {len(missed_body):,} đoạn body chưa dịch. "
                        f"Bấm **Quét bỏ sót** để dịch lại.")
         if total_hf > 0 and len(missed_hf) > 0:
-            st.info(f"📌 {len(missed_hf):,}/{total_hf:,} Header/Footer chưa dịch "
-                    f"(mặc định bỏ qua). Bấm **Dịch Header/Footer** nếu muốn dịch.")
+            st.info(f"📌 {len(missed_hf):,}/{total_hf:,} Header/Footer chưa dịch. "
+                    f"Bấm **Dịch Header/Footer** nếu muốn dịch.")
 
         with st.expander("📋  Xem & sửa bản dịch inline", expanded=False):
             _render_editor()
 
-        # Run heavy ops cuối hàm → progress UI full-width
         if rescan_clicked:
             _run_rescan()
             st.session_state["word_editor_version"] = (
