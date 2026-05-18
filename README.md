@@ -109,7 +109,9 @@ streamlit_app.py
 | **Parallel chunks** | `ThreadPoolExecutor` dịch 4 chunk cùng lúc → giảm thời gian ~4× |
 | **Adaptive chunking** | Chia theo ký tự (~8k chars/chunk), min 8 / max 40 paragraph/chunk |
 | **Per-chunk retry** | Mỗi chunk fail sẽ retry tối đa 3 lần với backoff 1s/2s/4s |
-| **Model fallback** | `gemini-2.5-flash-lite` → `flash` → `2.0-flash` → ... |
+| **Thread-safe model fallback** | `gemini-2.5-flash-lite` → `flash` → `2.0-flash` → ... (lock-protected, race-condition-free) |
+| **Cross-chunk glossary** | Trích top-30 thuật ngữ lặp lại → 1 Gemini call → inject vào mọi chunk prompt → dịch nhất quán |
+| **Inline format** | Bold/italic/underline encode thành `<b><i><u>` tags → AI giữ nguyên qua dịch → rebuild runs giữ font/size/color |
 | **Token + cost** | Cộng dồn input/output tokens → quy đổi USD/VND realtime |
 | **H/F detection** | Detect cả H/F thật (docx structure) **và** text lặp lại ≥3 lần trong body (heuristic) |
 | **Skip H/F by default** | Lần dịch đầu chỉ làm body. Bấm nút riêng để dịch H/F |
@@ -117,6 +119,7 @@ streamlit_app.py
 | **Inline edit** | `data_editor` — sửa trực tiếp bản dịch, cả body + H/F |
 | **Filter editor** | "Chỉ hiển thị đoạn chưa dịch" + "Hiện cả Header/Footer" |
 | **Quét bỏ sót** | Phát hiện đoạn API fail (translation == original) → dịch lại |
+| **Cached DOCX rebuild** | `apply_translations` chỉ chạy khi translations thay đổi (version counter) → mỗi rerun không rebuild DOCX |
 | **Role badges** | Header / Footer / 🔁 Lặp lại / Heading / Bullet / TOC / Cell / Note |
 | **Auto-detect role** | Heading / TOC / bullet / table_cell → prompt phù hợp từng loại |
 
@@ -131,6 +134,25 @@ streamlit_app.py
 5. User bấm "Dịch Header/Footer" → translate đúng các role này
 6. apply_translations() áp dụng MỌI translation trong dict
    (không phân biệt role) → file Word có đầy đủ
+```
+
+### Logic cross-chunk glossary
+
+```
+1. Sau extract, trích noun phrases + technical terms lặp lại ≥ 3 lần
+2. Gọi Gemini 1 lần để dịch top-30 thuật ngữ → {en: vi}
+3. Inject glossary vào mỗi chunk prompt ("USE THESE EXACT translations")
+4. Rescan + H/F translation tái dùng glossary đã build (stored in session_state)
+```
+
+### Logic inline format (bold/italic/underline)
+
+```
+1. extract: runs_to_tagged_text() → "<b>Important</b>: read <i>carefully</i>"
+2. prompt: thêm rule "PRESERVE <b><i><u> tags in translation"
+3. AI giữ nguyên hoặc dịch text quanh tags
+4. apply: replace_paragraph_with_tagged() parse tags → rebuild runs với format
+   Fallback về first-run-wins nếu paragraph có hyperlink/field
 ```
 
 ---
