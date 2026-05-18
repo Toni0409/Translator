@@ -48,12 +48,36 @@ def _iter_paragraphs_in_table(table):
                 yield from _iter_paragraphs_in_table(nested)
 
 
+def _iter_footnote_endnote_paragraphs(doc):
+    """
+    Yield (Paragraph, hint) cho footnotes và endnotes.
+    hint = "footnote" | "endnote".
+    Bỏ qua separator/continuation (id = -1, 0).
+    """
+    SKIP_IDS = {"-1", "0"}
+    for rel in doc.part.rels.values():
+        rt = rel.reltype
+        if "footnotes" not in rt and "endnotes" not in rt:
+            continue
+        hint = "footnote" if "footnotes" in rt else "endnote"
+        try:
+            root = rel.target_part._element
+            for fn in root:
+                if fn.get(qn("w:id"), "") in SKIP_IDS:
+                    continue
+                for p_elem in fn.iter(qn("w:p")):
+                    yield Paragraph(p_elem, parent=doc), hint
+        except Exception:
+            pass
+
+
 def _iter_blocks_with_meta(doc):
     """
     Single-walk generator → yield (paragraph, meta_dict) theo thứ tự ổn định.
 
     Meta = {
-      "role_hint":  "body" | "header" | "footer" | "textbox",
+      "role_hint":  "body" | "header" | "footer" | "textbox"
+                    | "footnote" | "endnote",
       "in_table":   bool,
       "table_cell": (T#, R#, C#) tuple 1-based, hoặc None,
     }
@@ -110,6 +134,9 @@ def _iter_blocks_with_meta(doc):
             yield Paragraph(p_elem, parent=doc), {
                 "role_hint": "textbox", "in_table": False, "table_cell": None,
             }
+    # Footnotes + endnotes
+    for para, hint in _iter_footnote_endnote_paragraphs(doc):
+        yield para, {"role_hint": hint, "in_table": False, "table_cell": None}
 
 
 def iter_all_paragraphs(doc):
@@ -146,18 +173,34 @@ def runs_to_tagged_text(paragraph) -> str:
     """
     Convert paragraph runs → tagged text. VD: '<b>Important</b>: read <i>carefully</i>'.
     Escape & < > trong text gốc để không xung đột với tag.
-    Bỏ qua hyperlink/field (sẽ fallback ở apply).
+    Bao gồm text bên trong w:hyperlink (URL được giữ nguyên khi apply).
     """
+    from docx.text.run import Run
     parts = []
-    for run in paragraph.runs:
-        text = run.text
-        if not text:
-            continue
-        text = _esc(text)
-        if run.bold:      text = f"<b>{text}</b>"
-        if run.italic:    text = f"<i>{text}</i>"
-        if run.underline: text = f"<u>{text}</u>"
-        parts.append(text)
+    for child in paragraph._p.iterchildren():
+        tag = child.tag.split("}", 1)[-1]
+        if tag == "r":
+            run = Run(child, paragraph)
+            text = run.text
+            if not text:
+                continue
+            text = _esc(text)
+            if run.bold:      text = f"<b>{text}</b>"
+            if run.italic:    text = f"<i>{text}</i>"
+            if run.underline: text = f"<u>{text}</u>"
+            parts.append(text)
+        elif tag == "hyperlink":
+            # Include hyperlink inner text — URL stays in XML, only text is translated
+            for r_elem in child.iterchildren(qn("w:r")):
+                run = Run(r_elem, paragraph)
+                text = run.text
+                if not text:
+                    continue
+                text = _esc(text)
+                if run.bold:      text = f"<b>{text}</b>"
+                if run.italic:    text = f"<i>{text}</i>"
+                if run.underline: text = f"<u>{text}</u>"
+                parts.append(text)
     return "".join(parts).strip()
 
 
@@ -209,25 +252,52 @@ def _paragraph_has_non_run_children(paragraph) -> bool:
 
 def replace_paragraph_text_keep_format(paragraph, new_text: str):
     """
-    Path 1 (legacy, dùng khi không có inline format hoặc paragraph phức tạp):
-    Thay text trong paragraph mà giữ format của run đầu tiên.
+    Replace paragraph text keeping format of first run.
+    Handles hyperlinks: collects ALL w:r elements (regular + inside w:hyperlink)
+    so translated text is written correctly even in hyperlink-only paragraphs.
+    Hyperlink URLs (relationships) are untouched; only inner text changes.
     """
-    runs = paragraph.runs
-    if not runs:
+    # Collect all w:r elements in document order, including inside w:hyperlink
+    all_r = []
+    for child in paragraph._p.iterchildren():
+        ctag = child.tag.split("}", 1)[-1]
+        if ctag == "r":
+            all_r.append(child)
+        elif ctag == "hyperlink":
+            all_r.extend(child.iterchildren(qn("w:r")))
+
+    if not all_r:
         paragraph.add_run(new_text)
         return
-    first_run = next((r for r in runs if r.text), None)
-    if first_run is None:
-        runs[0].text = new_text
-        return
-    first_run.text = new_text
-    after = False
-    for run in runs:
-        if run is first_run:
-            after = True
+
+    # Find first run that has non-empty text (use as formatting template)
+    first_r = next(
+        (r for r in all_r
+         if any((t.text or "").strip() for t in r.findall(qn("w:t")))),
+        all_r[0],
+    )
+
+    # Write new_text into first_r
+    t_elems = first_r.findall(qn("w:t"))
+    if t_elems:
+        t_elems[0].text = new_text
+        if new_text and (new_text[0] == " " or new_text[-1] == " "):
+            t_elems[0].set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        for t in t_elems[1:]:
+            t.text = ""
+    else:
+        from lxml import etree
+        t = etree.SubElement(first_r, qn("w:t"))
+        t.text = new_text
+        if new_text and (new_text[0] == " " or new_text[-1] == " "):
+            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+
+    # Clear all other runs (including hyperlink runs)
+    for r_elem in all_r:
+        if r_elem is first_r:
             continue
-        if after and run.text:
-            run.text = ""
+        for t in r_elem.findall(qn("w:t")):
+            t.text = ""
 
 
 def replace_paragraph_with_tagged(paragraph, tagged_text: str):
@@ -359,9 +429,11 @@ def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
             meta["role_hint"] == "header",
             meta["role_hint"] == "footer",
         )
-        # Override: textbox role chỉ khi không phải H/F
+        # Override special roles (chỉ khi không phải H/F thật)
         if meta["role_hint"] == "textbox" and role not in ("header", "footer"):
             role = "textbox"
+        if meta["role_hint"] in ("footnote", "endnote") and role not in ("header", "footer"):
+            role = meta["role_hint"]
         tagged = runs_to_tagged_text(para)
         blocks.append({
             "id":          f"p{idx}",
@@ -380,13 +452,15 @@ def count_by_role(blocks: list[dict]) -> dict:
     """Stat helper: đếm số block theo từng role + tổng theo nhóm."""
     counter = Counter(b["role"] for b in blocks)
     return {
-        "total":       len(blocks),
-        "body":        sum(c for r, c in counter.items() if r not in NO_TRANSLATE_ROLES),
-        "header":      counter.get("header", 0),
-        "footer":      counter.get("footer", 0),
+        "total":         len(blocks),
+        "body":          sum(c for r, c in counter.items() if r not in NO_TRANSLATE_ROLES),
+        "header":        counter.get("header", 0),
+        "footer":        counter.get("footer", 0),
         "body_repeated": counter.get("body_repeated", 0),
-        "hf_total":    sum(counter.get(r, 0) for r in NO_TRANSLATE_ROLES),
-        "by_role":     dict(counter),
+        "hf_total":      sum(counter.get(r, 0) for r in NO_TRANSLATE_ROLES),
+        "footnote":      counter.get("footnote", 0),
+        "endnote":       counter.get("endnote", 0),
+        "by_role":       dict(counter),
     }
 
 
@@ -603,6 +677,7 @@ Rules:
 - For table_cell: concise, consistent across row.
 - For note: keep WARNING/NOTE/CAUTION label verbatim.
 - For header/footer/body_repeated: concise like a page header/footer; preserve page numbers ("Page 1 of 10"), dates, document IDs verbatim.
+- For footnote/endnote: translate fully as body text; preserve footnote reference numbers (¹²³ or superscript digits) verbatim.
 
 Format:
 [{{"id":"...","text":"translated text"}}]

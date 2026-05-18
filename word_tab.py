@@ -186,13 +186,20 @@ def _run_analysis(uploaded_docx, lang_word):
         textbox_cnt  = sum(1 for b in blocks if b["role"] == "textbox")
         table_cnt    = sum(1 for b in blocks if b.get("table_cell"))
 
+        footnote_cnt = stats.get("footnote", 0)
+        endnote_cnt  = stats.get("endnote", 0)
+
         add_log(f"✅ {stats['total']:,} đoạn ({total_chars:,} ký tự body)")
         add_log(f"   • Body cần dịch:       {stats['body']:,}")
         add_log(f"   • Header/Footer (skip):{stats['hf_total']:,}")
         if textbox_cnt > 0:
-            add_log(f"   • Text-box / shape:    {textbox_cnt:,} (NEW — sẽ dịch)")
+            add_log(f"   • Text-box / shape:    {textbox_cnt:,} (sẽ dịch)")
         if table_cnt > 0:
             add_log(f"   • Cell bảng:           {table_cnt:,} → table-aware (T#R#C# context)")
+        if footnote_cnt > 0:
+            add_log(f"   • Footnotes:           {footnote_cnt:,} (sẽ dịch)")
+        if endnote_cnt > 0:
+            add_log(f"   • Endnotes:            {endnote_cnt:,} (sẽ dịch)")
 
         target_lang = LANG_EN[lang_word]
 
@@ -214,19 +221,21 @@ def _run_analysis(uploaded_docx, lang_word):
             add_log("📖 Không có thuật ngữ lặp đủ ngưỡng — bỏ qua glossary")
 
         st.session_state["word_analysis"] = {
-            "blocks":       blocks,
-            "translatable": translatable,
-            "stats":        stats,
-            "total_chars":  total_chars,
-            "textbox_cnt":  textbox_cnt,
-            "table_cnt":    table_cnt,
-            "tm_hits":      len(tm_cached),
-            "doc_context":  build_doc_context(blocks),
-            "glossary":     glossary,
-            "docx_bytes":   docx_bytes,
-            "filename":     uploaded_docx.name,
-            "lang":         lang_word,
-            "target_lang":  target_lang,
+            "blocks":        blocks,
+            "translatable":  translatable,
+            "stats":         stats,
+            "total_chars":   total_chars,
+            "textbox_cnt":   textbox_cnt,
+            "table_cnt":     table_cnt,
+            "footnote_cnt":  footnote_cnt,
+            "endnote_cnt":   endnote_cnt,
+            "tm_hits":       len(tm_cached),
+            "doc_context":   build_doc_context(blocks),
+            "glossary":      glossary,
+            "docx_bytes":    docx_bytes,
+            "filename":      uploaded_docx.name,
+            "lang":          lang_word,
+            "target_lang":   target_lang,
         }
         # Clear old kết quả từ lần dịch trước
         for k in ("word_blocks", "word_translations", "word_summary"):
@@ -248,7 +257,7 @@ def _render_analysis_panel():
     a = st.session_state["word_analysis"]
 
     st.markdown("### 📊 Kết quả phân tích")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.markdown(stat_box_html(f"{a['stats']['body']:,}", "Body cần dịch"),
                 unsafe_allow_html=True)
     c2.markdown(stat_box_html(f"{a['stats']['hf_total']:,}", "Header/Footer"),
@@ -256,6 +265,9 @@ def _render_analysis_panel():
     c3.markdown(stat_box_html(f"{a['textbox_cnt']:,}", "Text-box"),
                 unsafe_allow_html=True)
     c4.markdown(stat_box_html(f"{a['table_cnt']:,}", "Cell bảng"),
+                unsafe_allow_html=True)
+    fn_total = a.get("footnote_cnt", 0) + a.get("endnote_cnt", 0)
+    c5.markdown(stat_box_html(f"{fn_total:,}", "Footnote/Endnote"),
                 unsafe_allow_html=True)
 
     if a["tm_hits"] > 0:
@@ -541,6 +553,8 @@ ROLE_LABEL = {
     "header":          "📌 Header",
     "footer":          "📌 Footer",
     "body_repeated":   "🔁 Lặp lại",
+    "footnote":        "📝 Footnote",
+    "endnote":         "📝 Endnote",
 }
 
 
