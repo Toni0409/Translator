@@ -491,6 +491,33 @@ def _mark_repeating_as_hf(blocks: list[dict],
     return marked
 
 
+def _iter_image_alt_texts(doc):
+    """
+    Yield (element, attr_name, text) for every image alt-text/title in the doc.
+    Caller can later set element.set(attr_name, translated_text).
+
+    Covers:
+    - drawingML wp:docPr (descr, title)
+    - drawingML pic:cNvPr (descr, title)
+    - VML v:shape (alt)
+    """
+    WP_NS  = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    PIC_NS = "http://schemas.openxmlformats.org/drawingml/2006/picture"
+    VML_NS = "urn:schemas-microsoft-com:vml"
+
+    for tag in (f"{{{WP_NS}}}docPr", f"{{{PIC_NS}}}cNvPr"):
+        for el in doc.element.iter(tag):
+            for attr in ("descr", "title"):
+                val = (el.get(attr) or "").strip()
+                if val:
+                    yield el, attr, val
+
+    for el in doc.element.iter(f"{{{VML_NS}}}shape"):
+        val = (el.get("alt") or "").strip()
+        if val:
+            yield el, "alt", val
+
+
 def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
     """
     Đọc DOCX → list block {id, text, role, para_idx, table_cell, ...}.
@@ -531,6 +558,20 @@ def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
             "table_cell":  meta["table_cell"],   # (T,R,C) tuple hoặc None
         })
     _mark_repeating_as_hf(blocks)
+
+    # Image alt-texts (drawingML + VML). Appended AFTER body blocks so
+    # `apply_translations` can re-iterate `_iter_image_alt_texts` and match by order.
+    for i, (_, _, alt_text) in enumerate(_iter_image_alt_texts(doc)):
+        blocks.append({
+            "id":          f"IMG_ALT_{i}",
+            "text":        alt_text,
+            "text_tagged": alt_text,
+            "has_format":  False,
+            "role":        "image_alt",
+            "para_idx":    -1,
+            "table_cell":  None,
+        })
+
     return blocks
 
 
@@ -748,10 +789,14 @@ def _build_chunk_prompt(chunk: list[dict], target_lang: str, doc_context: str,
 
     custom_rules_section = ""
     if custom_rules:
+        extra = (custom_rules.get("_extra") or "").strip()
+        if extra:
+            custom_rules_section += f"\nAdditional instruction: {extra}\n"
         lines = [f"- For {role}: {rule.strip()}"
-                 for role, rule in custom_rules.items() if rule.strip()]
+                 for role, rule in custom_rules.items()
+                 if role != "_extra" and isinstance(rule, str) and rule.strip()]
         if lines:
-            custom_rules_section = (
+            custom_rules_section += (
                 "\nCustom rules (override defaults for these roles):\n"
                 + "\n".join(lines) + "\n"
             )
@@ -779,6 +824,7 @@ Rules:
 - For header/footer/body_repeated: concise like a page header/footer; preserve page numbers ("Page 1 of 10"), dates, document IDs verbatim.
 - For footnote/endnote: translate fully as body text; preserve footnote reference numbers (¹²³ or superscript digits) verbatim.
 - For comment: translate the comment text naturally as body text.
+- For image_alt: concise description (max ~100 chars), suitable as screen-reader alt-text.
 
 Format:
 [{{"id":"...","text":"translated text"}}]
@@ -922,6 +968,8 @@ def apply_translations(original_bytes: bytes, blocks: list[dict],
     idx_to_para = {idx: para for idx, para in enumerate(iter_all_paragraphs(doc))}
 
     for block in blocks:
+        if block.get("role") == "image_alt":
+            continue
         tr   = translations.get(block["id"])
         para = idx_to_para.get(block.get("para_idx"))
         if not tr or para is None:
@@ -933,6 +981,17 @@ def apply_translations(original_bytes: bytes, blocks: list[dict],
                 replace_paragraph_text_keep_format(para, tr)
         except Exception:
             pass
+
+    # Image alt-texts: re-iterate in same order as extract; match to blocks by sequence.
+    alt_iter   = list(_iter_image_alt_texts(doc))
+    alt_blocks = [b for b in blocks if b.get("role") == "image_alt"]
+    for (el, attr, _), block in zip(alt_iter, alt_blocks):
+        tr = translations.get(block["id"])
+        if tr:
+            try:
+                el.set(attr, tr)
+            except Exception:
+                pass
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -1111,3 +1170,123 @@ def find_missed(blocks: list[dict], translations: dict,
         in_set = lambda r: r not in NO_TRANSLATE_ROLES
     return [b for b in blocks
             if in_set(b["role"]) and _is_untranslated(b, translations)]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMAGE OCR + TRANSLATE (Gemini Vision)
+# ══════════════════════════════════════════════════════════════════════════════
+def extract_images_from_docx(docx_bytes: bytes) -> list[dict]:
+    """
+    Returns list of {id, filename, content_type, data: bytes} for every image
+    in the DOCX (word/media/* parts).
+    """
+    import zipfile
+    images = []
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+        for name in zf.namelist():
+            if not name.startswith("word/media/") or "." not in name:
+                continue
+            ext = name.rsplit(".", 1)[-1].lower()
+            if ext in ("png", "jpg", "jpeg", "gif", "bmp", "webp"):
+                mime_ext = "jpeg" if ext == "jpg" else ext
+                images.append({
+                    "id":           f"IMG_{len(images)}",
+                    "filename":     name.rsplit("/", 1)[-1],
+                    "content_type": f"image/{mime_ext}",
+                    "data":         zf.read(name),
+                })
+    return images
+
+
+def ocr_and_translate_images(client, images: list[dict], target_lang: str) -> dict:
+    """
+    For each image, call Gemini Vision: detect text, OCR it, translate.
+    Returns {image_id: {"ocr": str, "translation": str, "has_text": bool, "error"?: str}}.
+    Skips tiny images (< 5KB) — likely icons/decoration.
+    """
+    from google.genai import types as gtypes
+    results = {}
+    model = get_working_model() or WORD_MODELS[0]
+    for img in images:
+        if len(img["data"]) < 5000:
+            results[img["id"]] = {"ocr": "", "translation": "", "has_text": False}
+            continue
+        prompt = (
+            f"Analyze this image. If it contains readable text, do BOTH:\n"
+            f"1) Extract the text verbatim (OCR)\n"
+            f"2) Translate the text to {target_lang}\n\n"
+            f"Respond as JSON: {{\"has_text\": true/false, \"ocr\": \"...\", \"translation\": \"...\"}}\n"
+            f"If no readable text, return {{\"has_text\": false}}."
+        )
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[
+                    gtypes.Part.from_bytes(data=img["data"], mime_type=img["content_type"]),
+                    prompt,
+                ],
+                config=gtypes.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.2,
+                ),
+            )
+            data = parse_json_loose(response.text) or {}
+            if not isinstance(data, dict):
+                data = {}
+            results[img["id"]] = {
+                "ocr":         str(data.get("ocr", "") or "").strip(),
+                "translation": str(data.get("translation", "") or "").strip(),
+                "has_text":    bool(data.get("has_text", False)),
+            }
+        except Exception as e:
+            results[img["id"]] = {
+                "ocr": "", "translation": "", "has_text": False,
+                "error": str(e)[:120],
+            }
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GLOSSARY SUGGEST (LLM-based, domain-aware)
+# ══════════════════════════════════════════════════════════════════════════════
+def suggest_glossary(client, blocks: list[dict], target_lang: str,
+                     max_terms: int = 20) -> list[dict]:
+    """
+    Sample body text from blocks, ask LLM for domain-specific terms
+    that should be in a glossary. Returns list of {"term", "suggested", "note"}.
+    """
+    from google.genai import types as gtypes
+    body_text = "\n".join(
+        b["text"] for b in blocks
+        if b.get("role") in ("paragraph", "section_heading", "bullet")
+    )
+    body_text = body_text[:6000]
+    if not body_text.strip():
+        return []
+    prompt = (
+        f"Analyze the following document text. Identify up to {max_terms} domain-specific "
+        f"terms, technical jargon, brand names, or recurring concepts that should be "
+        f"translated consistently to {target_lang}.\n\n"
+        f"For each term, propose a translation and a brief note explaining why it matters.\n\n"
+        f"Return JSON: {{\"terms\": [{{\"term\": \"...\", \"suggested\": \"...\", \"note\": \"...\"}}]}}\n\n"
+        f"Document text:\n{body_text}"
+    )
+    model = get_working_model() or WORD_MODELS[0]
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=gtypes.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.3,
+            ),
+        )
+        data = parse_json_loose(response.text) or {}
+        if not isinstance(data, dict):
+            return []
+        terms = data.get("terms", [])
+        if not isinstance(terms, list):
+            return []
+        return [t for t in terms if isinstance(t, dict) and t.get("term")][:max_terms]
+    except Exception:
+        return []
