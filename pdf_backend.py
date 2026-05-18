@@ -2,12 +2,19 @@
 PDF backend: extract text spans, gọi Gemini, ghi lại PDF giữ nguyên layout.
 
 3 nhóm logic chính:
-1. Extract  : `extract_line_groups`, `parse_page_range`
-2. Translate: `translate_page` + helpers (`call_gemini_live` xử lý retry & live timer)
-3. Render   : `write_translated_pdf` + font helpers
+1. Extract  : `extract_line_groups`, `parse_page_range`, `extract_pdf_images`,
+              `build_pdf_glossary`
+2. Translate: `translate_page` (sequential + live UI), `translate_page_pure`,
+              `translate_pages_parallel`, `ocr_pdf_images`
+3. Render   : `write_translated_pdf` (with text wrap), `insert_ocr_captions_into_pdf`
 """
+import io
 import os
+import re
+import threading
 import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import fitz
@@ -206,11 +213,15 @@ def parse_page_range(s: str, total: int) -> list[int]:
 # RENDER
 # ══════════════════════════════════════════════════════════════════════════════
 def _insert_line(page, font_path, font_bold_path, bbox, text, fontsize, color, bold):
-    x0, y0, _, y1 = bbox
-    pw, ph        = page.rect.width, page.rect.height
-    x1_use        = pw - 30
-    line_h        = max(y1 - y0, fontsize * 1.5)
-    y1_use        = min(y0 + line_h * 3, ph - 10)
+    """
+    Insert translated text. Strategy:
+    1. Try to fit at original font size by expanding vertical area (wrap to multi-line)
+    2. Only scale down font (min 6pt) if multi-line wrap still doesn't fit
+    """
+    x0, y0, x1, y1 = bbox
+    pw, ph         = page.rect.width, page.rect.height
+    x1_use         = max(x1, pw - 30)
+    line_h         = max(y1 - y0, fontsize * 1.2)
 
     if font_path:
         fontfile = font_bold_path if bold and font_bold_path else font_path
@@ -223,13 +234,26 @@ def _insert_line(page, font_path, font_bold_path, bbox, text, fontsize, color, b
         fontname = "hebo" if bold else "helv"
 
     size = max(fontsize, 5.0)
-    while size >= 4.0:
+
+    # Step 1: try multi-line wrap at original size (1, 2, 3, 4, 5 lines)
+    for n_lines in (1, 2, 3, 4, 5):
+        y1_try = min(y0 + line_h * n_lines, ph - 10)
         rc = page.insert_textbox(
-            fitz.Rect(x0, y0, x1_use, y1_use),
+            fitz.Rect(x0, y0, x1_use, y1_try),
             text, fontsize=size, fontname=fontname, color=color, align=0,
         )
         if rc >= 0:
-            break
+            return
+
+    # Step 2: extra-tall area + scale font down (min 6pt — still readable)
+    y1_max = ph - 10
+    while size >= 6.0:
+        rc = page.insert_textbox(
+            fitz.Rect(x0, y0, x1_use, y1_max),
+            text, fontsize=size, fontname=fontname, color=color, align=0,
+        )
+        if rc >= 0:
+            return
         size -= 0.5
 
 
@@ -338,13 +362,12 @@ def _format_group_for_prompt(i: int, g: dict) -> str:
     return f"[{i}] {g['text']}"
 
 
-def translate_page(client, groups: list, target_lang: str, page_idx: int,
-                   timer_ph, t0: float, page_start: float,
-                   log_lines: list, log_ph):
-    """Dịch 1 trang PDF (1 list line groups) → list[str] cùng độ dài."""
-    numbered     = "\n".join(_format_group_for_prompt(i, g) for i, g in enumerate(groups))
-    has_tables   = any(g.get("cell") for g in groups)
-    table_hint   = (
+def _build_page_prompt(groups: list, target_lang: str,
+                       glossary: list[str] | None = None) -> str:
+    """Build prompt for translating 1 page of line groups."""
+    numbered   = "\n".join(_format_group_for_prompt(i, g) for i, g in enumerate(groups))
+    has_tables = any(g.get("cell") for g in groups)
+    table_hint = (
         "\nMột số dòng có dạng (T# R# C#) — đó là cell trong bảng "
         "(T = số bảng, R = row, C = column).\n"
         "Khi dịch các cell bảng:\n"
@@ -354,22 +377,275 @@ def translate_page(client, groups: list, target_lang: str, page_idx: int,
         "- Mã / serial / model code → GIỮ NGUYÊN\n"
         if has_tables else ""
     )
-    prompt = (
+    glossary_hint = ""
+    if glossary:
+        terms = ", ".join(glossary[:30])
+        glossary_hint = (
+            f"\nThuật ngữ lặp lại nhiều lần trong tài liệu — dịch consistent "
+            f"(dùng cùng 1 cách dịch xuyên suốt):\n{terms}\n"
+        )
+    return (
         f"Dịch sang {target_lang}. Giữ nguyên số thứ tự [0]...[{len(groups)-1}].\n"
         f"{table_hint}"
+        f"{glossary_hint}"
         f"Trả về JSON object, ĐẦY ĐỦ từ \"0\" đến \"{len(groups)-1}\", không bỏ sót.\n"
         f"KHÔNG kèm prefix (T# R# C#) trong bản dịch — chỉ trả về text đã dịch:\n"
         f"{{\"0\": \"bản dịch\", \"1\": \"bản dịch\", ...}}\n"
         f"Chỉ JSON, không giải thích.\n\n"
         f"{numbered}"
     )
-    label = f"Đang dịch trang {page_idx + 1}"
+
+
+def _parse_page_response(raw: str, groups: list) -> list[str]:
+    """Parse Gemini JSON response → list[str] same length as groups."""
+    parsed = parse_json_loose(raw)
+    if isinstance(parsed, dict):
+        return [str(parsed.get(str(i), groups[i]["text"])) for i in range(len(groups))]
+    if isinstance(parsed, list) and len(parsed) == len(groups):
+        return [str(x) for x in parsed]
+    return [g["text"] for g in groups]
+
+
+def translate_page(client, groups: list, target_lang: str, page_idx: int,
+                   timer_ph, t0: float, page_start: float,
+                   log_lines: list, log_ph,
+                   glossary: list[str] | None = None):
+    """Dịch 1 trang PDF (sequential mode — có live timer UI)."""
+    prompt = _build_page_prompt(groups, target_lang, glossary)
+    label  = f"Đang dịch trang {page_idx + 1}"
     raw, in_t, out_t = call_gemini_live(
         client, prompt, timer_ph, t0, page_start, label, log_lines, log_ph
     )
-    parsed = parse_json_loose(raw)
-    if isinstance(parsed, dict):
-        return [str(parsed.get(str(i), groups[i]["text"])) for i in range(len(groups))], in_t, out_t
-    if isinstance(parsed, list) and len(parsed) == len(groups):
-        return [str(x) for x in parsed], in_t, out_t
-    return [g["text"] for g in groups], in_t, out_t
+    return _parse_page_response(raw, groups), in_t, out_t
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARALLEL PAGE TRANSLATION — không có live timer, dùng ThreadPoolExecutor
+# ══════════════════════════════════════════════════════════════════════════════
+def _call_gemini_with_retry(client, prompt: str) -> tuple[str, int, int]:
+    """Sync call with exponential backoff on rate limit. Returns (text, in_tok, out_tok)."""
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = generate(client, PDF_MODEL, prompt,
+                            max_output_tokens=65_536, temperature=0.1)
+            in_t, out_t = usage_tokens(resp)
+            return resp.text.strip(), in_t, out_t
+        except Exception as e:
+            last_err = e
+            err_str = str(e).lower()
+            is_rate = any(c in err_str for c in RETRY_CODES)
+            if is_rate and attempt < MAX_RETRIES - 1:
+                time.sleep((2 ** attempt) * 5)
+            elif attempt < MAX_RETRIES - 1:
+                time.sleep(2 ** attempt)
+            else:
+                raise last_err
+    raise last_err
+
+
+def translate_page_pure(client, groups: list, target_lang: str,
+                        glossary: list[str] | None = None
+                        ) -> tuple[list[str], int, int, str | None]:
+    """Pure translate (no UI) — used by parallel processor. Returns (trans, in_t, out_t, error)."""
+    if not groups:
+        return [], 0, 0, None
+    prompt = _build_page_prompt(groups, target_lang, glossary)
+    try:
+        raw, in_t, out_t = _call_gemini_with_retry(client, prompt)
+        return _parse_page_response(raw, groups), in_t, out_t, None
+    except Exception as e:
+        return [g["text"] for g in groups], 0, 0, str(e)
+
+
+def translate_pages_parallel(client, all_groups: dict, target_lang: str,
+                             targets: list[int],
+                             max_workers: int = 4,
+                             glossary: list[str] | None = None,
+                             progress_callback=None):
+    """
+    Translate multiple pages concurrently with ThreadPoolExecutor.
+    progress_callback(page_idx, done_count, total, in_tok_delta, out_tok_delta, error).
+    Returns (all_trans: dict, total_in_tok, total_out_tok, errors: dict).
+    """
+    all_trans: dict = {}
+    errors: dict = {}
+    total_in = total_out = 0
+    done_count = 0
+    total = len(targets)
+    lock = threading.Lock()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(translate_page_pure, client, all_groups.get(pi, []),
+                      target_lang, glossary): pi
+            for pi in targets
+        }
+        for future in as_completed(futures):
+            pi = futures[future]
+            try:
+                trans, in_t, out_t, err = future.result()
+            except Exception as e:
+                trans, in_t, out_t, err = (
+                    [g["text"] for g in all_groups.get(pi, [])], 0, 0, str(e),
+                )
+            all_trans[pi] = trans
+            if err:
+                errors[pi] = err
+            with lock:
+                total_in  += in_t
+                total_out += out_t
+                done_count += 1
+                snapshot = (done_count, total_in, total_out)
+            if progress_callback:
+                progress_callback(pi, snapshot[0], total, in_t, out_t, err)
+
+    return all_trans, total_in, total_out, errors
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GLOSSARY — frequency-based proper noun / acronym detection
+# ══════════════════════════════════════════════════════════════════════════════
+def build_pdf_glossary(all_groups: dict, min_count: int = 2,
+                       max_terms: int = 30) -> list[str]:
+    """
+    Scan all extracted text for capitalized terms (proper nouns, acronyms, CamelCase)
+    that appear >= min_count times. Returns top N by frequency for prompt consistency.
+    """
+    counter: Counter = Counter()
+    # Match: ACRONYM (2+ caps), CamelCase, Proper noun (Cap + 2+ letters)
+    pattern = re.compile(r"\b[A-Z][A-Za-z0-9]{2,}\b")
+    for groups in all_groups.values():
+        for g in groups:
+            for term in pattern.findall(g["text"]):
+                # Skip common English words that just happen to be capitalized
+                if term.lower() in {"the", "and", "for", "with", "from", "this",
+                                    "that", "page", "table", "figure"}:
+                    continue
+                counter[term] += 1
+    return [term for term, c in counter.most_common(max_terms) if c >= min_count]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OCR — extract embedded images from PDF and translate text in them
+# ══════════════════════════════════════════════════════════════════════════════
+def extract_pdf_images(pdf_path: str, page_nums: list[int] | None = None) -> list[dict]:
+    """
+    Extract embedded images from PDF pages.
+    Returns list of {id, page_idx, xref, bbox, content_type, data}.
+    bbox = position on page (None if image not placed via standard refs).
+    """
+    out: list[dict] = []
+    doc = fitz.open(pdf_path)
+    total = len(doc)
+    targets = page_nums if page_nums else list(range(total))
+    seen_xrefs: set = set()
+
+    for pi in targets:
+        if not (0 <= pi < total):
+            continue
+        page = doc[pi]
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+            try:
+                base = doc.extract_image(xref)
+            except Exception:
+                continue
+            data = base.get("image")
+            ext  = base.get("ext", "png")
+            if not data or len(data) < 5000:
+                continue
+            # Find bbox on page (first occurrence)
+            bbox = None
+            try:
+                rects = page.get_image_rects(xref)
+                if rects:
+                    bbox = tuple(rects[0])
+            except Exception:
+                pass
+            out.append({
+                "id":           f"PDFIMG_{len(out)}",
+                "page_idx":     pi,
+                "xref":         xref,
+                "bbox":         bbox,
+                "content_type": f"image/{'jpeg' if ext == 'jpg' else ext}",
+                "data":         data,
+            })
+    doc.close()
+    return out
+
+
+def ocr_pdf_images(client, images: list[dict], target_lang: str,
+                   progress_callback=None, max_workers: int = 4) -> dict:
+    """
+    OCR + translate PDF images in parallel. Reuses word_backend's _ocr_single_image.
+    Returns {image_id: {ocr, translation, has_text, error?}}.
+    """
+    from word_backend import _ocr_single_image, get_working_model, WORD_MODELS
+
+    results: dict = {}
+    model = get_working_model() or WORD_MODELS[0]
+    if not images:
+        return results
+
+    done = 0
+    total = len(images)
+    lock = threading.Lock()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(_ocr_single_image, client, img, target_lang, model): img
+            for img in images
+        }
+        for future in as_completed(futures):
+            img = futures[future]
+            try:
+                results[img["id"]] = future.result()
+            except Exception as e:
+                results[img["id"]] = {
+                    "ocr": "", "translation": "", "has_text": False, "error": str(e),
+                }
+            with lock:
+                done += 1
+                current = done
+            if progress_callback:
+                progress_callback(current, total)
+    return results
+
+
+def insert_ocr_captions_into_pdf(pdf_path: str, dst_path: str,
+                                 images: list[dict], ocr_results: dict,
+                                 font_path: str | None = None) -> int:
+    """
+    Annotate each image (that has translated text) with a yellow text annotation
+    containing the OCR translation. Saves modified PDF to dst_path.
+    Returns number of captions inserted.
+    """
+    doc = fitz.open(pdf_path)
+    inserted = 0
+    for img in images:
+        r = ocr_results.get(img["id"], {})
+        if not (r.get("has_text") and r.get("translation")):
+            continue
+        if img.get("bbox") is None:
+            continue
+        page = doc[img["page_idx"]]
+        bbox = fitz.Rect(img["bbox"])
+        # Anchor annotation at top-left of image
+        try:
+            annot = page.add_text_annot(
+                (bbox.x0, bbox.y0),
+                f"[OCR] {r['translation']}",
+                icon="Comment",
+            )
+            annot.set_colors(stroke=(1.0, 0.85, 0.2))
+            annot.update()
+            inserted += 1
+        except Exception:
+            pass
+    doc.save(dst_path, garbage=4, deflate=True)
+    doc.close()
+    return inserted

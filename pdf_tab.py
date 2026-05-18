@@ -15,10 +15,16 @@ from ui_common import (
 from pdf_backend import (
     extract_line_groups, parse_page_range, find_font,
     translate_page, write_translated_pdf,
+    translate_pages_parallel, build_pdf_glossary,
+    extract_pdf_images, ocr_pdf_images, insert_ocr_captions_into_pdf,
 )
 
 
-def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s):
+def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
+                         use_parallel: bool = False,
+                         use_glossary: bool = False,
+                         use_ocr: bool = False,
+                         parallel_workers: int = 4):
     """Chạy pipeline dịch PDF và lưu kết quả vào session_state."""
     st.markdown("### 📊 Tiến độ")
     timer_ph = st.empty()
@@ -81,36 +87,78 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s):
         tok_in = tok_out = 0
         t0 = time.time()
 
-        for idx, pi in enumerate(targets):
-            groups     = all_groups.get(pi, [])
-            page_start = time.time()
-            pct        = int(10 + (idx / len(targets)) * 80)
-            prog.progress(pct, text=f"Dịch trang {pi + 1}/{total_pg}...")
-            add_log(f"📄 Trang {pi + 1}/{total_pg}: {len(groups)} dòng — gửi API...")
+        # Optional: build glossary
+        glossary = None
+        if use_glossary:
+            glossary = build_pdf_glossary(all_groups)
+            if glossary:
+                preview = ", ".join(glossary[:10])
+                more = f" (+{len(glossary)-10})" if len(glossary) > 10 else ""
+                add_log(f"📚 Glossary: {len(glossary)} thuật ngữ lặp → {preview}{more}")
+            else:
+                add_log("📚 Không tìm thấy thuật ngữ lặp")
 
-            if not groups:
-                all_trans[pi] = []
-                timer_ph.markdown(
-                    timer_box_html(time.time() - t0, f"⏭ Trang {pi+1} trống, bỏ qua"),
-                    unsafe_allow_html=True,
-                )
-                continue
+        if use_parallel and len(targets) > 1:
+            add_log(f"⚡ Parallel mode: {parallel_workers} workers")
+            page_results: dict[int, dict] = {}
 
-            try:
-                trans, in_t, out_t = translate_page(
-                    client, groups, lang_pdf, pi,
-                    timer_ph, t0, page_start, log_lines, log_ph,
-                )
+            def on_page_done(pi, done, total, in_t, out_t, err):
+                nonlocal tok_in, tok_out
                 tok_in  += in_t
                 tok_out += out_t
-                add_log(f"   ✅ {len(trans)} dòng ({in_t:,}in/{out_t:,}out tok) — {time.time()-page_start:.1f}s")
-            except Exception as e:
-                add_log(f"   ❌ Lỗi trang {pi + 1}: {e}")
-                trans = [g["text"] for g in groups]
+                page_results[pi] = {"in_t": in_t, "out_t": out_t, "err": err}
+                pct = int(10 + (done / total) * 80)
+                prog.progress(pct, text=f"Dịch {done}/{total} trang xong...")
+                status = "❌" if err else "✅"
+                msg = f"   {status} Trang {pi+1} ({in_t:,}in/{out_t:,}out)"
+                if err:
+                    msg += f" — Lỗi: {err[:120]}"
+                add_log(msg)
+                render_stats(done, total_pg, total_lines, tok_in, tok_out)
+                timer_ph.markdown(
+                    timer_box_html(time.time() - t0,
+                                   f"⚡ Đang dịch song song — {done}/{total} trang xong"),
+                    unsafe_allow_html=True,
+                )
 
-            all_trans[pi] = trans
-            render_stats(idx + 1, total_pg, total_lines, tok_in, tok_out)
-            time.sleep(PDF_DELAY)
+            all_trans, tok_in, tok_out, errors = translate_pages_parallel(
+                client, all_groups, lang_pdf, targets,
+                max_workers=parallel_workers,
+                glossary=glossary,
+                progress_callback=on_page_done,
+            )
+        else:
+            for idx, pi in enumerate(targets):
+                groups     = all_groups.get(pi, [])
+                page_start = time.time()
+                pct        = int(10 + (idx / len(targets)) * 80)
+                prog.progress(pct, text=f"Dịch trang {pi + 1}/{total_pg}...")
+                add_log(f"📄 Trang {pi + 1}/{total_pg}: {len(groups)} dòng — gửi API...")
+
+                if not groups:
+                    all_trans[pi] = []
+                    timer_ph.markdown(
+                        timer_box_html(time.time() - t0, f"⏭ Trang {pi+1} trống, bỏ qua"),
+                        unsafe_allow_html=True,
+                    )
+                    continue
+
+                try:
+                    trans, in_t, out_t = translate_page(
+                        client, groups, lang_pdf, pi,
+                        timer_ph, t0, page_start, log_lines, log_ph,
+                        glossary=glossary,
+                    )
+                    tok_in  += in_t
+                    tok_out += out_t
+                    add_log(f"   ✅ {len(trans)} dòng ({in_t:,}in/{out_t:,}out tok) — {time.time()-page_start:.1f}s")
+                except Exception as e:
+                    add_log(f"   ❌ Lỗi trang {pi + 1}: {e}")
+                    trans = [g["text"] for g in groups]
+
+                all_trans[pi] = trans
+                render_stats(idx + 1, total_pg, total_lines, tok_in, tok_out)
+                time.sleep(PDF_DELAY)
 
         prog.progress(92, text="Tạo PDF...")
         add_log("💾 Đang tạo PDF...")
@@ -121,6 +169,36 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s):
         font_path = find_font()
         add_log(f"🔤 Font: {os.path.basename(font_path) if font_path else 'built-in'}")
         write_translated_pdf(src_path, dst_path, all_groups, all_trans, font_path)
+
+        # Optional: OCR embedded images, add as PDF annotations on the translated file
+        if use_ocr:
+            prog.progress(94, text="OCR ảnh trong PDF...")
+            add_log("🖼 Đang trích ảnh từ PDF...")
+            imgs = extract_pdf_images(src_path, targets)
+            if not imgs:
+                add_log("🖼 Không có ảnh phù hợp để OCR (≥ 5KB)")
+            else:
+                add_log(f"🖼 Tìm thấy {len(imgs)} ảnh — đang OCR + dịch song song...")
+
+                def on_ocr_progress(done, total):
+                    pct = int(94 + (done / total) * 4)
+                    prog.progress(pct, text=f"OCR ảnh {done}/{total}...")
+                    timer_ph.markdown(
+                        timer_box_html(time.time() - t0, f"🖼 OCR ảnh {done}/{total}"),
+                        unsafe_allow_html=True,
+                    )
+
+                ocr_results = ocr_pdf_images(
+                    client, imgs, lang_pdf,
+                    progress_callback=on_ocr_progress,
+                )
+                with_text = sum(1 for r in ocr_results.values() if r.get("has_text"))
+                add_log(f"🖼 OCR xong: {with_text}/{len(imgs)} ảnh có text")
+                if with_text > 0:
+                    inserted = insert_ocr_captions_into_pdf(
+                        dst_path, dst_path, imgs, ocr_results, font_path,
+                    )
+                    add_log(f"📎 Đã chèn {inserted} OCR caption (annotation màu vàng) vào PDF")
 
         elapsed  = time.time() - t0
         usd, vnd = calc_cost(tok_in, tok_out)
@@ -167,12 +245,41 @@ def render():
         pages_s = st.text_input("📑 Trang cụ thể (tuỳ chọn)",
                                 placeholder="Vd: 1-5,8  •  Để trống = tất cả",
                                 key="pdf_pages")
+
+    with st.expander("⚙️ Tuỳ chọn nâng cao", expanded=False):
+        c1, c2 = st.columns(2)
+        use_parallel = c1.checkbox(
+            "⚡ Dịch song song nhiều trang",
+            value=True, key="pdf_parallel",
+            help="Tăng tốc đáng kể với PDF nhiều trang. Tắt nếu muốn xem live timer từng trang.",
+        )
+        parallel_workers = c2.slider(
+            "Số worker song song", 2, 8, 4, key="pdf_workers",
+            disabled=not use_parallel,
+        )
+        use_glossary = st.checkbox(
+            "📚 Tự build glossary để dịch consistent",
+            value=True, key="pdf_glossary",
+            help="Phát hiện thuật ngữ lặp lại và đảm bảo dịch nhất quán xuyên suốt tài liệu.",
+        )
+        use_ocr = st.checkbox(
+            "🖼 OCR text trong ảnh embedded",
+            value=False, key="pdf_ocr",
+            help="Trích ảnh từ PDF, OCR + dịch text trong ảnh, chèn vào PDF dưới dạng annotation màu vàng.",
+        )
+
     st.divider()
 
     if st.button("▶  Bắt đầu dịch PDF", disabled=(uploaded_pdf is None), key="pdf_run"):
         for k in ("pdf_bytes", "pdf_out_name", "pdf_summary"):
             st.session_state.pop(k, None)
-        _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s)
+        _run_pdf_translation(
+            uploaded_pdf, lang_pdf, pages_s,
+            use_parallel=use_parallel,
+            use_glossary=use_glossary,
+            use_ocr=use_ocr,
+            parallel_workers=parallel_workers,
+        )
 
     if "pdf_bytes" in st.session_state:
         st.divider()
