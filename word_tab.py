@@ -219,6 +219,9 @@ def _run_analysis(uploaded_docx, lang_word):
         comment_cnt = stats.get("comment", 0)
         if comment_cnt > 0:
             add_log(f"   • Comments:             {comment_cnt:,} (sẽ dịch)")
+        image_alt_cnt = stats.get("by_role", {}).get("image_alt", 0)
+        if image_alt_cnt > 0:
+            add_log(f"   • Image alt-texts:      {image_alt_cnt:,} (sẽ dịch)")
 
         target_lang = LANG_EN[lang_word]
 
@@ -336,6 +339,45 @@ def _render_analysis_panel():
         f"📚 Glossary ({len(a['glossary'])} thuật ngữ) — bấm để review / sửa",
         expanded=False,
     ):
+        # LLM glossary suggest — works whether or not heuristic glossary is empty
+        if st.button("🪄 Gợi ý glossary từ LLM", key="word_glossary_suggest"):
+            from word_backend import suggest_glossary
+            with st.spinner("Đang phân tích doc..."):
+                suggestions = suggest_glossary(
+                    get_client(), a["blocks"], a["target_lang"],
+                )
+                st.session_state["word_glossary_suggestions"] = suggestions
+
+        if "word_glossary_suggestions" in st.session_state:
+            sugg = st.session_state["word_glossary_suggestions"]
+            if sugg:
+                st.markdown(f"**🪄 {len(sugg)} gợi ý** — chọn để thêm vào glossary:")
+                df_sug = pd.DataFrame([{
+                    "✓":         False,
+                    "Term":      s.get("term", ""),
+                    "Suggested": s.get("suggested", ""),
+                    "Note":      s.get("note", ""),
+                } for s in sugg])
+                edited_sug = st.data_editor(
+                    df_sug, hide_index=True, use_container_width=True,
+                    key="word_glossary_sugg_edit",
+                    column_config={
+                        "✓": st.column_config.CheckboxColumn(required=True),
+                    },
+                )
+                if st.button("➕ Thêm các từ đã chọn", key="word_glossary_sugg_add"):
+                    added = 0
+                    for _, row in edited_sug.iterrows():
+                        if row["✓"] and row["Term"]:
+                            a["glossary"][row["Term"]] = row["Suggested"]
+                            added += 1
+                    st.session_state["word_analysis"] = a
+                    st.success(f"Đã thêm {added} thuật ngữ vào glossary")
+                    st.session_state.pop("word_glossary_suggestions", None)
+                    st.rerun()
+            else:
+                st.info("LLM không tìm được thuật ngữ nào (hoặc API fail).")
+
         if not a["glossary"]:
             st.info("Không có thuật ngữ lặp lại đủ ngưỡng (≥3 lần). Vẫn dịch được — chỉ là không có guarantee consistency.")
         else:
@@ -711,6 +753,7 @@ ROLE_LABEL = {
     "footnote":        "📝 Footnote",
     "endnote":         "📝 Endnote",
     "comment":         "💬 Comment",
+    "image_alt":       "🖼 Image alt",
 }
 
 
@@ -1009,6 +1052,51 @@ def render():
                 key="word_review_editor",
             )
 
+            st.markdown("---")
+            st.markdown("**🔄 Dịch lại đoạn cụ thể** (tuỳ chọn — dùng prompt bổ sung):")
+            all_block_ids = [
+                b["id"] for b in st.session_state["word_blocks"]
+                if b["role"] not in NO_TRANSLATE_ROLES
+                and st.session_state["word_translations"].get(b["id"])
+            ]
+            blocks_by_id_lookup = {b["id"]: b for b in st.session_state["word_blocks"]}
+            selected_ids = st.multiselect(
+                "Chọn đoạn cần dịch lại:",
+                options=all_block_ids,
+                format_func=lambda bid: (
+                    f"{bid} — "
+                    + (blocks_by_id_lookup.get(bid, {}).get("text", "")[:60])
+                ),
+                key="word_regen_select",
+            )
+            extra_inst = st.text_input(
+                "Hướng dẫn bổ sung (vd: 'dịch trang trọng hơn'):",
+                key="word_regen_instruction",
+            )
+            if st.button("🔄 Dịch lại các đoạn đã chọn", key="word_regen_btn",
+                         disabled=not selected_ids):
+                from word_backend import translate_chunk
+                chunk = [blocks_by_id_lookup[bid] for bid in selected_ids]
+                rules = {"_extra": extra_inst} if extra_inst.strip() else None
+                with st.spinner(f"Dịch lại {len(chunk)} đoạn..."):
+                    try:
+                        new_tr, _, _ = translate_chunk(
+                            get_client(), chunk,
+                            LANG_EN[st.session_state["word_lang"]],
+                            st.session_state["word_doc_context"],
+                            glossary=st.session_state.get("word_glossary"),
+                            custom_rules=rules,
+                        )
+                        st.session_state["word_translations"].update(new_tr)
+                        st.session_state["word_translations_version"] = (
+                            st.session_state.get("word_translations_version", 0) + 1
+                        )
+                        st.session_state.pop("word_review_df", None)
+                        st.success(f"Đã dịch lại {len(new_tr)} đoạn")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
             if st.button("✅ Xác nhận & lưu vào TM", key="word_review_confirm_btn",
                          use_container_width=True):
                 tm = _ensure_tm()
@@ -1031,6 +1119,40 @@ def render():
                     st.success(f"✅ Đã cập nhật {changed} bản dịch và lưu vào TM")
                 else:
                     st.info("Không có thay đổi nào.")
+
+        with st.expander("🖼 OCR & dịch text trong ảnh (tuỳ chọn)", expanded=False):
+            st.caption(
+                "Quét tất cả ảnh trong DOCX, OCR chữ và dịch sang ngôn ngữ đích. "
+                "Có thể tốn thêm chi phí Gemini Vision."
+            )
+            if st.button("🔍 Quét và dịch ảnh", key="word_ocr_btn"):
+                from word_backend import extract_images_from_docx, ocr_and_translate_images
+                with st.spinner("Đang OCR + dịch ảnh..."):
+                    imgs = extract_images_from_docx(st.session_state["word_docx_bytes"])
+                    if not imgs:
+                        st.info("Không có ảnh trong DOCX.")
+                    else:
+                        results = ocr_and_translate_images(
+                            get_client(), imgs,
+                            LANG_EN[st.session_state["word_lang"]],
+                        )
+                        st.session_state["word_image_ocr"] = (imgs, results)
+
+            if "word_image_ocr" in st.session_state:
+                imgs, results = st.session_state["word_image_ocr"]
+                shown = 0
+                for img in imgs:
+                    r = results.get(img["id"], {})
+                    if not r.get("has_text"):
+                        continue
+                    shown += 1
+                    with st.container(border=True):
+                        c1, c2 = st.columns([1, 2])
+                        c1.image(img["data"], width=200, caption=img["filename"])
+                        c2.markdown(f"**OCR (gốc):**\n```\n{r['ocr']}\n```")
+                        c2.markdown(f"**Dịch:**\n```\n{r['translation']}\n```")
+                if shown == 0:
+                    st.info(f"Đã quét {len(imgs)} ảnh — không phát hiện text.")
 
         translated_bytes = _get_cached_translated_bytes()
         out_name = st.session_state["word_filename"].replace(
