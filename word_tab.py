@@ -7,6 +7,7 @@ Phase 1 (Phân tích):
 Phase 2 (Dịch):
   TM lookup → chunk còn lại → translate parallel → merge TM + new → apply
 """
+import io
 import time
 import threading
 
@@ -27,7 +28,7 @@ from word_backend import (
     get_working_model, count_by_role,
     tm_lookup, tm_store,
     checkpoint_save, checkpoint_load, checkpoint_clear,
-    export_bilingual_docx,
+    export_bilingual_docx, quality_check,
 )
 
 
@@ -48,6 +49,13 @@ def _ensure_tm() -> dict:
     if "word_tm" not in st.session_state:
         st.session_state["word_tm"] = {}
     return st.session_state["word_tm"]
+
+
+def _estimate_cost(tok_in: int, tok_out: int) -> tuple:
+    """Estimate cost in (vnd, usd). Gemini Flash pricing."""
+    usd = tok_in * 0.075 / 1_000_000 + tok_out * 0.30 / 1_000_000
+    vnd = usd * 25_000
+    return vnd, usd
 
 
 def _make_job_ui(heading: str, stat_col1_label: str,
@@ -292,6 +300,36 @@ def _render_analysis_panel():
             f"({pct:.1f}%) sẽ dùng cache cũ — không gọi API."
         )
 
+    # TM Export / Import
+    with st.expander(f"💾 Translation Memory ({len(_ensure_tm()):,} entries) — Export / Import", expanded=False):
+        colA, colB = st.columns(2)
+        # Export TM
+        with colA:
+            tm = _ensure_tm()
+            if tm:
+                import json as _json
+                st.download_button(
+                    "⬇️ Export TM (.json)",
+                    data=_json.dumps(tm, ensure_ascii=False, indent=2),
+                    file_name="word_tm.json", mime="application/json",
+                    use_container_width=True, key="word_tm_export",
+                )
+            else:
+                st.info("TM hiện tại rỗng.")
+        # Import TM
+        with colB:
+            up = st.file_uploader("⬆️ Import TM (.json)", type=["json"], key="word_tm_import",
+                                  label_visibility="collapsed")
+            if up:
+                try:
+                    import json as _json
+                    loaded = _json.loads(up.read())
+                    if isinstance(loaded, dict):
+                        _ensure_tm().update(loaded)
+                        st.success(f"Đã import {len(loaded)} TM entries")
+                except Exception as e:
+                    st.error(str(e))
+
     # Glossary editor
     with st.expander(
         f"📚 Glossary ({len(a['glossary'])} thuật ngữ) — bấm để review / sửa",
@@ -305,6 +343,32 @@ def _render_analysis_panel():
                 "Xóa cell **Bản dịch** (để trống) để loại entry khỏi glossary. "
                 "Có thể thêm dòng mới."
             )
+            # Glossary export/import
+            gcolA, gcolB = st.columns(2)
+            with gcolA:
+                if a["glossary"]:
+                    import json as _json
+                    st.download_button(
+                        "⬇️ Export Glossary (.json)",
+                        data=_json.dumps(a["glossary"], ensure_ascii=False, indent=2),
+                        file_name="word_glossary.json", mime="application/json",
+                        use_container_width=True, key="word_glossary_export",
+                    )
+            with gcolB:
+                gup = st.file_uploader("⬆️ Import Glossary (.json)", type=["json"],
+                                       key="word_glossary_import",
+                                       label_visibility="collapsed")
+                if gup:
+                    try:
+                        import json as _json
+                        gloaded = _json.loads(gup.read())
+                        if isinstance(gloaded, dict):
+                            a["glossary"].update(gloaded)
+                            st.session_state["word_analysis"] = a
+                            st.success(f"Đã import {len(gloaded)} glossary entries")
+                    except Exception as e:
+                        st.error(str(e))
+
             df = pd.DataFrame([
                 {"Thuật ngữ gốc": k, "Bản dịch": v}
                 for k, v in a["glossary"].items()
@@ -350,13 +414,47 @@ def _render_analysis_panel():
         a["custom_rules"] = new_rules
         st.session_state["word_analysis"] = a
 
+    # Cost cap input
+    cost_cap = st.number_input(
+        "⚠️ Cảnh báo chi phí (USD) — 0 = tắt",
+        min_value=0.0, max_value=10.0, value=0.5, step=0.1,
+        key="word_cost_cap",
+    )
+
     # Dịch button — nói rõ còn bao nhiêu sau TM
     n_remain = len(a["translatable"]) - a["tm_hits"]
     label = (f"▶  Dịch {n_remain:,} đoạn"
              if n_remain > 0
              else f"▶  Apply {a['tm_hits']:,} TM hit (không gọi API)")
+
+    # Estimate cost for remaining blocks
+    if n_remain > 0:
+        translatable = a["translatable"]
+        tm = _ensure_tm()
+        target_lang = a["target_lang"]
+        _, remaining_blocks = tm_lookup(translatable, tm, target_lang)
+        est_chars = sum(len(b["text"]) for b in remaining_blocks)
+        est_in_tok = int(est_chars * 0.4)
+        est_out_tok = int(est_in_tok * 1.5)
+        _, est_usd = _estimate_cost(est_in_tok, est_out_tok)
+        st.caption(f"💰 Ước tính chi phí: ~${est_usd:.3f} USD cho {n_remain:,} đoạn")
+        if cost_cap > 0 and est_usd > cost_cap:
+            st.warning(
+                f"⚠️ Ước tính ~${est_usd:.3f} USD vượt ngưỡng cảnh báo ${cost_cap:.2f} USD. "
+                f"Xác nhận để tiếp tục."
+            )
+            cost_confirmed = st.checkbox(
+                f"✅ Tôi xác nhận dịch với chi phí ước tính ~${est_usd:.3f} USD",
+                key="word_cost_confirm",
+            )
+        else:
+            cost_confirmed = True
+    else:
+        cost_confirmed = True
+
     if st.button(label, use_container_width=True, type="primary",
-                 key="word_translate_phase2_btn"):
+                 key="word_translate_phase2_btn",
+                 disabled=(not cost_confirmed)):
         _run_full_translation()
         st.rerun()
 

@@ -12,6 +12,7 @@ parallel chunks), ghi lại DOCX giữ nguyên format runs.
 import hashlib
 import io
 import json
+import re as _re
 import re
 import time
 import threading
@@ -202,12 +203,25 @@ def runs_to_tagged_text(paragraph) -> str:
     Convert paragraph runs → tagged text. VD: '<b>Important</b>: read <i>carefully</i>'.
     Escape & < > trong text gốc để không xung đột với tag.
     Bao gồm text bên trong w:hyperlink (URL được giữ nguyên khi apply).
+    Math equations (m:oMath) → <MATH/> placeholder.
+    Field runs (w:fldChar, w:instrText) are skipped — kept as-is.
     """
     from docx.text.run import Run
+    _MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
     parts = []
     for child in paragraph._p.iterchildren():
+        # Math equations — preserve verbatim with placeholder
+        if child.tag == f"{{{_MATH_NS}}}oMath":
+            parts.append("<MATH/>")
+            continue
         tag = child.tag.split("}", 1)[-1]
         if tag == "r":
+            # Skip field instruction/delimiter runs
+            if child.find(qn("w:instrText")) is not None:
+                continue
+            fld = child.find(qn("w:fldChar"))
+            if fld is not None:
+                continue
             run = Run(child, paragraph)
             text = run.text
             if not text:
@@ -220,6 +234,10 @@ def runs_to_tagged_text(paragraph) -> str:
         elif tag == "hyperlink":
             # Include hyperlink inner text — URL stays in XML, only text is translated
             for r_elem in child.iterchildren(qn("w:r")):
+                if r_elem.find(qn("w:instrText")) is not None:
+                    continue
+                if r_elem.find(qn("w:fldChar")) is not None:
+                    continue
                 run = Run(r_elem, paragraph)
                 text = run.text
                 if not text:
@@ -232,6 +250,10 @@ def runs_to_tagged_text(paragraph) -> str:
         elif tag == "ins":
             # Track changes: inserted text — include for translation
             for r_elem in child.iterchildren(qn("w:r")):
+                if r_elem.find(qn("w:instrText")) is not None:
+                    continue
+                if r_elem.find(qn("w:fldChar")) is not None:
+                    continue
                 run = Run(r_elem, paragraph)
                 text = run.text
                 if not text:
@@ -284,9 +306,12 @@ def _parse_tagged(tagged: str) -> list[tuple[str, bool, bool, bool]]:
 
 def _paragraph_has_non_run_children(paragraph) -> bool:
     """True nếu paragraph có hyperlink/field/... — không rebuild runs an toàn được."""
+    SAFE = {"pPr", "r", "hyperlink", "ins", "del",
+            "bookmarkStart", "bookmarkEnd", "proofErr", "fldSimple",
+            "rPr", "pPrChange", "oMath"}
     for child in paragraph._p.iterchildren():
         tag = child.tag.split("}", 1)[-1]
-        if tag not in ("pPr", "r"):
+        if tag not in SAFE:
             return True
     return False
 
@@ -299,16 +324,30 @@ def replace_paragraph_text_keep_format(paragraph, new_text: str):
     Hyperlink URLs (relationships) are untouched; only inner text changes.
     """
     # Collect all w:r elements in document order, including inside w:hyperlink
+    # Field runs (w:fldChar, w:instrText) are excluded — keep original XML
     all_r = []
     for child in paragraph._p.iterchildren():
         ctag = child.tag.split("}", 1)[-1]
         if ctag == "r":
+            # Field runs — skip from translation
+            has_fld = (child.find(qn("w:fldChar")) is not None or
+                       child.find(qn("w:instrText")) is not None)
+            if has_fld:
+                continue
             all_r.append(child)
         elif ctag == "hyperlink":
-            all_r.extend(child.iterchildren(qn("w:r")))
+            for r_elem in child.iterchildren(qn("w:r")):
+                has_fld = (r_elem.find(qn("w:fldChar")) is not None or
+                           r_elem.find(qn("w:instrText")) is not None)
+                if not has_fld:
+                    all_r.append(r_elem)
         elif ctag == "ins":
             # Track changes insertion: include runs for translation
-            all_r.extend(child.iterchildren(qn("w:r")))
+            for r_elem in child.iterchildren(qn("w:r")):
+                has_fld = (r_elem.find(qn("w:fldChar")) is not None or
+                           r_elem.find(qn("w:instrText")) is not None)
+                if not has_fld:
+                    all_r.append(r_elem)
         # del: skip — deleted text untouched
 
     if not all_r:
@@ -730,7 +769,9 @@ Rules:
 - Do NOT translate company names (e.g. INVENTIO AG, Schindler, Otis).
 - Preserve ALL punctuation, whitespace, tabs (\\t), line breaks (\\n).
 - Match source sentence count — do NOT merge or split sentences.
-{format_rule}{table_rule}- For toc: translate heading text only; preserve numbering, dot leaders (...), page numbers.
+{format_rule}{table_rule}- Preserve <MATH/> placeholders exactly as-is (they represent math equations).
+- Preserve <FIELD>...</FIELD> content unchanged.
+- For toc: translate heading text only; preserve numbering, dot leaders (...), page numbers.
 - For bullet: concise imperative, keep bullet symbol.
 - For heading/section_heading: concise technical, match source brevity.
 - For table_cell: concise, consistent across row.
@@ -775,13 +816,17 @@ def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
                                doc_context: str,
                                retries: int = CHUNK_RETRIES,
                                glossary: dict | None = None,
-                               custom_rules: dict | None = None
+                               custom_rules: dict | None = None,
+                               fallback_individually: bool = True,
                                ) -> tuple[dict, int, int, str | None]:
     """
     Wrapper với exponential backoff. Trả về (translations, in_t, out_t, error).
-    Nếu hết retries → fallback giữ text gốc + error message.
+    Nếu hết retries:
+    - Nếu chunk có >1 block: thử dịch lại từng block riêng lẻ (smart fallback).
+    - Nếu block đơn hoặc smart fallback cũng fail → giữ text gốc + error message.
     """
     last_err = None
+    tok_in_total = tok_out_total = 0
     for attempt in range(retries):
         try:
             t, in_t, out_t = translate_chunk(client, chunk, target_lang, doc_context, glossary, custom_rules)
@@ -790,6 +835,23 @@ def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
             last_err = str(e)
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)   # 1s, 2s, 4s
+
+    # Final failure — smart fallback: retry each block individually
+    if fallback_individually and len(chunk) > 1:
+        result = {}
+        for block in chunk:
+            try:
+                t_single, in_t, out_t = translate_chunk(
+                    client, [block], target_lang, doc_context, glossary, custom_rules
+                )
+                result.update(t_single)
+                tok_in_total  += in_t
+                tok_out_total += out_t
+            except Exception:
+                # Individual block failed — keep original
+                result[block["id"]] = block.get("text_tagged") or block["text"]
+        return result, tok_in_total, tok_out_total, last_err
+
     fallback = {b["id"]: b.get("text_tagged") or b["text"] for b in chunk}
     return fallback, 0, 0, last_err
 
@@ -996,6 +1058,43 @@ def export_bilingual_docx(original_bytes: bytes, blocks: list[dict],
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
+
+
+_NUM_PAT = _re.compile(r'\b\d[\d,\.]*\b')
+
+
+def quality_check(blocks: list[dict], translations: dict) -> list[dict]:
+    """
+    Returns list of {"id", "text", "translation", "issues"} for suspicious entries.
+    Checks:
+    - Numbers present in original but missing in translation
+    - Translation is more than 3.5x longer or less than 0.2x shorter than original
+    - Original ends with ? but translation does not
+    """
+    results = []
+    for b in blocks:
+        tr = translations.get(b["id"])
+        if not tr or not b["text"].strip():
+            continue
+        issues = []
+        orig_nums = set(_NUM_PAT.findall(b["text"]))
+        tr_nums   = set(_NUM_PAT.findall(tr))
+        missing   = orig_nums - tr_nums
+        if missing:
+            issues.append(f"Số bị mất: {', '.join(sorted(missing)[:4])}")
+        ratio = len(tr) / max(len(b["text"]), 1)
+        if ratio > 3.5:
+            issues.append(f"Bản dịch quá dài ({ratio:.1f}x)")
+        if ratio < 0.2 and len(b["text"]) > 20:
+            issues.append(f"Bản dịch quá ngắn ({ratio:.1f}x)")
+        orig_q = b["text"].rstrip().endswith("?")
+        tr_q   = tr.rstrip().endswith("?")
+        if orig_q and not tr_q:
+            issues.append("Mất dấu '?'")
+        if issues:
+            results.append({"id": b["id"], "text": b["text"],
+                            "translation": tr, "issues": issues})
+    return results
 
 
 def find_missed(blocks: list[dict], translations: dict,
