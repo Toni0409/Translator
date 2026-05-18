@@ -29,7 +29,7 @@ from word_backend import (
     get_working_model, count_by_role,
     tm_lookup, tm_store, tm_key,
     checkpoint_save, checkpoint_load, checkpoint_clear,
-    export_bilingual_docx, quality_check,
+    export_bilingual_docx, quality_check, validate_docx_output,
 )
 
 
@@ -334,6 +334,38 @@ def _render_analysis_panel():
                 except Exception as e:
                     st.error(str(e))
 
+    # Per-role translation toggle
+    with st.expander("🎚 Chọn loại nội dung sẽ dịch", expanded=False):
+        st.caption("Mặc định bỏ qua header/footer (thường chứa page#, tên file...). "
+                   "Tick để dịch loại đó.")
+        role_options = [
+            ("header",       "📄 Header (đầu trang)"),
+            ("footer",       "📄 Footer (chân trang)"),
+            ("body_repeated","🔁 Body lặp (watermark, banner)"),
+            ("comment",      "💬 Comment"),
+            ("footnote",     "📌 Footnote"),
+            ("endnote",      "📌 Endnote"),
+            ("image_alt",    "🖼 Image alt-text"),
+            ("toc",          "📑 TOC (mục lục)"),
+        ]
+        enabled = {}
+        cols = st.columns(2)
+        for i, (role, label) in enumerate(role_options):
+            default_on = role not in {"header", "footer", "body_repeated"}
+            enabled[role] = cols[i % 2].checkbox(
+                label, value=a.get("role_toggles", {}).get(role, default_on),
+                key=f"word_role_toggle_{role}",
+            )
+        a["role_toggles"] = enabled
+        st.session_state["word_analysis"] = a
+        skip_roles_panel = {r for r, on in enabled.items() if not on}
+        translatable_now = [b for b in a["blocks"]
+                            if b["role"] not in skip_roles_panel
+                            and not b.get("_toc_mirror")]
+        chars_now = sum(len(b["text"]) for b in translatable_now)
+        st.caption(f"➡️ Sẽ dịch: **{len(translatable_now):,} đoạn** ({chars_now:,} ký tự) "
+                   f"sau khi áp dụng toggle.")
+
     # Glossary editor
     with st.expander(
         f"📚 Glossary ({len(a['glossary'])} thuật ngữ) — bấm để review / sửa",
@@ -509,7 +541,6 @@ def _run_full_translation():
     """Phase 2: dùng analysis đã extract + glossary đã edit → translate."""
     a = st.session_state["word_analysis"]
     blocks       = a["blocks"]
-    translatable = a["translatable"]
     target_lang  = a["target_lang"]
     doc_context  = a["doc_context"]
     glossary     = a["glossary"]
@@ -517,11 +548,26 @@ def _run_full_translation():
     docx_bytes   = a["docx_bytes"]
     tm           = _ensure_tm()
 
+    # Dynamic skip_roles from per-role toggles
+    toggles = a.get("role_toggles", {})
+    if toggles:
+        skip_roles = {role for role, on in toggles.items() if not on}
+    else:
+        skip_roles = set(NO_TRANSLATE_ROLES)
+    # Recompute translatable list from blocks (excluding TOC mirrors — they inherit headings)
+    translatable = [b for b in blocks
+                    if b["role"] not in skip_roles
+                    and not b.get("_toc_mirror")]
+
     timer_ph, prog, render_stats, add_log = _make_job_ui(
         "### 📊 Tiến độ dịch", "Đoạn văn", "### 📋 Nhật ký",
     )
 
     try:
+        toc_mirror_cnt = sum(1 for b in blocks if b.get("_toc_mirror"))
+        if toc_mirror_cnt:
+            add_log(f"🔗 TOC: {toc_mirror_cnt} entries sẽ dùng lại translation từ heading")
+
         cached, remaining = tm_lookup(translatable, tm, target_lang)
         if cached:
             add_log(f"💾 TM hit: {len(cached):,}/{len(translatable):,} đoạn — skip API")
@@ -608,6 +654,30 @@ def _run_full_translation():
             f"|  {elapsed:.1f}s  |  ${usd:.4f} USD ≈ {vnd:,.0f} VND"
         )
         st.session_state["word_translations_version"] = 1
+        # Persist role toggles (for post-translation editor filter)
+        st.session_state["word_role_toggles"] = toggles
+        st.session_state["word_skip_roles"]   = skip_roles
+
+        # Validate output DOCX
+        try:
+            out_bytes = apply_translations(docx_bytes, blocks, translations)
+            val = validate_docx_output(out_bytes)
+            st.session_state["word_validation"] = val
+            st.session_state["word_translated_bytes_cache"] = {
+                "version": 1, "bytes": out_bytes,
+            }
+            if not val["valid"]:
+                add_log(f"❌ Validate: {len(val['errors'])} lỗi")
+                for err in val["errors"][:3]:
+                    add_log(f"   • {err}")
+            else:
+                add_log(f"✅ Validate: {val['block_count']:,} paragraph, "
+                        f"{val['image_count']} ảnh — OK")
+            for warn in val["warnings"]:
+                add_log(f"⚠️ {warn}")
+        except Exception as e:
+            add_log(f"⚠️ Validate fail: {e}")
+
         st.session_state.pop("word_analysis", None)  # đã consume
 
     except Exception as e:
@@ -682,6 +752,32 @@ def _run_partial(missed: list, label: str, heading: str, log_heading: str,
         )
         _finalize_job(timer_ph, prog, add_log, elapsed,
                       len(missed), label, tok_in, tok_out, tm_added=tm_added)
+
+        # Validate updated output
+        try:
+            out_bytes = apply_translations(
+                st.session_state["word_docx_bytes"],
+                st.session_state["word_blocks"],
+                translations,
+            )
+            val = validate_docx_output(out_bytes)
+            st.session_state["word_validation"] = val
+            new_version = st.session_state["word_translations_version"]
+            st.session_state["word_translated_bytes_cache"] = {
+                "version": new_version, "bytes": out_bytes,
+            }
+            if not val["valid"]:
+                add_log(f"❌ Validate: {len(val['errors'])} lỗi")
+                for err in val["errors"][:3]:
+                    add_log(f"   • {err}")
+            else:
+                add_log(f"✅ Validate: {val['block_count']:,} paragraph, "
+                        f"{val['image_count']} ảnh — OK")
+            for warn in val["warnings"]:
+                add_log(f"⚠️ {warn}")
+        except Exception as e:
+            add_log(f"⚠️ Validate fail: {e}")
+
         st.success(success_msg.format(n=len(missed)))
 
     except Exception as e:
@@ -769,9 +865,10 @@ def _render_editor():
         show_hf = st.checkbox("📌 Hiện cả Header/Footer",
                               value=True, key="word_show_hf_filter")
 
+    skip_roles = st.session_state.get("word_skip_roles") or set(NO_TRANSLATE_ROLES)
     display_blocks = []
     for b in blocks:
-        is_hf = b["role"] in NO_TRANSLATE_ROLES
+        is_hf = b["role"] in skip_roles
         if is_hf and not show_hf:
             continue
         tr = translations.get(b["id"], "")
@@ -844,6 +941,9 @@ def _clear_state():
         st.session_state.pop(k, None)
     st.session_state.pop("word_translated_bytes_cache", None)
     st.session_state.pop("word_translations_version", None)
+    st.session_state.pop("word_validation", None)
+    st.session_state.pop("word_role_toggles", None)
+    st.session_state.pop("word_skip_roles", None)
     for k in list(st.session_state.keys()):
         if k.startswith("word_editor") or k in ("word_only_missed_filter",
                                                   "word_show_hf_filter",
@@ -1003,6 +1103,18 @@ def render():
         st.divider()
         st.success(st.session_state["word_summary"])
 
+        val = st.session_state.get("word_validation")
+        if val:
+            if val["valid"]:
+                st.success(f"✅ Output validated: {val['block_count']:,} paragraph, "
+                           f"{val['image_count']} ảnh")
+            else:
+                st.error("❌ Output có lỗi — KHÔNG nên download:")
+                for err in val["errors"]:
+                    st.code(err)
+            for warn in val.get("warnings", []):
+                st.warning(warn)
+
         blocks       = st.session_state["word_blocks"]
         translations = st.session_state["word_translations"]
 
@@ -1024,7 +1136,8 @@ def render():
             review_version = st.session_state.get("word_translations_version", 0)
             stored_rv = st.session_state.get("word_review_df_version")
             if stored_rv != review_version or "word_review_df" not in st.session_state:
-                translatable_blocks = [b for b in blocks if b["role"] not in NO_TRANSLATE_ROLES]
+                skip_roles_v = st.session_state.get("word_skip_roles") or set(NO_TRANSLATE_ROLES)
+                translatable_blocks = [b for b in blocks if b["role"] not in skip_roles_v]
                 st.session_state["word_review_df"] = pd.DataFrame([
                     {
                         "id":          b["id"],
@@ -1054,9 +1167,10 @@ def render():
 
             st.markdown("---")
             st.markdown("**🔄 Dịch lại đoạn cụ thể** (tuỳ chọn — dùng prompt bổ sung):")
+            skip_roles_v2 = st.session_state.get("word_skip_roles") or set(NO_TRANSLATE_ROLES)
             all_block_ids = [
                 b["id"] for b in st.session_state["word_blocks"]
-                if b["role"] not in NO_TRANSLATE_ROLES
+                if b["role"] not in skip_roles_v2
                 and st.session_state["word_translations"].get(b["id"])
             ]
             blocks_by_id_lookup = {b["id"]: b for b in st.session_state["word_blocks"]}
