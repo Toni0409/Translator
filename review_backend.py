@@ -333,12 +333,12 @@ def word_diff_html(old: str, new: str) -> tuple[str, str]:
             old_parts.append(_esc(o_chunk))
             new_parts.append(_esc(n_chunk))
         elif tag == "delete":
-            old_parts.append(f'<span style="background:#fde2e2;text-decoration:line-through;color:#a00">{_esc(o_chunk)}</span>')
+            old_parts.append(f'<span style="background:#ffcccc;text-decoration:line-through;color:#cc0000;font-weight:600;padding:1px 3px;border-radius:3px">{_esc(o_chunk)}</span>')
         elif tag == "insert":
-            new_parts.append(f'<span style="background:#d3f7d3;color:#070">{_esc(n_chunk)}</span>')
+            new_parts.append(f'<span style="background:#b6f5b6;color:#006600;font-weight:600;padding:1px 3px;border-radius:3px">{_esc(n_chunk)}</span>')
         elif tag == "replace":
-            old_parts.append(f'<span style="background:#fde2e2;text-decoration:line-through;color:#a00">{_esc(o_chunk)}</span>')
-            new_parts.append(f'<span style="background:#d3f7d3;color:#070">{_esc(n_chunk)}</span>')
+            old_parts.append(f'<span style="background:#ffcccc;text-decoration:line-through;color:#cc0000;font-weight:600;padding:1px 3px;border-radius:3px">{_esc(o_chunk)}</span>')
+            new_parts.append(f'<span style="background:#b6f5b6;color:#006600;font-weight:600;padding:1px 3px;border-radius:3px">{_esc(n_chunk)}</span>')
     return " ".join(old_parts), " ".join(new_parts)
 
 

@@ -363,14 +363,18 @@ def _render_results():
                 old_html, new_html = word_diff_html(current_trans, suggested)
                 st.markdown("**💡 Đề xuất (diff với bản hiện tại):**")
                 st.markdown(
-                    f"""<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;
-                    font-size:13px;line-height:1.5">
-                    <div style="padding:8px;background:#fff;border:1px solid #eee;border-radius:6px">
-                    <div style="font-weight:600;color:#666;margin-bottom:4px">Hiện tại</div>
-                    {old_html}</div>
-                    <div style="padding:8px;background:#fff;border:1px solid #eee;border-radius:6px">
-                    <div style="font-weight:600;color:#666;margin-bottom:4px">Đề xuất</div>
-                    {new_html}</div></div>""",
+                    f"""<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;
+                    font-size:15px;line-height:1.7;margin-bottom:8px">
+                    <div style="padding:12px;background:#f9f9f9;border:2px solid #ffaaaa;
+                    border-radius:8px;color:#1a1a1a">
+                    <div style="font-weight:700;color:#cc0000;margin-bottom:6px;font-size:13px">
+                    ✂️ Hiện tại</div>
+                    <span style="color:#1a1a1a">{old_html}</span></div>
+                    <div style="padding:12px;background:#f9f9f9;border:2px solid #88dd88;
+                    border-radius:8px;color:#1a1a1a">
+                    <div style="font-weight:700;color:#006600;margin-bottom:6px;font-size:13px">
+                    ✅ Đề xuất</div>
+                    <span style="color:#1a1a1a">{new_html}</span></div></div>""",
                     unsafe_allow_html=True,
                 )
                 if st.button("⬆️ Áp dụng bản đề xuất", key=f"rv_apply_{rid}"):
