@@ -19,7 +19,9 @@ def check_password() -> bool:
         st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
         pwd = st.text_input("🔑 Nhập mật khẩu", type="password",
                             key="pwd_input", placeholder="Password...")
-        if st.button("Đăng nhập", use_container_width=True):
+        if not APP_PASSWORD:
+            st.error("⛔ APP_PASSWORD chưa được cấu hình trong Secrets. Liên hệ admin.")
+        elif st.button("Đăng nhập", use_container_width=True):
             if pwd == APP_PASSWORD:
                 st.session_state["authenticated"] = True
                 st.rerun()
