@@ -8,8 +8,10 @@ PDF backend: extract text spans, gọi Gemini, ghi lại PDF giữ nguyên layou
               `translate_pages_parallel`, `ocr_pdf_images`
 3. Render   : `write_translated_pdf` (with text wrap), `insert_ocr_captions_into_pdf`
 """
+import hashlib
 import io
 import os
+import pickle
 import re
 import threading
 import time
@@ -540,11 +542,14 @@ def translate_page_pure(client, groups: list, target_lang: str,
                         glossary: list[str] | None = None,
                         tm: dict | None = None,
                         fallback_individually: bool = True,
+                        custom_glossary: dict[str, str] | None = None,
+                        custom_rules: str | None = None,
                         ) -> tuple[list[str], int, int, str | None, int]:
     """
     Pure translate (no UI). Supports:
     - TM lookup: skip lines already cached, only translate new ones
     - Smart fallback: if batch fails, retry each line individually
+    - Custom glossary + custom rules: injected into prompt
     Returns (translations, in_tok, out_tok, error_or_none, tm_hits).
     """
     from word_backend import tm_key
@@ -569,7 +574,8 @@ def translate_page_pure(client, groups: list, target_lang: str,
     last_err: str | None = None
 
     try:
-        prompt = _build_page_prompt(sub_groups, target_lang, glossary)
+        prompt = _build_page_prompt_v2(sub_groups, target_lang, glossary,
+                                       custom_glossary, custom_rules)
         raw, in_t, out_t = _call_gemini_with_retry(client, prompt)
         new_trans = _parse_page_response(raw, sub_groups)
     except Exception as e:
@@ -580,7 +586,8 @@ def translate_page_pure(client, groups: list, target_lang: str,
         new_trans = []
         for g in sub_groups:
             try:
-                single_prompt = _build_page_prompt([g], target_lang, glossary)
+                single_prompt = _build_page_prompt_v2([g], target_lang, glossary,
+                                                      custom_glossary, custom_rules)
                 raw_s, in_s, out_s = _call_gemini_with_retry(client, single_prompt)
                 parsed = _parse_page_response(raw_s, [g])
                 new_trans.append(parsed[0])
@@ -608,9 +615,15 @@ def translate_pages_parallel(client, all_groups: dict, target_lang: str,
                              max_workers: int = 4,
                              glossary: list[str] | None = None,
                              tm: dict | None = None,
-                             progress_callback=None):
+                             progress_callback=None,
+                             custom_glossary: dict[str, str] | None = None,
+                             custom_rules: str | None = None,
+                             skip_pages: dict[int, str] | None = None,
+                             resume_trans: dict | None = None):
     """
     Translate multiple pages concurrently with ThreadPoolExecutor.
+    - skip_pages: {page_idx: reason} for TOC/References pages → copy original text
+    - resume_trans: {page_idx: [...]} pre-existing translations to skip (from checkpoint)
     progress_callback(page_idx, done_count, total, in_tok_delta, out_tok_delta, error, tm_hits).
     Returns (all_trans: dict, total_in_tok, total_out_tok, errors: dict, total_tm_hits: int).
     """
@@ -622,11 +635,29 @@ def translate_pages_parallel(client, all_groups: dict, target_lang: str,
     total = len(targets)
     lock = threading.Lock()
 
+    skip_pages = skip_pages or {}
+    resume_trans = resume_trans or {}
+
+    # Pre-fill skipped pages (TOC/References) with original text
+    for pi, reason in skip_pages.items():
+        if pi in targets:
+            groups = all_groups.get(pi, [])
+            all_trans[pi] = [g["text"] for g in groups]
+
+    # Pre-fill resumed pages from checkpoint
+    for pi, trans in resume_trans.items():
+        if pi in targets and pi not in all_trans:
+            all_trans[pi] = trans
+
+    pages_to_translate = [pi for pi in targets
+                          if pi not in skip_pages and pi not in resume_trans]
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
             ex.submit(translate_page_pure, client, all_groups.get(pi, []),
-                      target_lang, glossary, tm): pi
-            for pi in targets
+                      target_lang, glossary, tm, True,
+                      custom_glossary, custom_rules): pi
+            for pi in pages_to_translate
         }
         for future in as_completed(futures):
             pi = futures[future]
@@ -646,7 +677,8 @@ def translate_pages_parallel(client, all_groups: dict, target_lang: str,
                 done_count += 1
                 snapshot = (done_count, total_in, total_out)
             if progress_callback:
-                progress_callback(pi, snapshot[0], total, in_t, out_t, err, tm_hits)
+                progress_callback(pi, snapshot[0], len(pages_to_translate),
+                                  in_t, out_t, err, tm_hits)
 
     return all_trans, total_in, total_out, errors, total_tm_hits
 
@@ -868,3 +900,133 @@ def build_bilingual_pdf(src_path: str, translated_path: str, dst_path: str,
     out.close()
     src.close()
     trans.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECKPOINT — persist partial translations, resume if interrupted
+# ══════════════════════════════════════════════════════════════════════════════
+def _pdf_checkpoint_path(pdf_bytes: bytes, target_lang: str) -> str:
+    h    = hashlib.md5(pdf_bytes[:8192]).hexdigest()[:12]
+    slug = target_lang.replace(" ", "_")[:12]
+    return f"/tmp/pdf_ckpt_{h}_{slug}.pkl"
+
+
+def pdf_checkpoint_save(pdf_bytes: bytes, target_lang: str,
+                        all_groups: dict, all_trans: dict,
+                        glossary: list[str] | None = None) -> None:
+    """Save current translation state. Called per-page during translation."""
+    try:
+        data = {
+            "groups":   all_groups,
+            "trans":    all_trans,
+            "glossary": glossary or [],
+            "ts":       time.time(),
+        }
+        with open(_pdf_checkpoint_path(pdf_bytes, target_lang), "wb") as f:
+            pickle.dump(data, f)
+    except Exception:
+        pass
+
+
+def pdf_checkpoint_load(pdf_bytes: bytes, target_lang: str) -> dict | None:
+    path = _pdf_checkpoint_path(pdf_bytes, target_lang)
+    try:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return pickle.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def pdf_checkpoint_clear(pdf_bytes: bytes, target_lang: str) -> None:
+    try:
+        os.unlink(_pdf_checkpoint_path(pdf_bytes, target_lang))
+    except Exception:
+        pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOC / REFERENCES detection — skip pages that aren't worth translating
+# ══════════════════════════════════════════════════════════════════════════════
+_SKIP_TITLES = (
+    "table of contents", "contents", "mục lục",
+    "references", "bibliography", "tài liệu tham khảo",
+    "index", "appendix", "phụ lục",
+)
+_TOC_LINE_PAT = re.compile(r"\.{3,}\s*\d+\s*$|\s\d+\s*$")
+
+
+def detect_skip_pages(all_groups: dict) -> dict[int, str]:
+    """
+    Heuristic detection of TOC / References / Index / Appendix pages.
+    Returns {page_idx: reason} for pages that should be skipped.
+
+    Detection rules:
+    - First few lines contain known title (Contents, References, Index, ...)
+    - >50% of lines end with "...." + number (typical TOC entry pattern)
+    """
+    skip_pages: dict[int, str] = {}
+    for pi, groups in all_groups.items():
+        if not groups:
+            continue
+        # Check first 3 non-empty lines for a known section title
+        first_texts = [g["text"].strip().lower() for g in groups[:5] if g["text"].strip()]
+        title_hit = next(
+            (kw for line in first_texts for kw in _SKIP_TITLES
+             if kw in line and len(line) < 60),
+            None,
+        )
+        if title_hit:
+            skip_pages[pi] = f"Detected: '{title_hit}'"
+            continue
+        # Check if >50% of lines look like TOC entries
+        toc_like = sum(1 for g in groups if _TOC_LINE_PAT.search(g["text"]))
+        if len(groups) >= 6 and toc_like / len(groups) > 0.5:
+            skip_pages[pi] = f"TOC pattern ({toc_like}/{len(groups)} lines)"
+    return skip_pages
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CUSTOM GLOSSARY IMPORT — parse user-provided source→target term pairs
+# ══════════════════════════════════════════════════════════════════════════════
+def parse_custom_glossary(text: str) -> dict[str, str]:
+    """
+    Parse glossary from text. Each line: 'source = target' or 'source -> target'
+    or 'source,target' (CSV). Returns {source: target} dict.
+    """
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for sep in (" = ", "=", " -> ", "->", "\t", ","):
+            if sep in line:
+                src, _, tgt = line.partition(sep)
+                src, tgt = src.strip(), tgt.strip()
+                if src and tgt:
+                    out[src] = tgt
+                break
+    return out
+
+
+def _build_page_prompt_v2(groups: list, target_lang: str,
+                          glossary: list[str] | None = None,
+                          custom_glossary: dict[str, str] | None = None,
+                          custom_rules: str | None = None) -> str:
+    """Extended prompt with custom rules and custom glossary support."""
+    base = _build_page_prompt(groups, target_lang, glossary)
+    extras = []
+    if custom_glossary:
+        pairs = "\n".join(f"  • {s}  →  {t}" for s, t in list(custom_glossary.items())[:50])
+        extras.append(
+            f"\nGLOSSARY BẮT BUỘC (dùng đúng bản dịch cho mỗi term):\n{pairs}\n"
+        )
+    if custom_rules and custom_rules.strip():
+        extras.append(f"\nHƯỚNG DẪN DỊCH BỔ SUNG (tuân thủ nghiêm):\n{custom_rules.strip()}\n")
+    if not extras:
+        return base
+    insert_at = base.find("Trả về JSON object")
+    if insert_at < 0:
+        return base + "\n" + "".join(extras)
+    return base[:insert_at] + "".join(extras) + "\n" + base[insert_at:]

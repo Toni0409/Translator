@@ -1,4 +1,5 @@
 """Streamlit UI cho tab PDF — gọi backend `pdf_backend`."""
+import io
 import os
 import time
 import tempfile
@@ -18,7 +19,43 @@ from pdf_backend import (
     translate_pages_parallel, build_pdf_glossary,
     extract_pdf_images, ocr_pdf_images, insert_ocr_captions_into_pdf,
     quality_check_pdf, build_bilingual_pdf,
+    pdf_checkpoint_save, pdf_checkpoint_load, pdf_checkpoint_clear,
+    detect_skip_pages, parse_custom_glossary,
 )
+
+
+def _run_batch_pdf_translation(uploaded_pdfs, lang_pdf, pages_s, **kwargs):
+    """Translate multiple PDFs sequentially, share TM, zip outputs."""
+    import zipfile
+    n = len(uploaded_pdfs)
+    st.markdown(f"### 📦 Batch mode: {n} file PDF")
+    overall = st.progress(0, text=f"0/{n} file...")
+    summary_lines = []
+    zip_buf = io.BytesIO()
+
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, pdf in enumerate(uploaded_pdfs):
+            st.markdown(f"---\n#### 📄 File {i+1}/{n}: `{pdf.name}`")
+            _run_pdf_translation(pdf, lang_pdf, pages_s, **kwargs)
+            if "pdf_bytes" in st.session_state:
+                out_name = st.session_state["pdf_out_name"]
+                zf.writestr(out_name, st.session_state["pdf_bytes"])
+                summary_lines.append(f"✅ {pdf.name} → {out_name}")
+                if "pdf_bilingual_bytes" in st.session_state:
+                    biling_name = out_name.replace(".pdf", "_bilingual.pdf")
+                    zf.writestr(biling_name, st.session_state["pdf_bilingual_bytes"])
+                # Clear single-file state so next iteration is fresh
+                for k in ("pdf_bytes", "pdf_out_name", "pdf_summary",
+                          "pdf_bilingual_bytes", "pdf_quality_issues"):
+                    st.session_state.pop(k, None)
+            else:
+                summary_lines.append(f"❌ {pdf.name} — không có output")
+            overall.progress((i + 1) / n, text=f"{i+1}/{n} file xong")
+
+    st.session_state["pdf_batch_zip"]  = zip_buf.getvalue()
+    st.session_state["pdf_batch_name"] = f"translated_pdfs_{lang_pdf[:2]}.zip"
+    st.session_state["pdf_batch_summary"] = "\n".join(summary_lines)
+    st.success(f"✅ Hoàn thành {n} file. Tải ZIP bên dưới.")
 
 
 def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
@@ -28,6 +65,10 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
                          use_tm: bool = True,
                          use_bilingual: bool = False,
                          use_quality_check: bool = True,
+                         use_skip_toc: bool = False,
+                         use_checkpoint: bool = True,
+                         custom_rules: str = "",
+                         custom_glossary_text: str = "",
                          parallel_workers: int = 4):
     """Chạy pipeline dịch PDF và lưu kết quả vào session_state."""
     st.markdown("### 📊 Tiến độ")
@@ -53,14 +94,23 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
 
     src_path = dst_path = None
     try:
+        pdf_bytes = uploaded_pdf.read()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_in:
-            tmp_in.write(uploaded_pdf.read())
+            tmp_in.write(pdf_bytes)
             src_path = tmp_in.name
         tmp_out  = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         dst_path = tmp_out.name
         tmp_out.close()
 
         add_log(f"📄 Đã nhận file: {uploaded_pdf.name}")
+
+        # Resume from checkpoint if available
+        resume_trans = {}
+        if use_checkpoint:
+            ckpt = pdf_checkpoint_load(pdf_bytes, lang_pdf)
+            if ckpt and ckpt.get("trans"):
+                resume_trans = ckpt["trans"]
+                add_log(f"♻️ Resume từ checkpoint: {len(resume_trans)} trang đã dịch trước đó")
 
         probe    = fitz.open(src_path)
         total_pg = len(probe)
@@ -102,6 +152,24 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
             else:
                 add_log("📚 Không tìm thấy thuật ngữ lặp")
 
+        # Custom user glossary (parsed from text input)
+        custom_glossary = parse_custom_glossary(custom_glossary_text) if custom_glossary_text.strip() else None
+        if custom_glossary:
+            add_log(f"📝 Custom glossary: {len(custom_glossary)} cặp thuật ngữ bắt buộc")
+        if custom_rules.strip():
+            add_log(f"📜 Custom rules: {len(custom_rules)} ký tự hướng dẫn dịch riêng")
+
+        # Skip TOC / References pages
+        skip_pages = {}
+        if use_skip_toc:
+            skip_pages = detect_skip_pages(all_groups)
+            if skip_pages:
+                pages_str = ", ".join(str(p+1) for p in sorted(skip_pages.keys())[:10])
+                more = f" (+{len(skip_pages)-10})" if len(skip_pages) > 10 else ""
+                add_log(f"⏭ Skip {len(skip_pages)} trang TOC/References: {pages_str}{more}")
+            else:
+                add_log("⏭ Không phát hiện trang TOC/References để skip")
+
         # Translation Memory: persistent across runs in session_state
         tm = None
         if use_tm:
@@ -111,6 +179,7 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
             add_log(f"💾 TM: {len(tm):,} entry sẵn có")
 
         total_tm_hits = 0
+        errors: dict = {}
 
         if use_parallel and len(targets) > 1:
             add_log(f"⚡ Parallel mode: {parallel_workers} workers")
@@ -119,7 +188,7 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
                 nonlocal tok_in, tok_out
                 tok_in  += in_t
                 tok_out += out_t
-                pct = int(10 + (done / total) * 80)
+                pct = int(10 + (done / total) * 80) if total else 90
                 prog.progress(pct, text=f"Dịch {done}/{total} trang xong...")
                 status = "❌" if err else "✅"
                 tm_note = f" [TM {tm_hits}]" if tm_hits else ""
@@ -133,11 +202,17 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
                                    f"⚡ Đang dịch song song — {done}/{total} trang xong"),
                     unsafe_allow_html=True,
                 )
+                if use_checkpoint:
+                    pdf_checkpoint_save(pdf_bytes, lang_pdf, all_groups, all_trans, glossary)
 
             all_trans, tok_in, tok_out, errors, total_tm_hits = translate_pages_parallel(
                 client, all_groups, lang_pdf, targets,
                 max_workers=parallel_workers,
                 glossary=glossary, tm=tm,
+                custom_glossary=custom_glossary,
+                custom_rules=custom_rules,
+                skip_pages=skip_pages,
+                resume_trans=resume_trans,
                 progress_callback=on_page_done,
             )
         else:
@@ -146,6 +221,18 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
                 page_start = time.time()
                 pct        = int(10 + (idx / len(targets)) * 80)
                 prog.progress(pct, text=f"Dịch trang {pi + 1}/{total_pg}...")
+
+                # Skip TOC/References
+                if pi in skip_pages:
+                    all_trans[pi] = [g["text"] for g in groups]
+                    add_log(f"⏭ Trang {pi+1}: skip ({skip_pages[pi]}) — giữ nguyên text")
+                    continue
+                # Resume from checkpoint
+                if pi in resume_trans:
+                    all_trans[pi] = resume_trans[pi]
+                    add_log(f"♻️ Trang {pi+1}: dùng kết quả từ checkpoint")
+                    continue
+
                 add_log(f"📄 Trang {pi + 1}/{total_pg}: {len(groups)} dòng — gửi API...")
 
                 if not groups:
@@ -173,12 +260,18 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
 
                 all_trans[pi] = trans
                 render_stats(idx + 1, total_pg, total_lines, tok_in, tok_out)
+                if use_checkpoint:
+                    pdf_checkpoint_save(pdf_bytes, lang_pdf, all_groups, all_trans, glossary)
                 time.sleep(PDF_DELAY)
 
         if use_tm and total_tm_hits > 0:
             add_log(f"💾 TM: tổng {total_tm_hits:,} dòng tái dùng — tiết kiệm chi phí")
         if use_tm:
             add_log(f"💾 TM: {len(tm):,} entry sau khi xong")
+
+        # Clear checkpoint on success
+        if use_checkpoint and not errors:
+            pdf_checkpoint_clear(pdf_bytes, lang_pdf)
 
         prog.progress(92, text="Tạo PDF...")
         add_log("💾 Đang tạo PDF...")
@@ -282,8 +375,11 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
 
 def render():
     """Entry point — gọi từ `streamlit_app.py`."""
-    uploaded_pdf = st.file_uploader("📄 Chọn file PDF cần dịch",
-                                     type=["pdf"], key="pdf_uploader")
+    uploaded_pdfs = st.file_uploader(
+        "📄 Chọn 1 hoặc nhiều file PDF cần dịch",
+        type=["pdf"], key="pdf_uploader",
+        accept_multiple_files=True,
+    )
     col1, col2 = st.columns(2)
     with col1:
         lang_pdf = st.selectbox("🌐 Ngôn ngữ đích", LANGUAGES, key="pdf_lang")
@@ -311,7 +407,17 @@ def render():
         use_tm = st.checkbox(
             "💾 Translation Memory (cache giữa các lần dịch)",
             value=True, key="pdf_use_tm",
-            help="Cache bản dịch trong session — dòng đã dịch lần sau sẽ reuse, không tốn API call.",
+            help="Cache bản dịch trong session — dòng đã dịch lần sau sẽ reuse, không tốn API call. Share giữa các file PDF khi batch mode.",
+        )
+        use_checkpoint = st.checkbox(
+            "♻️ Auto-checkpoint (resume nếu bị gián đoạn)",
+            value=True, key="pdf_checkpoint",
+            help="Lưu state sau mỗi trang. Nếu crash/disconnect, lần sau chạy lại sẽ resume từ trang cuối thay vì làm lại từ đầu.",
+        )
+        use_skip_toc = st.checkbox(
+            "⏭ Skip TOC / References / Index",
+            value=False, key="pdf_skip_toc",
+            help="Tự phát hiện trang mục lục, danh mục tham khảo, phụ lục — bỏ qua không dịch để tiết kiệm token.",
         )
         use_ocr = st.checkbox(
             "🖼 OCR text trong ảnh embedded",
@@ -329,6 +435,20 @@ def render():
             help="Tự động phát hiện: số bị mất, dòng quá dài/ngắn bất thường, dòng chưa dịch.",
         )
 
+        st.markdown("---")
+        st.markdown("**📝 Custom translation rules** *(tuỳ chọn)*")
+        custom_rules = st.text_area(
+            "Hướng dẫn dịch riêng cho tài liệu này",
+            value="", key="pdf_custom_rules", height=80,
+            placeholder="Vd: Dịch formal, giữ nguyên các thuật ngữ IT bằng tiếng Anh, dùng đại từ 'chúng tôi'...",
+        )
+        st.markdown("**📖 Custom glossary** *(tuỳ chọn)*")
+        custom_glossary_text = st.text_area(
+            "Mỗi dòng: source = target  (hoặc source,target  /  source -> target)",
+            value="", key="pdf_custom_glossary", height=100,
+            placeholder="API = giao diện lập trình\nendpoint = điểm cuối\nrequest -> yêu cầu",
+        )
+
         tm_count = len(st.session_state.get("pdf_tm", {}))
         if tm_count > 0:
             cc1, cc2 = st.columns([3, 1])
@@ -339,20 +459,34 @@ def render():
 
     st.divider()
 
-    if st.button("▶  Bắt đầu dịch PDF", disabled=(uploaded_pdf is None), key="pdf_run"):
+    n_files = len(uploaded_pdfs or [])
+    btn_label = (f"▶  Bắt đầu dịch {n_files} file PDF" if n_files > 1
+                 else "▶  Bắt đầu dịch PDF")
+
+    if st.button(btn_label, disabled=(n_files == 0), key="pdf_run"):
         for k in ("pdf_bytes", "pdf_out_name", "pdf_summary",
-                  "pdf_bilingual_bytes", "pdf_quality_issues"):
+                  "pdf_bilingual_bytes", "pdf_quality_issues",
+                  "pdf_batch_zip", "pdf_batch_name"):
             st.session_state.pop(k, None)
-        _run_pdf_translation(
-            uploaded_pdf, lang_pdf, pages_s,
+
+        common_kwargs = dict(
             use_parallel=use_parallel,
             use_glossary=use_glossary,
             use_ocr=use_ocr,
             use_tm=use_tm,
             use_bilingual=use_bilingual,
             use_quality_check=use_quality_check,
+            use_skip_toc=use_skip_toc,
+            use_checkpoint=use_checkpoint,
+            custom_rules=custom_rules,
+            custom_glossary_text=custom_glossary_text,
             parallel_workers=parallel_workers,
         )
+
+        if n_files == 1:
+            _run_pdf_translation(uploaded_pdfs[0], lang_pdf, pages_s, **common_kwargs)
+        else:
+            _run_batch_pdf_translation(uploaded_pdfs, lang_pdf, pages_s, **common_kwargs)
 
     if "pdf_bytes" in st.session_state:
         st.divider()
@@ -399,5 +533,17 @@ def render():
                                       disabled=True, label_visibility="collapsed")
                 if len(issues) > 100:
                     st.caption(f"Chỉ hiển thị 100/{len(issues)} dòng đầu.")
-    elif not uploaded_pdf:
+
+    if "pdf_batch_zip" in st.session_state:
+        st.divider()
+        st.success("📦 Batch hoàn thành — tải ZIP chứa tất cả PDF đã dịch")
+        st.code(st.session_state.get("pdf_batch_summary", ""), language=None)
+        st.download_button(
+            label="⬇️  Tải ZIP toàn bộ batch",
+            data=st.session_state["pdf_batch_zip"],
+            file_name=st.session_state["pdf_batch_name"],
+            mime="application/zip",
+            use_container_width=True,
+        )
+    elif not uploaded_pdfs:
         st.info("👆 Vui lòng upload file PDF để bắt đầu")
