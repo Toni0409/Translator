@@ -903,6 +903,170 @@ def build_bilingual_pdf(src_path: str, translated_path: str, dst_path: str,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SCANNED PDF DETECTION + FULL-PAGE OCR
+# ══════════════════════════════════════════════════════════════════════════════
+def detect_scanned_pages(pdf_path: str,
+                         targets: list[int] | None = None) -> list[int]:
+    """
+    Detect pages with no text layer (likely scanned image-based pages).
+    Returns list of page indices that have 0 text but have images.
+    """
+    doc = fitz.open(pdf_path)
+    out: list[int] = []
+    total = len(doc)
+    targets = targets if targets else list(range(total))
+    for pi in targets:
+        if not (0 <= pi < total):
+            continue
+        page = doc[pi]
+        text = page.get_text("text").strip()
+        if len(text) < 20:  # essentially no text
+            has_img = bool(page.get_images(full=True))
+            if has_img:
+                out.append(pi)
+    doc.close()
+    return out
+
+
+def _ocr_scanned_page(client, pdf_path: str, page_idx: int,
+                      target_lang: str, dpi: int = 150) -> tuple[str, str, int, int]:
+    """
+    Render page to image, OCR + translate via Gemini Vision.
+    Returns (ocr_text, translation, in_tok, out_tok).
+    """
+    from google.genai import types as gtypes
+    from word_backend import get_working_model, WORD_MODELS
+
+    doc = fitz.open(pdf_path)
+    page = doc[page_idx]
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat)
+    img_bytes = pix.tobytes("png")
+    doc.close()
+
+    model = get_working_model() or WORD_MODELS[0]
+    prompt = (
+        f"This is a scanned page. Extract ALL readable text verbatim (preserve "
+        f"paragraph structure with \\n), then translate to {target_lang}.\n\n"
+        f"Respond ONLY as JSON:\n"
+        f'{{"ocr": "extracted text here", "translation": "translated text here"}}'
+    )
+    last_err: Exception | None = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[
+                    gtypes.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                    prompt,
+                ],
+                config=gtypes.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                ),
+            )
+            data = parse_json_loose(response.text) or {}
+            if not isinstance(data, dict):
+                data = {}
+            in_t, out_t = usage_tokens(response)
+            return (
+                str(data.get("ocr", "") or "").strip(),
+                str(data.get("translation", "") or "").strip(),
+                in_t, out_t,
+            )
+        except Exception as e:
+            last_err = e
+            if attempt < MAX_RETRIES - 1:
+                time.sleep((2 ** attempt) * 5)
+    raise last_err or Exception("OCR failed")
+
+
+def ocr_scanned_pages_parallel(client, pdf_path: str, scanned_pages: list[int],
+                               target_lang: str, max_workers: int = 4,
+                               progress_callback=None) -> dict:
+    """
+    Parallel OCR + translate for scanned pages.
+    Returns {page_idx: {"ocr": str, "translation": str, "error"?: str, "in_t", "out_t"}}.
+    """
+    results: dict = {}
+    if not scanned_pages:
+        return results
+
+    done = 0
+    total = len(scanned_pages)
+    lock = threading.Lock()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(_ocr_scanned_page, client, pdf_path, pi, target_lang): pi
+            for pi in scanned_pages
+        }
+        for future in as_completed(futures):
+            pi = futures[future]
+            try:
+                ocr_text, trans_text, in_t, out_t = future.result()
+                results[pi] = {"ocr": ocr_text, "translation": trans_text,
+                               "in_t": in_t, "out_t": out_t}
+            except Exception as e:
+                results[pi] = {"ocr": "", "translation": "",
+                               "in_t": 0, "out_t": 0, "error": str(e)}
+            with lock:
+                done += 1
+                current = done
+            if progress_callback:
+                progress_callback(current, total)
+    return results
+
+
+def insert_scanned_translation_pages(pdf_path: str, dst_path: str,
+                                     scanned_results: dict,
+                                     font_path: str | None) -> int:
+    """
+    For each scanned page with OCR translation, insert a NEW text-only page
+    after it containing the translation. Returns count of pages added.
+    """
+    doc = fitz.open(pdf_path)
+    added = 0
+    # Process in reverse order so insertions don't shift indices
+    for pi in sorted(scanned_results.keys(), reverse=True):
+        r = scanned_results[pi]
+        trans = (r.get("translation") or "").strip()
+        if not trans:
+            continue
+        src_page = doc[pi]
+        w, h = src_page.rect.width, src_page.rect.height
+
+        new_page = doc.new_page(pno=pi + 1, width=w, height=h)
+        if font_path:
+            try:
+                new_page.insert_font(fontname="FReg", fontfile=font_path)
+                fontname = "FReg"
+            except Exception:
+                fontname = "helv"
+        else:
+            fontname = "helv"
+
+        # Header
+        new_page.insert_text(
+            (50, 40), f"[Translation of page {pi+1}]",
+            fontsize=9, fontname=fontname, color=(0.5, 0.5, 0.5),
+        )
+        # Body — auto-shrink if needed
+        body_rect = fitz.Rect(50, 60, w - 50, h - 50)
+        for size in (11, 10, 9, 8):
+            rc = new_page.insert_textbox(
+                body_rect, trans, fontsize=size,
+                fontname=fontname, color=(0, 0, 0), align=0,
+            )
+            if rc >= 0:
+                break
+        added += 1
+    doc.save(dst_path, garbage=4, deflate=True)
+    doc.close()
+    return added
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CHECKPOINT — persist partial translations, resume if interrupted
 # ══════════════════════════════════════════════════════════════════════════════
 def _pdf_checkpoint_path(pdf_bytes: bytes, target_lang: str) -> str:

@@ -21,6 +21,8 @@ from pdf_backend import (
     quality_check_pdf, build_bilingual_pdf,
     pdf_checkpoint_save, pdf_checkpoint_load, pdf_checkpoint_clear,
     detect_skip_pages, parse_custom_glossary,
+    detect_scanned_pages, ocr_scanned_pages_parallel,
+    insert_scanned_translation_pages,
 )
 
 
@@ -67,6 +69,7 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
                          use_quality_check: bool = True,
                          use_skip_toc: bool = False,
                          use_checkpoint: bool = True,
+                         use_scanned_ocr: bool = True,
                          custom_rules: str = "",
                          custom_glossary_text: str = "",
                          parallel_workers: int = 4):
@@ -158,6 +161,15 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
             add_log(f"📝 Custom glossary: {len(custom_glossary)} cặp thuật ngữ bắt buộc")
         if custom_rules.strip():
             add_log(f"📜 Custom rules: {len(custom_rules)} ký tự hướng dẫn dịch riêng")
+
+        # Detect scanned (image-only) pages — no extractable text layer
+        scanned_pages: list[int] = []
+        if use_scanned_ocr:
+            scanned_pages = detect_scanned_pages(src_path, targets)
+            if scanned_pages:
+                pages_str = ", ".join(str(p+1) for p in scanned_pages[:10])
+                more = f" (+{len(scanned_pages)-10})" if len(scanned_pages) > 10 else ""
+                add_log(f"🔎 Phát hiện {len(scanned_pages)} trang scan (không có text layer): {pages_str}{more}")
 
         # Skip TOC / References pages
         skip_pages = {}
@@ -283,6 +295,35 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
         add_log(f"🔤 Font: {os.path.basename(font_path) if font_path else 'built-in'}")
         write_translated_pdf(src_path, dst_path, all_groups, all_trans, font_path)
 
+        # OCR scanned pages → insert translation as new pages after originals
+        if use_scanned_ocr and scanned_pages:
+            prog.progress(93, text="OCR trang scan...")
+            add_log(f"🔎 Đang OCR + dịch {len(scanned_pages)} trang scan...")
+
+            def on_scan_progress(done, total):
+                pct = int(93 + (done / total) * 1)
+                prog.progress(pct, text=f"OCR trang scan {done}/{total}...")
+                timer_ph.markdown(
+                    timer_box_html(time.time() - t0, f"🔎 OCR trang scan {done}/{total}"),
+                    unsafe_allow_html=True,
+                )
+
+            scan_results = ocr_scanned_pages_parallel(
+                client, src_path, scanned_pages, lang_pdf,
+                progress_callback=on_scan_progress,
+            )
+            scan_in  = sum(r.get("in_t", 0)  for r in scan_results.values())
+            scan_out = sum(r.get("out_t", 0) for r in scan_results.values())
+            tok_in  += scan_in
+            tok_out += scan_out
+            with_text = sum(1 for r in scan_results.values() if r.get("translation"))
+            add_log(f"🔎 OCR scan xong: {with_text}/{len(scanned_pages)} trang có text dịch")
+            if with_text > 0:
+                added = insert_scanned_translation_pages(
+                    dst_path, dst_path, scan_results, font_path,
+                )
+                add_log(f"📄 Đã chèn {added} trang dịch (sau mỗi trang scan tương ứng)")
+
         # Optional: OCR embedded images, add as PDF annotations on the translated file
         if use_ocr:
             prog.progress(94, text="OCR ảnh trong PDF...")
@@ -334,6 +375,13 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
             f"|  ${usd:.4f} USD ≈ {vnd:,.0f} VND"
         )
 
+        # State for inline editor (re-render with user edits)
+        with open(src_path, "rb") as f:
+            st.session_state["pdf_src_bytes"] = f.read()
+        st.session_state["pdf_all_groups"] = all_groups
+        st.session_state["pdf_all_trans"]  = all_trans
+        st.session_state["pdf_lang_used"]  = lang_pdf
+
         # Bilingual PDF: interleave original + translated pages
         if use_bilingual:
             add_log("📑 Tạo PDF song ngữ (gốc + dịch xen kẽ)...")
@@ -371,6 +419,112 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
                     os.unlink(p)
             except Exception:
                 pass
+
+
+def _render_editor():
+    """Inline editor for translated lines + re-render button."""
+    import pandas as pd
+
+    all_groups = st.session_state["pdf_all_groups"]
+    all_trans  = st.session_state["pdf_all_trans"]
+    issues     = st.session_state.get("pdf_quality_issues") or []
+
+    # Build editable DataFrame
+    rows = []
+    for pi in sorted(all_groups.keys()):
+        groups = all_groups[pi]
+        trans  = all_trans.get(pi, [])
+        for li, g in enumerate(groups):
+            if li >= len(trans):
+                break
+            rows.append({
+                "key":         f"{pi}_{li}",
+                "page":        pi + 1,
+                "original":    g["text"],
+                "translation": trans[li] or "",
+            })
+
+    if not rows:
+        return
+
+    suspicious_keys = {f"{it['page']-1}_{it['line_idx']}" for it in issues}
+
+    with st.expander(f"✏️ Edit bản dịch ({len(rows):,} dòng) — sửa rồi re-render PDF",
+                     expanded=False):
+        c1, c2, c3 = st.columns([2, 1, 1])
+        filter_mode = c1.selectbox(
+            "Hiển thị",
+            ["Tất cả", "Chỉ dòng có vấn đề (quality check)", "Theo trang"],
+            key="pdf_edit_filter",
+        )
+        page_filter = None
+        if filter_mode == "Theo trang":
+            pages_avail = sorted({r["page"] for r in rows})
+            page_filter = c2.selectbox("Trang", pages_avail, key="pdf_edit_page")
+        search = c3.text_input("🔍 Tìm trong gốc", key="pdf_edit_search")
+
+        visible_rows = rows
+        if filter_mode == "Chỉ dòng có vấn đề (quality check)":
+            visible_rows = [r for r in rows if r["key"] in suspicious_keys]
+        elif page_filter is not None:
+            visible_rows = [r for r in rows if r["page"] == page_filter]
+        if search.strip():
+            s = search.strip().lower()
+            visible_rows = [r for r in visible_rows if s in r["original"].lower()]
+
+        st.caption(f"Hiển thị {len(visible_rows):,}/{len(rows):,} dòng")
+
+        df = pd.DataFrame(visible_rows)
+        edited = st.data_editor(
+            df,
+            column_config={
+                "key":         None,
+                "page":        st.column_config.NumberColumn("Trang", disabled=True, width="small"),
+                "original":    st.column_config.TextColumn("Gốc",  disabled=True, width="large"),
+                "translation": st.column_config.TextColumn("Bản dịch (sửa được)", width="large"),
+            },
+            hide_index=True,
+            use_container_width=True,
+            height=min(600, max(200, len(visible_rows) * 35)),
+            key="pdf_edit_table",
+        )
+
+        cc1, cc2 = st.columns(2)
+        if cc1.button("💾 Áp dụng sửa + Re-render PDF", type="primary",
+                      use_container_width=True, key="pdf_edit_apply"):
+            # Update all_trans with edits from the editor
+            edit_map = {row["key"]: row["translation"] for _, row in edited.iterrows()}
+            for pi in all_trans:
+                for li in range(len(all_trans[pi])):
+                    k = f"{pi}_{li}"
+                    if k in edit_map:
+                        all_trans[pi][li] = edit_map[k]
+            st.session_state["pdf_all_trans"] = all_trans
+
+            with st.spinner("Đang re-render PDF với bản sửa..."):
+                src_path = dst_path = None
+                try:
+                    src_path = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
+                    with open(src_path, "wb") as f:
+                        f.write(st.session_state["pdf_src_bytes"])
+                    dst_path = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
+                    font_path = find_font()
+                    write_translated_pdf(src_path, dst_path, all_groups, all_trans, font_path)
+                    with open(dst_path, "rb") as f:
+                        st.session_state["pdf_bytes"] = f.read()
+                    st.success("✅ PDF đã re-render với bản sửa. Tải lại ở nút bên trên.")
+                finally:
+                    for p in (src_path, dst_path):
+                        try:
+                            if p:
+                                os.unlink(p)
+                        except Exception:
+                            pass
+            st.rerun()
+
+        if cc2.button("🔄 Reset về bản dịch gốc", use_container_width=True,
+                      key="pdf_edit_reset"):
+            st.warning("Tải lại từ run mới để reset — bản sửa hiện không thể undo riêng phần.")
 
 
 def render():
@@ -419,6 +573,11 @@ def render():
             value=False, key="pdf_skip_toc",
             help="Tự phát hiện trang mục lục, danh mục tham khảo, phụ lục — bỏ qua không dịch để tiết kiệm token.",
         )
+        use_scanned_ocr = st.checkbox(
+            "🔎 Tự OCR trang scan (không có text layer)",
+            value=True, key="pdf_scanned_ocr",
+            help="Phát hiện trang chỉ chứa ảnh (PDF scan/photo). Tự OCR + dịch bằng Gemini Vision, chèn 1 trang text dịch ngay sau mỗi trang scan.",
+        )
         use_ocr = st.checkbox(
             "🖼 OCR text trong ảnh embedded",
             value=False, key="pdf_ocr",
@@ -466,7 +625,9 @@ def render():
     if st.button(btn_label, disabled=(n_files == 0), key="pdf_run"):
         for k in ("pdf_bytes", "pdf_out_name", "pdf_summary",
                   "pdf_bilingual_bytes", "pdf_quality_issues",
-                  "pdf_batch_zip", "pdf_batch_name"):
+                  "pdf_batch_zip", "pdf_batch_name",
+                  "pdf_all_groups", "pdf_all_trans", "pdf_src_bytes",
+                  "pdf_lang_used"):
             st.session_state.pop(k, None)
 
         common_kwargs = dict(
@@ -478,6 +639,7 @@ def render():
             use_quality_check=use_quality_check,
             use_skip_toc=use_skip_toc,
             use_checkpoint=use_checkpoint,
+            use_scanned_ocr=use_scanned_ocr,
             custom_rules=custom_rules,
             custom_glossary_text=custom_glossary_text,
             parallel_workers=parallel_workers,
@@ -533,6 +695,10 @@ def render():
                                       disabled=True, label_visibility="collapsed")
                 if len(issues) > 100:
                     st.caption(f"Chỉ hiển thị 100/{len(issues)} dòng đầu.")
+
+        # Inline editor: edit translations and re-render PDF
+        if "pdf_all_groups" in st.session_state and "pdf_all_trans" in st.session_state:
+            _render_editor()
 
     if "pdf_batch_zip" in st.session_state:
         st.divider()
