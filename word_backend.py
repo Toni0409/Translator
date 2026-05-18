@@ -71,6 +71,20 @@ def _iter_footnote_endnote_paragraphs(doc):
             pass
 
 
+def _iter_comment_paragraphs(doc):
+    """Yield (Paragraph, "comment") for all comment body paragraphs."""
+    for rel in doc.part.rels.values():
+        if "comments" not in rel.reltype:
+            continue
+        try:
+            root = rel.target_part._element
+            for comment in root:
+                for p_elem in comment.iter(qn("w:p")):
+                    yield Paragraph(p_elem, parent=doc), "comment"
+        except Exception:
+            pass
+
+
 def _iter_blocks_with_meta(doc):
     """
     Single-walk generator → yield (paragraph, meta_dict) theo thứ tự ổn định.
@@ -137,6 +151,20 @@ def _iter_blocks_with_meta(doc):
     # Footnotes + endnotes
     for para, hint in _iter_footnote_endnote_paragraphs(doc):
         yield para, {"role_hint": hint, "in_table": False, "table_cell": None}
+    # VML text-boxes (Word 2003/older format) — w:txbxContent usually already caught above;
+    # this handles the rare case where VML v:textbox has direct w:p without w:txbxContent
+    _VML_TB = "{urn:schemas-microsoft-com:vml}textbox"
+    _seen_p = {id(p_elem) for txbx in doc.element.iter(qn("w:txbxContent"))
+               for p_elem in txbx.iter(qn("w:p"))}
+    for vml_tb in doc.element.iter(_VML_TB):
+        for p_elem in vml_tb.iter(qn("w:p")):
+            if id(p_elem) not in _seen_p:
+                yield Paragraph(p_elem, parent=doc), {
+                    "role_hint": "textbox", "in_table": False, "table_cell": None,
+                }
+    # Comments (word/comments.xml)
+    for para, hint in _iter_comment_paragraphs(doc):
+        yield para, {"role_hint": hint, "in_table": False, "table_cell": None}
 
 
 def iter_all_paragraphs(doc):
@@ -201,6 +229,19 @@ def runs_to_tagged_text(paragraph) -> str:
                 if run.italic:    text = f"<i>{text}</i>"
                 if run.underline: text = f"<u>{text}</u>"
                 parts.append(text)
+        elif tag == "ins":
+            # Track changes: inserted text — include for translation
+            for r_elem in child.iterchildren(qn("w:r")):
+                run = Run(r_elem, paragraph)
+                text = run.text
+                if not text:
+                    continue
+                text = _esc(text)
+                if run.bold:      text = f"<b>{text}</b>"
+                if run.italic:    text = f"<i>{text}</i>"
+                if run.underline: text = f"<u>{text}</u>"
+                parts.append(text)
+        # w:del: intentionally skipped — deleted text not translated
     return "".join(parts).strip()
 
 
@@ -265,6 +306,10 @@ def replace_paragraph_text_keep_format(paragraph, new_text: str):
             all_r.append(child)
         elif ctag == "hyperlink":
             all_r.extend(child.iterchildren(qn("w:r")))
+        elif ctag == "ins":
+            # Track changes insertion: include runs for translation
+            all_r.extend(child.iterchildren(qn("w:r")))
+        # del: skip — deleted text untouched
 
     if not all_r:
         paragraph.add_run(new_text)
@@ -434,6 +479,8 @@ def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
             role = "textbox"
         if meta["role_hint"] in ("footnote", "endnote") and role not in ("header", "footer"):
             role = meta["role_hint"]
+        if meta["role_hint"] == "comment" and role not in ("header", "footer"):
+            role = "comment"
         tagged = runs_to_tagged_text(para)
         blocks.append({
             "id":          f"p{idx}",
@@ -460,6 +507,7 @@ def count_by_role(blocks: list[dict]) -> dict:
         "hf_total":      sum(counter.get(r, 0) for r in NO_TRANSLATE_ROLES),
         "footnote":      counter.get("footnote", 0),
         "endnote":       counter.get("endnote", 0),
+        "comment":       counter.get("comment", 0),
         "by_role":       dict(counter),
     }
 
@@ -619,7 +667,8 @@ def _format_block_text(b: dict) -> str:
 
 
 def _build_chunk_prompt(chunk: list[dict], target_lang: str, doc_context: str,
-                        glossary: dict | None = None) -> str:
+                        glossary: dict | None = None,
+                        custom_rules: dict | None = None) -> str:
     """Build prompt. Dùng `text_tagged` nếu có (preserve inline format)."""
     payload = json.dumps(
         [{
@@ -658,10 +707,20 @@ def _build_chunk_prompt(chunk: list[dict], target_lang: str, doc_context: str,
             f"{glossary_str}\n"
         )
 
+    custom_rules_section = ""
+    if custom_rules:
+        lines = [f"- For {role}: {rule.strip()}"
+                 for role, rule in custom_rules.items() if rule.strip()]
+        if lines:
+            custom_rules_section = (
+                "\nCustom rules (override defaults for these roles):\n"
+                + "\n".join(lines) + "\n"
+            )
+
     return f"""Translate these Word document blocks into {target_lang}.
 
 Document context:
-{doc_context}{glossary_section}
+{doc_context}{glossary_section}{custom_rules_section}
 
 Rules:
 - Return ONLY valid JSON array. No markdown, no explanation.
@@ -678,6 +737,7 @@ Rules:
 - For note: keep WARNING/NOTE/CAUTION label verbatim.
 - For header/footer/body_repeated: concise like a page header/footer; preserve page numbers ("Page 1 of 10"), dates, document IDs verbatim.
 - For footnote/endnote: translate fully as body text; preserve footnote reference numbers (¹²³ or superscript digits) verbatim.
+- For comment: translate the comment text naturally as body text.
 
 Format:
 [{{"id":"...","text":"translated text"}}]
@@ -688,12 +748,13 @@ Blocks:
 
 def translate_chunk(client, chunk: list[dict], target_lang: str,
                     doc_context: str,
-                    glossary: dict | None = None) -> tuple[dict, int, int]:
+                    glossary: dict | None = None,
+                    custom_rules: dict | None = None) -> tuple[dict, int, int]:
     """
     Dịch 1 chunk → (translations_dict, in_tokens, out_tokens).
     RAISE exception nếu API fail. Block bị model bỏ sót → fallback giữ text gốc.
     """
-    prompt = _build_chunk_prompt(chunk, target_lang, doc_context, glossary)
+    prompt = _build_chunk_prompt(chunk, target_lang, doc_context, glossary, custom_rules)
     raw, in_t, out_t = call_gemini(client, prompt)
     parsed = parse_json_loose(raw) or []
     if not isinstance(parsed, list):
@@ -713,7 +774,8 @@ def translate_chunk(client, chunk: list[dict], target_lang: str,
 def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
                                doc_context: str,
                                retries: int = CHUNK_RETRIES,
-                               glossary: dict | None = None
+                               glossary: dict | None = None,
+                               custom_rules: dict | None = None
                                ) -> tuple[dict, int, int, str | None]:
     """
     Wrapper với exponential backoff. Trả về (translations, in_t, out_t, error).
@@ -722,7 +784,7 @@ def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
     last_err = None
     for attempt in range(retries):
         try:
-            t, in_t, out_t = translate_chunk(client, chunk, target_lang, doc_context, glossary)
+            t, in_t, out_t = translate_chunk(client, chunk, target_lang, doc_context, glossary, custom_rules)
             return t, in_t, out_t, None
         except Exception as e:
             last_err = str(e)
@@ -739,7 +801,8 @@ def translate_parallel(holder: dict, client,
                        chunks: list[list[dict]],
                        target_lang: str, doc_context: str,
                        max_workers: int,
-                       glossary: dict | None = None):
+                       glossary: dict | None = None,
+                       custom_rules: dict | None = None):
     """
     Background worker: dịch nhiều chunk song song với ThreadPoolExecutor.
 
@@ -755,7 +818,7 @@ def translate_parallel(holder: dict, client,
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
                 ex.submit(translate_chunk_with_retry,
-                          client, c, target_lang, doc_context, CHUNK_RETRIES, glossary): (i, c)
+                          client, c, target_lang, doc_context, CHUNK_RETRIES, glossary, custom_rules): (i, c)
                 for i, c in enumerate(chunks)
             }
             for future in as_completed(futures):
@@ -857,6 +920,82 @@ def tm_store(blocks: list[dict], translations: dict, tm: dict,
             tm[key] = tr
             added += 1
     return added
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECKPOINT — persist partial translations across browser refresh
+# ══════════════════════════════════════════════════════════════════════════════
+import os, pickle as _pickle
+
+
+def _checkpoint_path(docx_bytes: bytes, target_lang: str) -> str:
+    h = hashlib.md5(docx_bytes[:8192]).hexdigest()[:12]
+    slug = target_lang.replace(" ", "_")[:12]
+    return f"/tmp/tr_ckpt_{h}_{slug}.pkl"
+
+
+def checkpoint_save(docx_bytes: bytes, target_lang: str, translations: dict) -> None:
+    try:
+        with open(_checkpoint_path(docx_bytes, target_lang), "wb") as f:
+            _pickle.dump(translations, f)
+    except Exception:
+        pass
+
+
+def checkpoint_load(docx_bytes: bytes, target_lang: str) -> dict | None:
+    path = _checkpoint_path(docx_bytes, target_lang)
+    try:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return _pickle.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def checkpoint_clear(docx_bytes: bytes, target_lang: str) -> None:
+    try:
+        os.unlink(_checkpoint_path(docx_bytes, target_lang))
+    except Exception:
+        pass
+
+
+def export_bilingual_docx(original_bytes: bytes, blocks: list[dict],
+                          translations: dict) -> bytes:
+    """
+    Tạo DOCX so sánh song ngữ: bảng 2 cột (gốc | dịch).
+    Chỉ bao gồm block có translation.
+    """
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc = Document()
+    # Narrow margins to fit 2 columns
+    for section in doc.sections:
+        section.left_margin  = Inches(0.6)
+        section.right_margin = Inches(0.6)
+
+    table = doc.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    for cell, label in zip(hdr, ["Original", "Translation"]):
+        run = cell.paragraphs[0].add_run(label)
+        run.bold = True
+        run.font.size = Pt(10)
+
+    for b in blocks:
+        tr = translations.get(b["id"])
+        if not tr or tr == b["text"]:
+            continue
+        row = table.add_row().cells
+        row[0].text = b["text"]
+        row[1].text = tr
+        for cell in row:
+            cell.paragraphs[0].runs[0].font.size = Pt(9)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 def find_missed(blocks: list[dict], translations: dict,

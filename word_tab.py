@@ -26,6 +26,8 @@ from word_backend import (
     translate_parallel, apply_translations, find_missed,
     get_working_model, count_by_role,
     tm_lookup, tm_store,
+    checkpoint_save, checkpoint_load, checkpoint_clear,
+    export_bilingual_docx,
 )
 
 
@@ -94,7 +96,9 @@ def _finalize_job(timer_ph, prog, add_log,
 def _run_translation(chunks, target_lang, doc_context,
                      timer_ph, prog_ph, render_stats, add_log,
                      total_blocks, prefix_label="Dịch",
-                     glossary: dict | None = None):
+                     glossary: dict | None = None,
+                     custom_rules: dict | None = None,
+                     on_chunk_done=None):
     """
     Chạy `translate_parallel` trong thread, main loop poll & render UI.
     Trả về (translations, tok_in, tok_out, elapsed).
@@ -115,7 +119,7 @@ def _run_translation(chunks, target_lang, doc_context,
     threading.Thread(
         target=translate_parallel,
         args=(holder, client, chunks, target_lang, doc_context,
-              MAX_WORD_WORKERS, glossary),
+              MAX_WORD_WORKERS, glossary, custom_rules),
         daemon=True,
     ).start()
 
@@ -130,6 +134,9 @@ def _run_translation(chunks, target_lang, doc_context,
                 add_log(f"   ✅ Chunk {entry['idx']+1}: {entry['size']} đoạn "
                         f"({entry['in_t']:,}in/{entry['out_t']:,}out tok)")
             last_logged += 1
+
+        if on_chunk_done and last_logged > 0:
+            on_chunk_done(holder["translations"])
 
         elapsed = time.time() - t0
         done_c  = holder["chunk_done"]
@@ -200,6 +207,9 @@ def _run_analysis(uploaded_docx, lang_word):
             add_log(f"   • Footnotes:           {footnote_cnt:,} (sẽ dịch)")
         if endnote_cnt > 0:
             add_log(f"   • Endnotes:            {endnote_cnt:,} (sẽ dịch)")
+        comment_cnt = stats.get("comment", 0)
+        if comment_cnt > 0:
+            add_log(f"   • Comments:             {comment_cnt:,} (sẽ dịch)")
 
         target_lang = LANG_EN[lang_word]
 
@@ -555,6 +565,7 @@ ROLE_LABEL = {
     "body_repeated":   "🔁 Lặp lại",
     "footnote":        "📝 Footnote",
     "endnote":         "📝 Endnote",
+    "comment":         "💬 Comment",
 }
 
 
