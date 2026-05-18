@@ -1304,26 +1304,32 @@ def extract_images_from_docx(docx_bytes: bytes) -> list[dict]:
     return images
 
 
-def ocr_and_translate_images(client, images: list[dict], target_lang: str) -> dict:
+def _ocr_single_image(client, img: dict, target_lang: str, model: str,
+                      retries: int = CHUNK_RETRIES) -> dict:
     """
-    For each image, call Gemini Vision: detect text, OCR it, translate.
-    Returns {image_id: {"ocr": str, "translation": str, "has_text": bool, "error"?: str}}.
-    Skips tiny images (< 5KB) — likely icons/decoration.
+    Call Gemini Vision for one image with retry + exponential backoff.
+    Returns {"ocr": str, "translation": str, "has_text": bool, "error"?: str}.
     """
     from google.genai import types as gtypes
-    results = {}
-    model = get_working_model() or WORD_MODELS[0]
-    for img in images:
-        if len(img["data"]) < 5000:
-            results[img["id"]] = {"ocr": "", "translation": "", "has_text": False}
-            continue
-        prompt = (
-            f"Analyze this image. If it contains readable text, do BOTH:\n"
-            f"1) Extract the text verbatim (OCR)\n"
-            f"2) Translate the text to {target_lang}\n\n"
-            f"Respond as JSON: {{\"has_text\": true/false, \"ocr\": \"...\", \"translation\": \"...\"}}\n"
-            f"If no readable text, return {{\"has_text\": false}}."
-        )
+
+    prompt = (
+        f"You are a professional OCR and translation expert. Analyze this image carefully.\n\n"
+        f"TASK:\n"
+        f"1. Determine if the image contains any readable text "
+        f"(printed, handwritten, tables, charts, or diagrams with labels).\n"
+        f"2. If text exists:\n"
+        f"   a. Extract ALL text verbatim — preserve structure using \\n for line breaks "
+        f"and | to separate table columns.\n"
+        f"   b. Keep numbers, units, punctuation, and special characters exactly as shown.\n"
+        f"   c. Translate the extracted text to {target_lang}, maintaining the same structure.\n"
+        f"   d. For mixed-language content, translate only the non-{target_lang} portions.\n\n"
+        f"Respond ONLY as JSON (no extra keys):\n"
+        f"  if text found : {{\"has_text\": true,  \"ocr\": \"...\", \"translation\": \"...\"}}\n"
+        f"  if no text    : {{\"has_text\": false, \"ocr\": \"\",    \"translation\": \"\"}}"
+    )
+
+    last_err = None
+    for attempt in range(retries):
         try:
             response = client.models.generate_content(
                 model=model,
@@ -1333,23 +1339,162 @@ def ocr_and_translate_images(client, images: list[dict], target_lang: str) -> di
                 ],
                 config=gtypes.GenerateContentConfig(
                     response_mime_type="application/json",
-                    temperature=0.2,
+                    temperature=0.1,
                 ),
             )
             data = parse_json_loose(response.text) or {}
             if not isinstance(data, dict):
                 data = {}
-            results[img["id"]] = {
+            return {
                 "ocr":         str(data.get("ocr", "") or "").strip(),
                 "translation": str(data.get("translation", "") or "").strip(),
                 "has_text":    bool(data.get("has_text", False)),
             }
         except Exception as e:
-            results[img["id"]] = {
-                "ocr": "", "translation": "", "has_text": False,
-                "error": str(e)[:120],
-            }
+            last_err = str(e)
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+
+    return {"ocr": "", "translation": "", "has_text": False, "error": last_err}
+
+
+def ocr_and_translate_images(
+    client,
+    images: list[dict],
+    target_lang: str,
+    progress_callback=None,
+    max_workers: int = 4,
+) -> dict:
+    """
+    OCR + translate all images in parallel using ThreadPoolExecutor.
+    Skips images < 5 KB (icons/decorations).
+    progress_callback(done, total) called after each image completes.
+    Returns {image_id: {"ocr", "translation", "has_text", "error"?}}.
+    """
+    results = {}
+    model = get_working_model() or WORD_MODELS[0]
+
+    to_process = []
+    for img in images:
+        if len(img["data"]) < 5000:
+            results[img["id"]] = {"ocr": "", "translation": "", "has_text": False}
+        else:
+            to_process.append(img)
+
+    if not to_process:
+        return results
+
+    done_count = 0
+    total = len(images)
+    lock = threading.Lock()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(_ocr_single_image, client, img, target_lang, model): img
+            for img in to_process
+        }
+        for future in as_completed(futures):
+            img = futures[future]
+            try:
+                results[img["id"]] = future.result()
+            except Exception as e:
+                results[img["id"]] = {
+                    "ocr": "", "translation": "", "has_text": False,
+                    "error": str(e),
+                }
+            with lock:
+                done_count += 1
+                current = done_count
+            if progress_callback:
+                progress_callback(current, total)
+
     return results
+
+
+def insert_ocr_captions_into_docx(
+    docx_bytes: bytes,
+    images: list[dict],
+    ocr_results: dict,
+) -> bytes:
+    """
+    Insert OCR translation as a styled caption paragraph after each image paragraph.
+    Only inserts for images where has_text=True and translation is non-empty.
+    Returns modified DOCX bytes (unchanged if no captions to insert).
+    """
+    import zipfile
+    from lxml import etree
+
+    fname_to_translation: dict[str, str] = {}
+    for img in images:
+        r = ocr_results.get(img["id"], {})
+        if r.get("has_text") and r.get("translation"):
+            fname_to_translation[img["filename"]] = r["translation"]
+
+    if not fname_to_translation:
+        return docx_bytes
+
+    # rId → filename from word/_rels/document.xml.rels
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+        rels_xml = zf.read("word/_rels/document.xml.rels")
+
+    rels_root = etree.fromstring(rels_xml)
+    rid_to_caption: dict[str, str] = {}
+    for rel in rels_root:
+        target = rel.get("Target", "")
+        rid = rel.get("Id", "")
+        if "media/" in target:
+            fname = target.split("/")[-1]
+            if fname in fname_to_translation:
+                rid_to_caption[rid] = fname_to_translation[fname]
+
+    if not rid_to_caption:
+        return docx_bytes
+
+    doc = Document(io.BytesIO(docx_bytes))
+    R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    XML_NS = "http://www.w3.org/XML/1998/namespace"
+
+    # Collect (paragraph_element, caption_text) pairs
+    hits: list[tuple] = []
+    for para in iter_all_paragraphs(doc):
+        for elem in para._element.iter():
+            embed = elem.get(f"{{{R_NS}}}embed")
+            if embed and embed in rid_to_caption:
+                hits.append((para._element, rid_to_caption[embed]))
+                break
+
+    # Insert captions in document order (reverse to preserve indices)
+    for para_el, caption_text in reversed(hits):
+        parent = para_el.getparent()
+        idx = list(parent).index(para_el)
+
+        p = etree.Element(f"{{{W_NS}}}p")
+
+        pPr = etree.SubElement(p, f"{{{W_NS}}}pPr")
+        jc = etree.SubElement(pPr, f"{{{W_NS}}}jc")
+        jc.set(f"{{{W_NS}}}val", "center")
+
+        run = etree.SubElement(p, f"{{{W_NS}}}r")
+        rPr = etree.SubElement(run, f"{{{W_NS}}}rPr")
+        etree.SubElement(rPr, f"{{{W_NS}}}i")
+        etree.SubElement(rPr, f"{{{W_NS}}}iCs")
+        color = etree.SubElement(rPr, f"{{{W_NS}}}color")
+        color.set(f"{{{W_NS}}}val", "808080")
+        sz = etree.SubElement(rPr, f"{{{W_NS}}}sz")
+        sz.set(f"{{{W_NS}}}val", "18")
+        szCs = etree.SubElement(rPr, f"{{{W_NS}}}szCs")
+        szCs.set(f"{{{W_NS}}}val", "18")
+
+        t = etree.SubElement(run, f"{{{W_NS}}}t")
+        t.text = f"[OCR] {caption_text}"
+        t.set(f"{{{XML_NS}}}space", "preserve")
+
+        parent.insert(idx + 1, p)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
