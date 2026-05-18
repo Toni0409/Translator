@@ -26,6 +26,8 @@ from word_backend import (
     translate_parallel, apply_translations, find_missed,
     get_working_model, count_by_role,
     tm_lookup, tm_store,
+    checkpoint_save, checkpoint_load, checkpoint_clear,
+    export_bilingual_docx,
 )
 
 
@@ -94,7 +96,9 @@ def _finalize_job(timer_ph, prog, add_log,
 def _run_translation(chunks, target_lang, doc_context,
                      timer_ph, prog_ph, render_stats, add_log,
                      total_blocks, prefix_label="Dịch",
-                     glossary: dict | None = None):
+                     glossary: dict | None = None,
+                     custom_rules: dict | None = None,
+                     on_chunk_done=None):
     """
     Chạy `translate_parallel` trong thread, main loop poll & render UI.
     Trả về (translations, tok_in, tok_out, elapsed).
@@ -115,7 +119,7 @@ def _run_translation(chunks, target_lang, doc_context,
     threading.Thread(
         target=translate_parallel,
         args=(holder, client, chunks, target_lang, doc_context,
-              MAX_WORD_WORKERS, glossary),
+              MAX_WORD_WORKERS, glossary, custom_rules),
         daemon=True,
     ).start()
 
@@ -130,6 +134,9 @@ def _run_translation(chunks, target_lang, doc_context,
                 add_log(f"   ✅ Chunk {entry['idx']+1}: {entry['size']} đoạn "
                         f"({entry['in_t']:,}in/{entry['out_t']:,}out tok)")
             last_logged += 1
+
+        if on_chunk_done and last_logged > 0:
+            on_chunk_done(holder["translations"])
 
         elapsed = time.time() - t0
         done_c  = holder["chunk_done"]
@@ -200,6 +207,9 @@ def _run_analysis(uploaded_docx, lang_word):
             add_log(f"   • Footnotes:           {footnote_cnt:,} (sẽ dịch)")
         if endnote_cnt > 0:
             add_log(f"   • Endnotes:            {endnote_cnt:,} (sẽ dịch)")
+        comment_cnt = stats.get("comment", 0)
+        if comment_cnt > 0:
+            add_log(f"   • Comments:             {comment_cnt:,} (sẽ dịch)")
 
         target_lang = LANG_EN[lang_word]
 
@@ -229,6 +239,7 @@ def _run_analysis(uploaded_docx, lang_word):
             "table_cnt":     table_cnt,
             "footnote_cnt":  footnote_cnt,
             "endnote_cnt":   endnote_cnt,
+            "comment_cnt":   comment_cnt,
             "tm_hits":       len(tm_cached),
             "doc_context":   build_doc_context(blocks),
             "glossary":      glossary,
@@ -269,6 +280,10 @@ def _render_analysis_panel():
     fn_total = a.get("footnote_cnt", 0) + a.get("endnote_cnt", 0)
     c5.markdown(stat_box_html(f"{fn_total:,}", "Footnote/Endnote"),
                 unsafe_allow_html=True)
+
+    comment_cnt = a.get("comment_cnt", 0)
+    if comment_cnt > 0:
+        st.info(f"💬 **{comment_cnt:,} comment** trong tài liệu — sẽ được dịch.")
 
     if a["tm_hits"] > 0:
         pct = 100 * a["tm_hits"] / max(len(a["translatable"]), 1)
@@ -314,6 +329,27 @@ def _render_analysis_panel():
             a["glossary"] = new_gloss
             st.session_state["word_analysis"] = a
 
+    with st.expander("⚙️ Custom rules per role (tuỳ chọn)", expanded=False):
+        st.caption(
+            "Định nghĩa rule riêng cho từng role — sẽ được inject vào mọi chunk prompt. "
+            "Để trống = dùng rule mặc định."
+        )
+        custom_roles = ["section_heading", "paragraph", "bullet", "table_cell",
+                        "note", "textbox", "footnote", "endnote", "comment"]
+        stored = a.get("custom_rules", {})
+        new_rules = {}
+        for role in custom_roles:
+            val = st.text_input(
+                f"{ROLE_LABEL.get(role, role)}:",
+                value=stored.get(role, ""),
+                key=f"word_custom_rule_{role}",
+                placeholder="vd: keep concise, max 8 words",
+            )
+            if val.strip():
+                new_rules[role] = val.strip()
+        a["custom_rules"] = new_rules
+        st.session_state["word_analysis"] = a
+
     # Dịch button — nói rõ còn bao nhiêu sau TM
     n_remain = len(a["translatable"]) - a["tm_hits"]
     label = (f"▶  Dịch {n_remain:,} đoạn"
@@ -336,6 +372,7 @@ def _run_full_translation():
     target_lang  = a["target_lang"]
     doc_context  = a["doc_context"]
     glossary     = a["glossary"]
+    custom_rules = a.get("custom_rules") or {}
     docx_bytes   = a["docx_bytes"]
     tm           = _ensure_tm()
 
@@ -350,6 +387,16 @@ def _run_full_translation():
         add_log(f"📝 Sẽ gọi API cho {len(remaining):,} đoạn")
 
         translations = dict(cached)   # khởi đầu với TM hits
+
+        # Checkpoint recovery: restore partial translations from previous run
+        ckpt = checkpoint_load(docx_bytes, target_lang)
+        if ckpt:
+            ckpt_hits = sum(1 for b in remaining if b["id"] in ckpt)
+            if ckpt_hits > 0:
+                add_log(f"🔄 Checkpoint: {ckpt_hits:,} đoạn từ lần dịch trước")
+                translations.update(ckpt)
+                remaining = [b for b in remaining if b["id"] not in translations]
+
         tok_in = tok_out = 0
         elapsed = 0.0
         num_chunks = 0
@@ -364,14 +411,20 @@ def _run_full_translation():
                 add_log(f"📖 Áp dụng glossary {len(glossary)} thuật ngữ")
             add_log(f"⚡ Dịch song song {MAX_WORD_WORKERS} luồng")
 
+            def _save_ckpt(tr_so_far):
+                checkpoint_save(docx_bytes, target_lang, {**cached, **tr_so_far})
+
             new_translations, tok_in, tok_out, elapsed = _run_translation(
                 chunks, target_lang, doc_context,
                 timer_ph, prog, render_stats, add_log,
                 len(remaining), prefix_label="Dịch",
                 glossary=glossary,
+                custom_rules=custom_rules or None,
+                on_chunk_done=_save_ckpt,
             )
             translations.update(new_translations)
             tm_added = tm_store(remaining, new_translations, tm, target_lang)
+            checkpoint_clear(docx_bytes, target_lang)
             add_log(f"🤖 Model: {get_working_model()}")
         else:
             timer_ph.markdown(
@@ -407,6 +460,7 @@ def _run_full_translation():
         st.session_state["word_elapsed"]      = elapsed
         st.session_state["word_num_chunks"]   = num_chunks
         st.session_state["word_glossary"]     = glossary
+        st.session_state["word_custom_rules"] = custom_rules
         st.session_state["word_summary"]      = (
             f"✅ Dịch xong {len(translatable):,} đoạn  "
             f"(💾 {len(cached):,} TM + 🔄 {len(remaining):,} API)  "
@@ -431,10 +485,11 @@ def _run_partial(missed: list, label: str, heading: str, log_heading: str,
         st.info("✨ Không có đoạn nào cần xử lý!")
         return
 
-    doc_context = st.session_state["word_doc_context"]
-    target_lang = LANG_EN[st.session_state["word_lang"]]
-    glossary    = st.session_state.get("word_glossary")
-    tm          = _ensure_tm()
+    doc_context  = st.session_state["word_doc_context"]
+    target_lang  = LANG_EN[st.session_state["word_lang"]]
+    glossary     = st.session_state.get("word_glossary")
+    custom_rules = st.session_state.get("word_custom_rules")
+    tm           = _ensure_tm()
     translations = st.session_state["word_translations"]
 
     cached, remaining = tm_lookup(missed, tm, target_lang)
@@ -474,6 +529,7 @@ def _run_partial(missed: list, label: str, heading: str, log_heading: str,
             timer_ph, prog, render_stats, add_log,
             len(remaining), prefix_label=label,
             glossary=glossary,
+            custom_rules=custom_rules or None,
         )
         translations.update(new_translations)
         tm_added = tm_store(remaining, new_translations, tm, target_lang)
@@ -555,6 +611,7 @@ ROLE_LABEL = {
     "body_repeated":   "🔁 Lặp lại",
     "footnote":        "📝 Footnote",
     "endnote":         "📝 Endnote",
+    "comment":         "💬 Comment",
 }
 
 
@@ -728,6 +785,23 @@ def render():
             file_name=out_name,
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
+        )
+
+        bilingual_bytes = export_bilingual_docx(
+            st.session_state["word_docx_bytes"],
+            st.session_state["word_blocks"],
+            st.session_state["word_translations"],
+        )
+        bi_name = st.session_state["word_filename"].replace(
+            ".docx", f"_bilingual_{st.session_state['word_lang'][:2]}.docx"
+        )
+        st.download_button(
+            label="📊  Tải DOCX so sánh song ngữ",
+            data=bilingual_bytes,
+            file_name=bi_name,
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+            key="word_dl_bilingual",
         )
 
         blocks       = st.session_state["word_blocks"]
