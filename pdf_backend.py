@@ -476,14 +476,39 @@ def _parse_page_response(raw: str, groups: list) -> list[str]:
 def translate_page(client, groups: list, target_lang: str, page_idx: int,
                    timer_ph, t0: float, page_start: float,
                    log_lines: list, log_ph,
-                   glossary: list[str] | None = None):
-    """Dịch 1 trang PDF (sequential mode — có live timer UI)."""
-    prompt = _build_page_prompt(groups, target_lang, glossary)
+                   glossary: list[str] | None = None,
+                   tm: dict | None = None):
+    """Dịch 1 trang PDF (sequential mode — có live timer UI). Returns (trans, in_t, out_t, tm_hits)."""
+    from word_backend import tm_key
+
+    if tm is not None:
+        cached = [tm.get(tm_key(g["text"], target_lang)) for g in groups]
+    else:
+        cached = [None] * len(groups)
+    tm_hits = sum(1 for c in cached if c)
+    to_translate_idx = [i for i, c in enumerate(cached) if not c]
+
+    if not to_translate_idx:
+        return cached, 0, 0, tm_hits
+
+    sub_groups = [groups[i] for i in to_translate_idx]
+    prompt = _build_page_prompt(sub_groups, target_lang, glossary)
     label  = f"Đang dịch trang {page_idx + 1}"
     raw, in_t, out_t = call_gemini_live(
         client, prompt, timer_ph, t0, page_start, label, log_lines, log_ph
     )
-    return _parse_page_response(raw, groups), in_t, out_t
+    new_trans = _parse_page_response(raw, sub_groups)
+
+    final = list(cached)
+    for idx, tr in zip(to_translate_idx, new_trans):
+        final[idx] = tr
+
+    if tm is not None:
+        for g, tr in zip(sub_groups, new_trans):
+            if tr and tr != g["text"]:
+                tm[tm_key(g["text"], target_lang)] = tr
+
+    return final, in_t, out_t, tm_hits
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -512,49 +537,104 @@ def _call_gemini_with_retry(client, prompt: str) -> tuple[str, int, int]:
 
 
 def translate_page_pure(client, groups: list, target_lang: str,
-                        glossary: list[str] | None = None
-                        ) -> tuple[list[str], int, int, str | None]:
-    """Pure translate (no UI) — used by parallel processor. Returns (trans, in_t, out_t, error)."""
+                        glossary: list[str] | None = None,
+                        tm: dict | None = None,
+                        fallback_individually: bool = True,
+                        ) -> tuple[list[str], int, int, str | None, int]:
+    """
+    Pure translate (no UI). Supports:
+    - TM lookup: skip lines already cached, only translate new ones
+    - Smart fallback: if batch fails, retry each line individually
+    Returns (translations, in_tok, out_tok, error_or_none, tm_hits).
+    """
+    from word_backend import tm_key
+
     if not groups:
-        return [], 0, 0, None
-    prompt = _build_page_prompt(groups, target_lang, glossary)
+        return [], 0, 0, None, 0
+
+    # TM lookup
+    if tm is not None:
+        cached_per_line = [tm.get(tm_key(g["text"], target_lang)) for g in groups]
+    else:
+        cached_per_line = [None] * len(groups)
+
+    tm_hits = sum(1 for c in cached_per_line if c)
+    to_translate_idx = [i for i, c in enumerate(cached_per_line) if not c]
+
+    if not to_translate_idx:
+        return cached_per_line, 0, 0, None, tm_hits
+
+    sub_groups = [groups[i] for i in to_translate_idx]
+    in_t = out_t = 0
+    last_err: str | None = None
+
     try:
+        prompt = _build_page_prompt(sub_groups, target_lang, glossary)
         raw, in_t, out_t = _call_gemini_with_retry(client, prompt)
-        return _parse_page_response(raw, groups), in_t, out_t, None
+        new_trans = _parse_page_response(raw, sub_groups)
     except Exception as e:
-        return [g["text"] for g in groups], 0, 0, str(e)
+        last_err = str(e)
+        if not fallback_individually:
+            return [g["text"] for g in groups], 0, 0, last_err, tm_hits
+        # Smart fallback: try each line individually
+        new_trans = []
+        for g in sub_groups:
+            try:
+                single_prompt = _build_page_prompt([g], target_lang, glossary)
+                raw_s, in_s, out_s = _call_gemini_with_retry(client, single_prompt)
+                parsed = _parse_page_response(raw_s, [g])
+                new_trans.append(parsed[0])
+                in_t  += in_s
+                out_t += out_s
+            except Exception:
+                new_trans.append(g["text"])
+
+    # Merge cached + new translations back to full list
+    final: list[str] = list(cached_per_line)  # type: ignore[arg-type]
+    for idx, tr in zip(to_translate_idx, new_trans):
+        final[idx] = tr
+
+    # Store new translations into TM
+    if tm is not None:
+        for g, tr in zip(sub_groups, new_trans):
+            if tr and tr != g["text"]:
+                tm[tm_key(g["text"], target_lang)] = tr
+
+    return final, in_t, out_t, last_err, tm_hits
 
 
 def translate_pages_parallel(client, all_groups: dict, target_lang: str,
                              targets: list[int],
                              max_workers: int = 4,
                              glossary: list[str] | None = None,
+                             tm: dict | None = None,
                              progress_callback=None):
     """
     Translate multiple pages concurrently with ThreadPoolExecutor.
-    progress_callback(page_idx, done_count, total, in_tok_delta, out_tok_delta, error).
-    Returns (all_trans: dict, total_in_tok, total_out_tok, errors: dict).
+    progress_callback(page_idx, done_count, total, in_tok_delta, out_tok_delta, error, tm_hits).
+    Returns (all_trans: dict, total_in_tok, total_out_tok, errors: dict, total_tm_hits: int).
     """
     all_trans: dict = {}
     errors: dict = {}
     total_in = total_out = 0
     done_count = 0
+    total_tm_hits = 0
     total = len(targets)
     lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
             ex.submit(translate_page_pure, client, all_groups.get(pi, []),
-                      target_lang, glossary): pi
+                      target_lang, glossary, tm): pi
             for pi in targets
         }
         for future in as_completed(futures):
             pi = futures[future]
             try:
-                trans, in_t, out_t, err = future.result()
+                trans, in_t, out_t, err, tm_hits = future.result()
             except Exception as e:
-                trans, in_t, out_t, err = (
-                    [g["text"] for g in all_groups.get(pi, [])], 0, 0, str(e),
+                trans, in_t, out_t, err, tm_hits = (
+                    [g["text"] for g in all_groups.get(pi, [])], 0, 0, str(e), 0,
                 )
             all_trans[pi] = trans
             if err:
@@ -562,12 +642,13 @@ def translate_pages_parallel(client, all_groups: dict, target_lang: str,
             with lock:
                 total_in  += in_t
                 total_out += out_t
+                total_tm_hits += tm_hits
                 done_count += 1
                 snapshot = (done_count, total_in, total_out)
             if progress_callback:
-                progress_callback(pi, snapshot[0], total, in_t, out_t, err)
+                progress_callback(pi, snapshot[0], total, in_t, out_t, err, tm_hits)
 
-    return all_trans, total_in, total_out, errors
+    return all_trans, total_in, total_out, errors, total_tm_hits
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -716,3 +797,74 @@ def insert_ocr_captions_into_pdf(pdf_path: str, dst_path: str,
     doc.save(dst_path, garbage=4, deflate=True)
     doc.close()
     return inserted
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QUALITY CHECK — số bị mất, length ratio, dòng bỏ sót
+# ══════════════════════════════════════════════════════════════════════════════
+_PDF_NUM_PAT = re.compile(r"\b\d[\d,\.]*\b")
+
+
+def quality_check_pdf(all_groups: dict, all_trans: dict) -> list[dict]:
+    """
+    Returns list of {page, line_idx, text, translation, issues} for suspicious lines.
+    Checks per line: missing numbers, abnormal length ratio, untranslated (text == translation).
+    """
+    issues_out: list[dict] = []
+    for pi in sorted(all_groups.keys()):
+        groups = all_groups[pi]
+        trans  = all_trans.get(pi, [])
+        for li, g in enumerate(groups):
+            if li >= len(trans):
+                break
+            orig = g["text"].strip()
+            tr   = (trans[li] or "").strip()
+            if not orig or not tr:
+                continue
+            issues: list[str] = []
+
+            orig_nums = set(_PDF_NUM_PAT.findall(orig))
+            tr_nums   = set(_PDF_NUM_PAT.findall(tr))
+            missing   = orig_nums - tr_nums
+            if missing:
+                issues.append(f"Số bị mất: {', '.join(sorted(missing)[:4])}")
+
+            ratio = len(tr) / max(len(orig), 1)
+            if ratio > 3.5:
+                issues.append(f"Dịch quá dài ({ratio:.1f}x)")
+            elif ratio < 0.2 and len(orig) > 20:
+                issues.append(f"Dịch quá ngắn ({ratio:.1f}x)")
+
+            if tr == orig and len(orig) > 15 and any(c.isalpha() for c in orig):
+                issues.append("Chưa dịch (giữ nguyên text gốc)")
+
+            if issues:
+                issues_out.append({
+                    "page": pi + 1, "line_idx": li,
+                    "text": orig, "translation": tr, "issues": issues,
+                })
+    return issues_out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BILINGUAL PDF — interleave original + translated pages (page 1: orig, page 2: trans, ...)
+# ══════════════════════════════════════════════════════════════════════════════
+def build_bilingual_pdf(src_path: str, translated_path: str, dst_path: str,
+                        targets: list[int]):
+    """
+    Create a bilingual PDF: pages from `src_path` (original) interleaved with
+    corresponding pages from `translated_path` (translated). Only targets pages.
+    Layout: [orig p1] [trans p1] [orig p2] [trans p2] ...
+    """
+    src   = fitz.open(src_path)
+    trans = fitz.open(translated_path)
+    out   = fitz.open()
+    for pi in targets:
+        if 0 <= pi < len(src):
+            out.insert_pdf(src,   from_page=pi, to_page=pi)
+        if 0 <= pi < len(trans):
+            out.insert_pdf(trans, from_page=pi, to_page=pi)
+    out.save(dst_path, garbage=4, deflate=True)
+    out.close()
+    src.close()
+    trans.close()

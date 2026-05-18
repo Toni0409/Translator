@@ -17,6 +17,7 @@ from pdf_backend import (
     translate_page, write_translated_pdf,
     translate_pages_parallel, build_pdf_glossary,
     extract_pdf_images, ocr_pdf_images, insert_ocr_captions_into_pdf,
+    quality_check_pdf, build_bilingual_pdf,
 )
 
 
@@ -24,6 +25,9 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
                          use_parallel: bool = False,
                          use_glossary: bool = False,
                          use_ocr: bool = False,
+                         use_tm: bool = True,
+                         use_bilingual: bool = False,
+                         use_quality_check: bool = True,
                          parallel_workers: int = 4):
     """Chạy pipeline dịch PDF và lưu kết quả vào session_state."""
     st.markdown("### 📊 Tiến độ")
@@ -98,19 +102,28 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
             else:
                 add_log("📚 Không tìm thấy thuật ngữ lặp")
 
+        # Translation Memory: persistent across runs in session_state
+        tm = None
+        if use_tm:
+            if "pdf_tm" not in st.session_state:
+                st.session_state["pdf_tm"] = {}
+            tm = st.session_state["pdf_tm"]
+            add_log(f"💾 TM: {len(tm):,} entry sẵn có")
+
+        total_tm_hits = 0
+
         if use_parallel and len(targets) > 1:
             add_log(f"⚡ Parallel mode: {parallel_workers} workers")
-            page_results: dict[int, dict] = {}
 
-            def on_page_done(pi, done, total, in_t, out_t, err):
+            def on_page_done(pi, done, total, in_t, out_t, err, tm_hits):
                 nonlocal tok_in, tok_out
                 tok_in  += in_t
                 tok_out += out_t
-                page_results[pi] = {"in_t": in_t, "out_t": out_t, "err": err}
                 pct = int(10 + (done / total) * 80)
                 prog.progress(pct, text=f"Dịch {done}/{total} trang xong...")
                 status = "❌" if err else "✅"
-                msg = f"   {status} Trang {pi+1} ({in_t:,}in/{out_t:,}out)"
+                tm_note = f" [TM {tm_hits}]" if tm_hits else ""
+                msg = f"   {status} Trang {pi+1} ({in_t:,}in/{out_t:,}out){tm_note}"
                 if err:
                     msg += f" — Lỗi: {err[:120]}"
                 add_log(msg)
@@ -121,10 +134,10 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
                     unsafe_allow_html=True,
                 )
 
-            all_trans, tok_in, tok_out, errors = translate_pages_parallel(
+            all_trans, tok_in, tok_out, errors, total_tm_hits = translate_pages_parallel(
                 client, all_groups, lang_pdf, targets,
                 max_workers=parallel_workers,
-                glossary=glossary,
+                glossary=glossary, tm=tm,
                 progress_callback=on_page_done,
             )
         else:
@@ -144,14 +157,16 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
                     continue
 
                 try:
-                    trans, in_t, out_t = translate_page(
+                    trans, in_t, out_t, tm_hits = translate_page(
                         client, groups, lang_pdf, pi,
                         timer_ph, t0, page_start, log_lines, log_ph,
-                        glossary=glossary,
+                        glossary=glossary, tm=tm,
                     )
                     tok_in  += in_t
                     tok_out += out_t
-                    add_log(f"   ✅ {len(trans)} dòng ({in_t:,}in/{out_t:,}out tok) — {time.time()-page_start:.1f}s")
+                    total_tm_hits += tm_hits
+                    tm_note = f" [TM hit: {tm_hits}]" if tm_hits else ""
+                    add_log(f"   ✅ {len(trans)} dòng ({in_t:,}in/{out_t:,}out tok){tm_note} — {time.time()-page_start:.1f}s")
                 except Exception as e:
                     add_log(f"   ❌ Lỗi trang {pi + 1}: {e}")
                     trans = [g["text"] for g in groups]
@@ -159,6 +174,11 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
                 all_trans[pi] = trans
                 render_stats(idx + 1, total_pg, total_lines, tok_in, tok_out)
                 time.sleep(PDF_DELAY)
+
+        if use_tm and total_tm_hits > 0:
+            add_log(f"💾 TM: tổng {total_tm_hits:,} dòng tái dùng — tiết kiệm chi phí")
+        if use_tm:
+            add_log(f"💾 TM: {len(tm):,} entry sau khi xong")
 
         prog.progress(92, text="Tạo PDF...")
         add_log("💾 Đang tạo PDF...")
@@ -221,6 +241,32 @@ def _run_pdf_translation(uploaded_pdf, lang_pdf, pages_s,
             f"|  ${usd:.4f} USD ≈ {vnd:,.0f} VND"
         )
 
+        # Bilingual PDF: interleave original + translated pages
+        if use_bilingual:
+            add_log("📑 Tạo PDF song ngữ (gốc + dịch xen kẽ)...")
+            biling_path = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
+            try:
+                build_bilingual_pdf(src_path, dst_path, biling_path, targets)
+                with open(biling_path, "rb") as f:
+                    st.session_state["pdf_bilingual_bytes"] = f.read()
+                add_log("✅ PDF song ngữ sẵn sàng để tải")
+            except Exception as e:
+                add_log(f"⚠️ Không tạo được PDF song ngữ: {e}")
+            finally:
+                try:
+                    os.unlink(biling_path)
+                except Exception:
+                    pass
+
+        # Quality check
+        if use_quality_check:
+            issues = quality_check_pdf(all_groups, all_trans)
+            st.session_state["pdf_quality_issues"] = issues
+            if issues:
+                add_log(f"⚠️ Quality check: {len(issues)} dòng có vấn đề (xem chi tiết dưới)")
+            else:
+                add_log("✅ Quality check: không phát hiện vấn đề")
+
     except Exception as e:
         add_log(f"❌ Lỗi: {e}")
         st.error(f"❌ Có lỗi xảy ra: {e}")
@@ -262,34 +308,96 @@ def render():
             value=True, key="pdf_glossary",
             help="Phát hiện thuật ngữ lặp lại và đảm bảo dịch nhất quán xuyên suốt tài liệu.",
         )
+        use_tm = st.checkbox(
+            "💾 Translation Memory (cache giữa các lần dịch)",
+            value=True, key="pdf_use_tm",
+            help="Cache bản dịch trong session — dòng đã dịch lần sau sẽ reuse, không tốn API call.",
+        )
         use_ocr = st.checkbox(
             "🖼 OCR text trong ảnh embedded",
             value=False, key="pdf_ocr",
             help="Trích ảnh từ PDF, OCR + dịch text trong ảnh, chèn vào PDF dưới dạng annotation màu vàng.",
         )
+        use_bilingual = st.checkbox(
+            "📑 Xuất thêm PDF song ngữ (gốc + dịch xen kẽ)",
+            value=False, key="pdf_bilingual",
+            help="Tạo thêm 1 file PDF có pages xen kẽ: trang gốc → trang dịch → trang gốc...",
+        )
+        use_quality_check = st.checkbox(
+            "🔍 Quality check sau khi dịch",
+            value=True, key="pdf_qc",
+            help="Tự động phát hiện: số bị mất, dòng quá dài/ngắn bất thường, dòng chưa dịch.",
+        )
+
+        tm_count = len(st.session_state.get("pdf_tm", {}))
+        if tm_count > 0:
+            cc1, cc2 = st.columns([3, 1])
+            cc1.caption(f"💾 TM hiện có **{tm_count:,}** entry")
+            if cc2.button("🗑 Xoá TM", key="pdf_clear_tm"):
+                st.session_state["pdf_tm"] = {}
+                st.rerun()
 
     st.divider()
 
     if st.button("▶  Bắt đầu dịch PDF", disabled=(uploaded_pdf is None), key="pdf_run"):
-        for k in ("pdf_bytes", "pdf_out_name", "pdf_summary"):
+        for k in ("pdf_bytes", "pdf_out_name", "pdf_summary",
+                  "pdf_bilingual_bytes", "pdf_quality_issues"):
             st.session_state.pop(k, None)
         _run_pdf_translation(
             uploaded_pdf, lang_pdf, pages_s,
             use_parallel=use_parallel,
             use_glossary=use_glossary,
             use_ocr=use_ocr,
+            use_tm=use_tm,
+            use_bilingual=use_bilingual,
+            use_quality_check=use_quality_check,
             parallel_workers=parallel_workers,
         )
 
     if "pdf_bytes" in st.session_state:
         st.divider()
         st.success(st.session_state["pdf_summary"])
-        st.download_button(
-            label="⬇️  Tải PDF đã dịch",
-            data=st.session_state["pdf_bytes"],
-            file_name=st.session_state["pdf_out_name"],
-            mime="application/pdf",
-            use_container_width=True,
-        )
+
+        if "pdf_bilingual_bytes" in st.session_state:
+            dc1, dc2 = st.columns(2)
+            dc1.download_button(
+                label="⬇️  Tải PDF đã dịch",
+                data=st.session_state["pdf_bytes"],
+                file_name=st.session_state["pdf_out_name"],
+                mime="application/pdf",
+                use_container_width=True,
+            )
+            biling_name = st.session_state["pdf_out_name"].replace(".pdf", "_bilingual.pdf")
+            dc2.download_button(
+                label="⬇️  Tải PDF song ngữ",
+                data=st.session_state["pdf_bilingual_bytes"],
+                file_name=biling_name,
+                mime="application/pdf",
+                use_container_width=True,
+            )
+        else:
+            st.download_button(
+                label="⬇️  Tải PDF đã dịch",
+                data=st.session_state["pdf_bytes"],
+                file_name=st.session_state["pdf_out_name"],
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
+        issues = st.session_state.get("pdf_quality_issues") or []
+        if issues:
+            with st.expander(f"⚠️ Quality check: {len(issues)} dòng có vấn đề", expanded=False):
+                for it in issues[:100]:
+                    with st.container(border=True):
+                        st.markdown(f"**Trang {it['page']}** — *{'; '.join(it['issues'])}*")
+                        cc1, cc2 = st.columns(2)
+                        cc1.text_area("Gốc", it["text"], height=80,
+                                      key=f"pdf_qc_orig_{it['page']}_{it['line_idx']}",
+                                      disabled=True, label_visibility="collapsed")
+                        cc2.text_area("Dịch", it["translation"], height=80,
+                                      key=f"pdf_qc_tr_{it['page']}_{it['line_idx']}",
+                                      disabled=True, label_visibility="collapsed")
+                if len(issues) > 100:
+                    st.caption(f"Chỉ hiển thị 100/{len(issues)} dòng đầu.")
     elif not uploaded_pdf:
         st.info("👆 Vui lòng upload file PDF để bắt đầu")
