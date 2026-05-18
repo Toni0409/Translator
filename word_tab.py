@@ -279,6 +279,7 @@ def _run_analysis(uploaded_docx, lang_word):
 def _render_analysis_panel():
     a = st.session_state["word_analysis"]
 
+    # ── TIER 1 — Quick mode: stats + primary action ──────────────────────
     st.markdown("### 📊 Kết quả phân tích")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.markdown(stat_box_html(f"{a['stats']['body']:,}", "Body cần dịch"),
@@ -304,38 +305,11 @@ def _render_analysis_panel():
             f"({pct:.1f}%) sẽ dùng cache cũ — không gọi API."
         )
 
-    # TM Export / Import
-    with st.expander(f"💾 Translation Memory ({len(_ensure_tm()):,} entries) — Export / Import", expanded=False):
-        colA, colB = st.columns(2)
-        # Export TM
-        with colA:
-            tm = _ensure_tm()
-            if tm:
-                import json as _json
-                st.download_button(
-                    "⬇️ Export TM (.json)",
-                    data=_json.dumps(tm, ensure_ascii=False, indent=2),
-                    file_name="word_tm.json", mime="application/json",
-                    use_container_width=True, key="word_tm_export",
-                )
-            else:
-                st.info("TM hiện tại rỗng.")
-        # Import TM
-        with colB:
-            up = st.file_uploader("⬆️ Import TM (.json)", type=["json"], key="word_tm_import",
-                                  label_visibility="collapsed")
-            if up:
-                try:
-                    import json as _json
-                    loaded = _json.loads(up.read())
-                    if isinstance(loaded, dict):
-                        _ensure_tm().update(loaded)
-                        st.success(f"Đã import {len(loaded)} TM entries")
-                except Exception as e:
-                    st.error(str(e))
+    # ── TIER 2 — Single advanced expander (no nested expanders!) ─────────
+    with st.expander("⚙️ Tuỳ chỉnh nâng cao", expanded=False):
 
-    # Per-role translation toggle
-    with st.expander("🎚 Chọn loại nội dung sẽ dịch", expanded=False):
+        # ── 1. Role toggles ──────────────────────────────────────────────
+        st.markdown("##### 🎚 Chọn loại nội dung dịch")
         st.caption("Mặc định bỏ qua header/footer (thường chứa page#, tên file...). "
                    "Tick để dịch loại đó.")
         role_options = [
@@ -349,10 +323,10 @@ def _render_analysis_panel():
             ("toc",          "📑 TOC (mục lục)"),
         ]
         enabled = {}
-        cols = st.columns(2)
+        rcols = st.columns(2)
         for i, (role, label) in enumerate(role_options):
             default_on = role not in {"header", "footer", "body_repeated"}
-            enabled[role] = cols[i % 2].checkbox(
+            enabled[role] = rcols[i % 2].checkbox(
                 label, value=a.get("role_toggles", {}).get(role, default_on),
                 key=f"word_role_toggle_{role}",
             )
@@ -366,11 +340,21 @@ def _render_analysis_panel():
         st.caption(f"➡️ Sẽ dịch: **{len(translatable_now):,} đoạn** ({chars_now:,} ký tự) "
                    f"sau khi áp dụng toggle.")
 
-    # Glossary editor
-    with st.expander(
-        f"📚 Glossary ({len(a['glossary'])} thuật ngữ) — bấm để review / sửa",
-        expanded=False,
-    ):
+        st.divider()
+
+        # ── 2. Cost cap warning ──────────────────────────────────────────
+        st.markdown("##### 💰 Cảnh báo chi phí")
+        cost_cap = st.number_input(
+            "Ngưỡng cảnh báo (USD) — 0 = tắt",
+            min_value=0.0, max_value=10.0, value=0.5, step=0.1,
+            key="word_cost_cap",
+        )
+
+        st.divider()
+
+        # ── 3. Glossary (editor + LLM suggest + export/import) ───────────
+        st.markdown(f"##### 📖 Glossary ({len(a['glossary'])} thuật ngữ)")
+
         # LLM glossary suggest — works whether or not heuristic glossary is empty
         if st.button("🪄 Gợi ý glossary từ LLM", key="word_glossary_suggest"):
             from word_backend import suggest_glossary
@@ -418,32 +402,6 @@ def _render_analysis_panel():
                 "Xóa cell **Bản dịch** (để trống) để loại entry khỏi glossary. "
                 "Có thể thêm dòng mới."
             )
-            # Glossary export/import
-            gcolA, gcolB = st.columns(2)
-            with gcolA:
-                if a["glossary"]:
-                    import json as _json
-                    st.download_button(
-                        "⬇️ Export Glossary (.json)",
-                        data=_json.dumps(a["glossary"], ensure_ascii=False, indent=2),
-                        file_name="word_glossary.json", mime="application/json",
-                        use_container_width=True, key="word_glossary_export",
-                    )
-            with gcolB:
-                gup = st.file_uploader("⬆️ Import Glossary (.json)", type=["json"],
-                                       key="word_glossary_import",
-                                       label_visibility="collapsed")
-                if gup:
-                    try:
-                        import json as _json
-                        gloaded = _json.loads(gup.read())
-                        if isinstance(gloaded, dict):
-                            a["glossary"].update(gloaded)
-                            st.session_state["word_analysis"] = a
-                            st.success(f"Đã import {len(gloaded)} glossary entries")
-                    except Exception as e:
-                        st.error(str(e))
-
             df = pd.DataFrame([
                 {"Thuật ngữ gốc": k, "Bản dịch": v}
                 for k, v in a["glossary"].items()
@@ -468,7 +426,69 @@ def _render_analysis_panel():
             a["glossary"] = new_gloss
             st.session_state["word_analysis"] = a
 
-    with st.expander("⚙️ Custom rules per role (tuỳ chọn)", expanded=False):
+        # Glossary export/import — always shown so user can import even when empty
+        gcolA, gcolB = st.columns(2)
+        with gcolA:
+            if a["glossary"]:
+                import json as _json
+                st.download_button(
+                    "⬇️ Export Glossary (.json)",
+                    data=_json.dumps(a["glossary"], ensure_ascii=False, indent=2),
+                    file_name="word_glossary.json", mime="application/json",
+                    use_container_width=True, key="word_glossary_export",
+                )
+            else:
+                st.caption("(Glossary rỗng — chưa có gì để export)")
+        with gcolB:
+            gup = st.file_uploader("⬆️ Import Glossary (.json)", type=["json"],
+                                   key="word_glossary_import",
+                                   label_visibility="collapsed")
+            if gup:
+                try:
+                    import json as _json
+                    gloaded = _json.loads(gup.read())
+                    if isinstance(gloaded, dict):
+                        a["glossary"].update(gloaded)
+                        st.session_state["word_analysis"] = a
+                        st.success(f"Đã import {len(gloaded)} glossary entries")
+                except Exception as e:
+                    st.error(str(e))
+
+        st.divider()
+
+        # ── 4. Translation Memory ────────────────────────────────────────
+        tm = _ensure_tm()
+        st.markdown(f"##### 💾 Translation Memory")
+        st.caption(f"Hiện có **{len(tm):,} entry** trong TM.")
+        tcolA, tcolB = st.columns(2)
+        with tcolA:
+            if tm:
+                import json as _json
+                st.download_button(
+                    "⬇️ Export TM (.json)",
+                    data=_json.dumps(tm, ensure_ascii=False, indent=2),
+                    file_name="word_tm.json", mime="application/json",
+                    use_container_width=True, key="word_tm_export",
+                )
+            else:
+                st.caption("(TM hiện tại rỗng)")
+        with tcolB:
+            up = st.file_uploader("⬆️ Import TM (.json)", type=["json"], key="word_tm_import",
+                                  label_visibility="collapsed")
+            if up:
+                try:
+                    import json as _json
+                    loaded = _json.loads(up.read())
+                    if isinstance(loaded, dict):
+                        _ensure_tm().update(loaded)
+                        st.success(f"Đã import {len(loaded)} TM entries")
+                except Exception as e:
+                    st.error(str(e))
+
+        st.divider()
+
+        # ── 5. Custom rules per role ─────────────────────────────────────
+        st.markdown("##### ⚙️ Custom rules per role")
         st.caption(
             "Định nghĩa rule riêng cho từng role — sẽ được inject vào mọi chunk prompt. "
             "Để trống = dùng rule mặc định."
@@ -489,18 +509,16 @@ def _render_analysis_panel():
         a["custom_rules"] = new_rules
         st.session_state["word_analysis"] = a
 
-    # Cost cap input
-    cost_cap = st.number_input(
-        "⚠️ Cảnh báo chi phí (USD) — 0 = tắt",
-        min_value=0.0, max_value=10.0, value=0.5, step=0.1,
-        key="word_cost_cap",
-    )
+    # ── Action buttons (after advanced expander, still inside Phase 1) ───
+    # Cost cap value — read from session_state since the widget lives inside
+    # the (possibly collapsed) advanced expander.
+    cost_cap = st.session_state.get("word_cost_cap", 0.5)
 
     # Dịch button — nói rõ còn bao nhiêu sau TM
     n_remain = len(a["translatable"]) - a["tm_hits"]
-    label = (f"▶  Dịch {n_remain:,} đoạn"
+    label = (f"🚀 Dịch ngay ({n_remain:,} đoạn)"
              if n_remain > 0
-             else f"▶  Apply {a['tm_hits']:,} TM hit (không gọi API)")
+             else f"🚀 Dịch ngay — apply {a['tm_hits']:,} TM hit (không gọi API)")
 
     # Estimate cost for remaining blocks
     if n_remain > 0:
@@ -527,11 +545,20 @@ def _render_analysis_panel():
     else:
         cost_confirmed = True
 
-    if st.button(label, use_container_width=True, type="primary",
-                 key="word_translate_phase2_btn",
-                 disabled=(not cost_confirmed)):
-        _run_full_translation()
-        st.rerun()
+    btn_primary, btn_secondary = st.columns([3, 1])
+    with btn_primary:
+        if st.button(label, use_container_width=True, type="primary",
+                     key="word_translate_phase2_btn",
+                     disabled=(not cost_confirmed)):
+            _run_full_translation()
+            st.rerun()
+    with btn_secondary:
+        if st.button("🔄 Phân tích lại", use_container_width=True,
+                     key="word_reanalyze_btn",
+                     help="Xoá kết quả phân tích để upload lại file"):
+            st.session_state.pop("word_analysis", None)
+            st.session_state.pop("word_glossary_suggestions", None)
+            st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
