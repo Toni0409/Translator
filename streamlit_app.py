@@ -19,6 +19,7 @@ import styles
 import auth
 import pdf_tab
 import word_tab
+import review_tab
 
 
 st.set_page_config(
@@ -44,8 +45,12 @@ with col_lo:
 st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_pdf, tab_word = st.tabs(["📄 Dịch PDF", "📝 Dịch Word"])
+tab_pdf, tab_word, tab_review = st.tabs([
+    "📄 Dịch PDF", "📝 Dịch Word", "🔍 So sánh / Đánh giá"
+])
 with tab_pdf:
     pdf_tab.render()
 with tab_word:
     word_tab.render()
+with tab_review:
+    review_tab.render()
