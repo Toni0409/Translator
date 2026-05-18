@@ -12,6 +12,7 @@ from ui_common import (
     make_log_adder, calc_cost,
 )
 from word_backend import extract_docx_blocks, build_doc_context
+from pdf_backend import extract_pdf_blocks
 from review_backend import (
     align_blocks, chunk_pairs, review_parallel, summarize_reviews,
     build_review_report_docx, REVIEW_CHUNK_SIZE,
@@ -27,19 +28,34 @@ def _clear_state():
         st.session_state.pop(k, None)
 
 
+def _extract_blocks_any(file_obj) -> tuple[list[dict], str]:
+    """
+    Detect file format from name and extract blocks.
+    Returns (blocks, format_label) where format_label is "DOCX" or "PDF".
+    """
+    name = (file_obj.name or "").lower()
+    data = file_obj.read()
+    if name.endswith(".pdf"):
+        return extract_pdf_blocks(data), "PDF"
+    return extract_docx_blocks(data), "DOCX"
+
+
 def render():
-    st.markdown("## 🔍 So sánh / Đánh giá bản dịch Word")
+    st.markdown("## 🔍 So sánh / Đánh giá bản dịch")
     st.caption(
-        "Tải lên bản gốc và bản dịch DOCX. LLM sẽ đối chiếu từng đoạn, "
-        "đánh giá độ chính xác + văn phong, liệt kê đoạn có vấn đề kèm đề xuất + lý do."
+        "Tải lên bản gốc và bản dịch (DOCX hoặc PDF — có thể trộn). "
+        "LLM đối chiếu từng đoạn, đánh giá độ chính xác + văn phong, "
+        "liệt kê đoạn có vấn đề kèm đề xuất + lý do."
     )
 
     col1, col2 = st.columns(2)
     with col1:
-        orig_file = st.file_uploader("📄 Bản GỐC (.docx)", type=["docx"],
+        orig_file = st.file_uploader("📄 Bản GỐC (.docx / .pdf)",
+                                     type=["docx", "pdf"],
                                      key="rv_orig_upload")
     with col2:
-        trans_file = st.file_uploader("📝 Bản DỊCH (.docx)", type=["docx"],
+        trans_file = st.file_uploader("📝 Bản DỊCH (.docx / .pdf)",
+                                      type=["docx", "pdf"],
                                       key="rv_trans_upload")
 
     c1, c2, c3 = st.columns([2, 1, 1])
@@ -79,13 +95,12 @@ def _run_review(orig_file, trans_file, target_lang, strictness):
         add_log(f"📄 Gốc: {orig_file.name}")
         add_log(f"📝 Dịch: {trans_file.name}")
 
-        orig_bytes  = orig_file.read()
-        trans_bytes = trans_file.read()
-
-        orig_blocks  = extract_docx_blocks(orig_bytes)
-        trans_blocks = extract_docx_blocks(trans_bytes)
-        add_log(f"   • Gốc: {len(orig_blocks):,} block")
-        add_log(f"   • Dịch: {len(trans_blocks):,} block")
+        orig_blocks,  orig_fmt  = _extract_blocks_any(orig_file)
+        trans_blocks, trans_fmt = _extract_blocks_any(trans_file)
+        add_log(f"   • Gốc ({orig_fmt}): {len(orig_blocks):,} block")
+        add_log(f"   • Dịch ({trans_fmt}): {len(trans_blocks):,} block")
+        if orig_fmt != trans_fmt:
+            add_log(f"ℹ️ So sánh chéo định dạng: {orig_fmt} ↔ {trans_fmt}")
 
         pairs, warnings = align_blocks(orig_blocks, trans_blocks)
         for w in warnings[:5]:
@@ -208,7 +223,7 @@ def _render_results():
         st.download_button(
             "⬇️ Tải báo cáo DOCX",
             data=report_bytes,
-            file_name=f"review_{st.session_state['rv_orig_name'].replace('.docx', '')}.docx",
+            file_name=f"review_{st.session_state['rv_orig_name'].rsplit('.', 1)[0]}.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
         )
@@ -229,7 +244,7 @@ def _render_results():
         st.download_button(
             "⬇️ Tải CSV",
             data=df_csv,
-            file_name=f"review_{st.session_state['rv_orig_name'].replace('.docx', '')}.csv",
+            file_name=f"review_{st.session_state['rv_orig_name'].rsplit('.', 1)[0]}.csv",
             mime="text/csv",
             use_container_width=True,
         )

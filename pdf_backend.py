@@ -209,6 +209,73 @@ def parse_page_range(s: str, total: int) -> list[int]:
     return sorted(p for p in set(pages) if 0 <= p < total)
 
 
+def extract_pdf_blocks(pdf_bytes: bytes) -> list[dict]:
+    """
+    Extract PDF as block list compatible with DOCX schema for review/comparison.
+    Each line group → 1 block; role inferred from font size and table membership.
+    Output schema matches `extract_docx_blocks`:
+      {id, text, text_tagged, has_format, role, para_idx, table_cell}
+    """
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        groups_per_page, _, _ = extract_line_groups(tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+    # Body font size = median of all sizes (cheap heuristic)
+    all_sizes: list[float] = []
+    for groups in groups_per_page.values():
+        all_sizes.extend(g["size"] for g in groups)
+    if all_sizes:
+        all_sizes.sort()
+        body_size = all_sizes[len(all_sizes) // 2]
+    else:
+        body_size = 10.0
+
+    blocks: list[dict] = []
+    para_idx = 0
+    for page_idx in sorted(groups_per_page.keys()):
+        for g in groups_per_page[page_idx]:
+            text = g["text"].strip()
+            if not text:
+                continue
+
+            cell = g.get("cell")
+            if cell:
+                role = "table_cell"
+                table_cell = (cell["table"], cell["row"], cell["col"])
+            elif g["size"] >= body_size * 1.4 and g["bold"]:
+                role = "title"
+                table_cell = None
+            elif g["size"] >= body_size * 1.15 or (g["bold"] and g["size"] >= body_size):
+                role = "section_heading"
+                table_cell = None
+            else:
+                role = "paragraph"
+                table_cell = None
+
+            blocks.append({
+                "id":          f"pdf_p{page_idx}_{para_idx}",
+                "text":        text,
+                "text_tagged": text,
+                "has_format":  False,
+                "role":        role,
+                "para_idx":    para_idx,
+                "table_cell":  table_cell,
+                "page":        page_idx,
+            })
+            para_idx += 1
+    return blocks
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # RENDER
 # ══════════════════════════════════════════════════════════════════════════════
