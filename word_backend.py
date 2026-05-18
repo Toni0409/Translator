@@ -118,7 +118,8 @@ def _iter_blocks_with_meta(doc):
 
     # Body paragraphs
     for para in doc.paragraphs:
-        yield para, {"role_hint": "body", "in_table": False, "table_cell": None}
+        hint = "toc" if _is_toc_paragraph(para) else "body"
+        yield para, {"role_hint": hint, "in_table": False, "table_cell": None}
     # Body tables
     for tbl in doc.tables:
         t_counter[0] += 1
@@ -457,6 +458,50 @@ def _detect_role(para, in_table: bool, in_header: bool, in_footer: bool) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TOC DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+def _is_toc_paragraph(paragraph) -> bool:
+    """Detect if paragraph is part of a Table of Contents."""
+    try:
+        style = (paragraph.style.name or "").lower()
+        if style.startswith("toc"):
+            return True
+    except Exception:
+        pass
+    # Check for hyperlink to _Toc bookmark
+    try:
+        for h in paragraph._p.iter(qn("w:hyperlink")):
+            anchor = h.get(qn("w:anchor"), "")
+            if anchor.startswith("_Toc"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _link_toc_to_headings(blocks: list[dict]) -> int:
+    """Set _toc_mirror on TOC blocks pointing to matching heading block id."""
+    headings = {}
+    for b in blocks:
+        if b["role"] == "section_heading":
+            key = b["text"].strip().lower()
+            if key and key not in headings:
+                headings[key] = b["id"]
+    linked = 0
+    for b in blocks:
+        if b["role"] != "toc":
+            continue
+        raw = b["text"]
+        # Strip trailing tab+digits or dots+digits (page number suffix)
+        m = _re.match(r"^(.*?)(?:[\t\s\.]+\d+)?$", raw)
+        head_text = (m.group(1) if m else raw).strip().lower()
+        if head_text in headings:
+            b["_toc_mirror"] = headings[head_text]
+            linked += 1
+    return linked
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # EXTRACT
 # ══════════════════════════════════════════════════════════════════════════════
 def _mark_repeating_as_hf(blocks: list[dict],
@@ -547,6 +592,8 @@ def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
             role = meta["role_hint"]
         if meta["role_hint"] == "comment" and role not in ("header", "footer"):
             role = "comment"
+        if meta["role_hint"] == "toc" and role not in ("header", "footer"):
+            role = "toc"
         tagged = runs_to_tagged_text(para)
         blocks.append({
             "id":          f"p{idx}",
@@ -558,6 +605,7 @@ def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
             "table_cell":  meta["table_cell"],   # (T,R,C) tuple hoặc None
         })
     _mark_repeating_as_hf(blocks)
+    _link_toc_to_headings(blocks)
 
     # Image alt-texts (drawingML + VML). Appended AFTER body blocks so
     # `apply_translations` can re-iterate `_iter_image_alt_texts` and match by order.
@@ -957,6 +1005,14 @@ def translate_parallel(holder: dict, client,
 # ══════════════════════════════════════════════════════════════════════════════
 # RENDER
 # ══════════════════════════════════════════════════════════════════════════════
+def _resolve_translation(block: dict, translations: dict) -> str | None:
+    """Resolve translation for a block, honoring _toc_mirror inheritance."""
+    mirror_id = block.get("_toc_mirror")
+    if mirror_id and translations.get(mirror_id):
+        return translations[mirror_id]
+    return translations.get(block["id"])
+
+
 def apply_translations(original_bytes: bytes, blocks: list[dict],
                        translations: dict) -> bytes:
     """
@@ -970,7 +1026,7 @@ def apply_translations(original_bytes: bytes, blocks: list[dict],
     for block in blocks:
         if block.get("role") == "image_alt":
             continue
-        tr   = translations.get(block["id"])
+        tr   = _resolve_translation(block, translations)
         para = idx_to_para.get(block.get("para_idx"))
         if not tr or para is None:
             continue
@@ -986,7 +1042,7 @@ def apply_translations(original_bytes: bytes, blocks: list[dict],
     alt_iter   = list(_iter_image_alt_texts(doc))
     alt_blocks = [b for b in blocks if b.get("role") == "image_alt"]
     for (el, attr, _), block in zip(alt_iter, alt_blocks):
-        tr = translations.get(block["id"])
+        tr = _resolve_translation(block, translations)
         if tr:
             try:
                 el.set(attr, tr)
@@ -996,6 +1052,56 @@ def apply_translations(original_bytes: bytes, blocks: list[dict],
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
+
+
+def validate_docx_output(docx_bytes: bytes) -> dict:
+    """
+    Validate translated DOCX output. Returns:
+    {
+      "valid": bool,
+      "block_count": int,
+      "image_count": int,
+      "warnings": [str, ...],
+      "errors": [str, ...],
+    }
+    """
+    import zipfile
+    result = {"valid": True, "block_count": 0, "image_count": 0,
+              "warnings": [], "errors": []}
+    try:
+        # 1. ZIP integrity
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+            bad = zf.testzip()
+            if bad:
+                result["errors"].append(f"ZIP corrupt: {bad}")
+                result["valid"] = False
+                return result
+            names = zf.namelist()
+            if "word/document.xml" not in names:
+                result["errors"].append("Missing word/document.xml")
+                result["valid"] = False
+                return result
+            result["image_count"] = sum(1 for n in names if n.startswith("word/media/"))
+        # 2. python-docx opens cleanly
+        doc = Document(io.BytesIO(docx_bytes))
+        result["block_count"] = sum(1 for _ in doc.element.iter(qn("w:p")))
+        # 3. XML well-formed for all .xml parts
+        from lxml import etree
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+            for name in zf.namelist():
+                if name.endswith(".xml") or name.endswith(".rels"):
+                    try:
+                        etree.fromstring(zf.read(name))
+                    except etree.XMLSyntaxError as e:
+                        result["errors"].append(f"{name}: {str(e)[:120]}")
+                        result["valid"] = False
+        # 4. Sanity checks
+        if result["block_count"] == 0:
+            result["warnings"].append("Document has 0 paragraphs (suspicious)")
+    except Exception as e:
+        result["valid"] = False
+        result["errors"].append(f"Validation crashed: {str(e)[:200]}")
+    return result
 
 
 def _is_untranslated(b: dict, translations: dict) -> bool:
