@@ -10,6 +10,7 @@ Phase 2 (Dịch):
 import io
 import time
 import threading
+import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -26,7 +27,7 @@ from word_backend import (
     extract_docx_blocks, build_doc_context, build_glossary, chunk_blocks,
     translate_parallel, apply_translations, find_missed,
     get_working_model, count_by_role,
-    tm_lookup, tm_store,
+    tm_lookup, tm_store, tm_key,
     checkpoint_save, checkpoint_load, checkpoint_clear,
     export_bilingual_docx, quality_check,
 )
@@ -809,10 +810,88 @@ def _clear_state():
     # KHÔNG xóa "word_tm" — TM persist xuyên suốt session
 
 
+def _run_batch(uploaded_files, lang_word):
+    """Batch-translate multiple DOCX files, sharing TM across all files."""
+    st.markdown("### 📚 Dịch theo lô")
+
+    target_lang = LANG_EN[lang_word]
+    file_status = {f.name: "⏳ Chờ" for f in uploaded_files}
+    status_ph   = st.empty()
+    results     = {}  # name → bytes
+
+    for uploaded in uploaded_files:
+        file_status[uploaded.name] = "🔄 Đang dịch..."
+        status_ph.table({
+            "File":       list(file_status.keys()),
+            "Trạng thái": list(file_status.values()),
+        })
+        try:
+            docx_bytes  = uploaded.read()
+            blocks      = extract_docx_blocks(docx_bytes)
+            doc_context = build_doc_context(blocks)
+            client      = get_client()
+            glossary    = build_glossary(client, blocks, target_lang)
+            tm          = _ensure_tm()
+            translatable = [b for b in blocks if b["role"] not in NO_TRANSLATE_ROLES]
+            cached, remaining = tm_lookup(translatable, tm, target_lang)
+            translations = dict(cached)
+
+            if remaining:
+                chunks = chunk_blocks(remaining)
+                timer_ph  = st.empty()
+                prog_ph   = st.empty()
+
+                def _noop_stats(*_a, **_kw): pass
+                def _noop_log(_msg): pass
+
+                new_tr, _, _, _ = _run_translation(
+                    chunks, target_lang, doc_context,
+                    timer_ph, prog_ph, _noop_stats, _noop_log,
+                    len(remaining), prefix_label=uploaded.name[:20],
+                    glossary=glossary,
+                )
+                translations.update(new_tr)
+                tm_store(remaining, new_tr, tm, target_lang)
+                timer_ph.empty()
+                prog_ph.empty()
+
+            out_bytes = apply_translations(docx_bytes, blocks, translations)
+            results[uploaded.name] = out_bytes
+            file_status[uploaded.name] = "✅ Xong"
+        except Exception as e:
+            file_status[uploaded.name] = f"❌ {str(e)[:40]}"
+
+        status_ph.table({
+            "File":       list(file_status.keys()),
+            "Trạng thái": list(file_status.values()),
+        })
+
+    if results:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fname, data in results.items():
+                zf.writestr(fname.replace(".docx", f"_{lang_word[:2]}.docx"), data)
+        buf.seek(0)
+        st.download_button(
+            "⬇️ Tải ZIP tất cả file đã dịch",
+            data=buf.getvalue(),
+            file_name=f"translated_{lang_word[:8]}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            key="word_batch_zip_dl",
+        )
+
+
 def render():
     """Entry point — gọi từ `streamlit_app.py`."""
-    uploaded_docx = st.file_uploader("📝 Chọn file Word cần dịch",
-                                      type=["docx"], key="word_uploader")
+    uploaded_files = st.file_uploader(
+        "📁 Tải lên file Word (.docx)",
+        type=["docx"],
+        accept_multiple_files=True,
+        key="word_upload",
+    )
+    # Backward compat: treat single file the same as before
+    uploaded_docx = uploaded_files[0] if uploaded_files and len(uploaded_files) == 1 else None
     lang_word = st.selectbox("🌐 Ngôn ngữ đích", LANGUAGES, key="word_lang_select")
 
     # TM status sidebar info
@@ -826,6 +905,15 @@ def render():
             st.rerun()
 
     st.divider()
+
+    # ── BATCH mode: multiple files ────────────────────────────────────────
+    if uploaded_files and len(uploaded_files) > 1:
+        if st.button("📚  Dịch tất cả file (batch)", use_container_width=True,
+                     type="primary", key="word_batch_btn"):
+            _run_batch(uploaded_files, lang_word)
+        elif not st.session_state.get("word_batch_zip_dl"):
+            st.info(f"📁 Đã chọn {len(uploaded_files)} file — bấm **Dịch tất cả file (batch)** để dịch.")
+        return  # don't show single-file UI when batch
 
     # ── PHASE 1: Phân tích ────────────────────────────────────────────────
     col_a, col_b = st.columns(2)
@@ -872,6 +960,78 @@ def render():
         st.divider()
         st.success(st.session_state["word_summary"])
 
+        blocks       = st.session_state["word_blocks"]
+        translations = st.session_state["word_translations"]
+
+        # ── Quality check report ──────────────────────────────────────────
+        issues = quality_check(blocks, translations)
+        if issues:
+            with st.expander(f"⚠️ Quality check: {len(issues)} đoạn nghi vấn", expanded=False):
+                for item in issues[:30]:
+                    st.markdown(f"**🔴 {', '.join(item['issues'])}**")
+                    col1, col2 = st.columns(2)
+                    col1.text_area("Gốc", item["text"], height=60, disabled=True,
+                                   key=f"qc_orig_{item['id']}")
+                    col2.text_area("Dịch", item["translation"], height=60, disabled=True,
+                                   key=f"qc_tr_{item['id']}")
+
+        # ── Phase 2 review editor (auto-learn to TM) ─────────────────────
+        with st.expander("✏️ Review & lưu vào TM", expanded=False):
+            # Build or restore review DataFrame
+            review_version = st.session_state.get("word_translations_version", 0)
+            stored_rv = st.session_state.get("word_review_df_version")
+            if stored_rv != review_version or "word_review_df" not in st.session_state:
+                translatable_blocks = [b for b in blocks if b["role"] not in NO_TRANSLATE_ROLES]
+                st.session_state["word_review_df"] = pd.DataFrame([
+                    {
+                        "id":          b["id"],
+                        "role":        b["role"],
+                        "original":    b["text"],
+                        "translation": translations.get(b["id"], ""),
+                    }
+                    for b in translatable_blocks
+                ])
+                st.session_state["word_review_df_version"] = review_version
+
+            review_df = st.session_state["word_review_df"]
+            edited_review = st.data_editor(
+                review_df,
+                column_config={
+                    "id":          st.column_config.TextColumn("ID", disabled=True, width="small"),
+                    "role":        st.column_config.TextColumn("Vai trò", disabled=True, width="small"),
+                    "original":    st.column_config.TextColumn("Gốc", disabled=True, width="large"),
+                    "translation": st.column_config.TextColumn("Bản dịch", width="large"),
+                },
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                height=400,
+                key="word_review_editor",
+            )
+
+            if st.button("✅ Xác nhận & lưu vào TM", key="word_review_confirm_btn",
+                         use_container_width=True):
+                tm = _ensure_tm()
+                target_lang = LANG_EN[st.session_state["word_lang"]]
+                changed = 0
+                for _, row in edited_review.iterrows():
+                    orig_tr = translations.get(row["id"], "")
+                    new_tr  = row["translation"]
+                    if new_tr and new_tr != orig_tr:
+                        translations[row["id"]] = new_tr
+                        # Also save to TM
+                        tm[tm_key(row["original"], target_lang)] = new_tr
+                        changed += 1
+                if changed:
+                    st.session_state["word_translations"] = translations
+                    st.session_state["word_translations_version"] = (
+                        st.session_state.get("word_translations_version", 0) + 1
+                    )
+                    st.session_state.pop("word_review_df", None)
+                    st.success(f"✅ Đã cập nhật {changed} bản dịch và lưu vào TM")
+                else:
+                    st.info("Không có thay đổi nào.")
+
         translated_bytes = _get_cached_translated_bytes()
         out_name = st.session_state["word_filename"].replace(
             ".docx", f"_translated_{st.session_state['word_lang'][:2]}.docx"
@@ -902,8 +1062,6 @@ def render():
             key="word_dl_bilingual",
         )
 
-        blocks       = st.session_state["word_blocks"]
-        translations = st.session_state["word_translations"]
         missed_body  = find_missed(blocks, translations, hf_only=False)
         missed_hf    = find_missed(blocks, translations, hf_only=True)
         total_hf     = sum(1 for b in blocks if b["role"] in NO_TRANSLATE_ROLES)
@@ -955,5 +1113,5 @@ def render():
             )
             st.rerun()
 
-    elif not uploaded_docx:
+    elif not uploaded_files:
         st.info("👆 Vui lòng upload file Word (.docx) để bắt đầu")
