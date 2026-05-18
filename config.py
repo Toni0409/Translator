@@ -38,7 +38,8 @@ WORD_MODELS = [
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
 ]
-MAX_WORD_TOKENS    = 65_536
+MAX_WORD_TOKENS    = 8_192     # output limit thực tế của Gemini Flash family
+                               # (65k cũ gây JSON cut khi chunk lớn)
 MAX_WORD_WORKERS   = 4         # số chunk dịch song song
 CHUNK_RETRIES      = 3         # số lần retry mỗi chunk khi lỗi
 TARGET_CHUNK_CHARS = 8_000     # mục tiêu ký tự / chunk (adaptive)

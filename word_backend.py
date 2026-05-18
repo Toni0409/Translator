@@ -11,7 +11,9 @@ parallel chunks), ghi lại DOCX giữ nguyên format runs.
 """
 import io
 import json
+import re
 import time
+import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -25,8 +27,10 @@ from config import (
 from gemini import generate, usage_tokens, parse_json_loose
 
 
-# Module-level cache cho model đang work (persist giữa các Streamlit rerun + thread)
+# Module-level cache cho model đang work (persist giữa các Streamlit rerun + thread).
+# Cần lock vì 4 worker thread cùng đọc/ghi.
 _working_model: list = [None]
+_model_lock = threading.Lock()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -65,10 +69,96 @@ def iter_all_paragraphs(doc):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FORMAT-SAFE TEXT REPLACEMENT
+# INLINE FORMAT — encode/decode bold/italic/underline qua tag để AI giữ được
 # ══════════════════════════════════════════════════════════════════════════════
+_TAG_RE      = re.compile(r"</?[biu]>")
+_TAG_STRIP   = re.compile(r"</?[biu]>")
+_ESC_MAP     = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
+_UNESC_MAP   = (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
+
+
+def _esc(s: str) -> str:
+    for a, b in _ESC_MAP:
+        s = s.replace(a, b)
+    return s
+
+
+def _unesc(s: str) -> str:
+    for a, b in _UNESC_MAP:
+        s = s.replace(a, b)
+    return s
+
+
+def runs_to_tagged_text(paragraph) -> str:
+    """
+    Convert paragraph runs → tagged text. VD: '<b>Important</b>: read <i>carefully</i>'.
+    Escape & < > trong text gốc để không xung đột với tag.
+    Bỏ qua hyperlink/field (sẽ fallback ở apply).
+    """
+    parts = []
+    for run in paragraph.runs:
+        text = run.text
+        if not text:
+            continue
+        text = _esc(text)
+        if run.bold:      text = f"<b>{text}</b>"
+        if run.italic:    text = f"<i>{text}</i>"
+        if run.underline: text = f"<u>{text}</u>"
+        parts.append(text)
+    return "".join(parts).strip()
+
+
+def has_inline_format(tagged: str) -> bool:
+    return _TAG_RE.search(tagged) is not None
+
+
+def strip_tags(tagged: str) -> str:
+    """Bỏ tag, unescape — dùng khi fallback về plain text."""
+    return _unesc(_TAG_STRIP.sub("", tagged))
+
+
+def _parse_tagged(tagged: str) -> list[tuple[str, bool, bool, bool]]:
+    """
+    Parse tagged text → list of (text, bold, italic, underline).
+    Tolerant với tag mismatch (ignore).
+    """
+    segments: list = []
+    stack:    list = []
+    last           = 0
+
+    def flush(text):
+        if text:
+            segments.append((_unesc(text), "b" in stack, "i" in stack, "u" in stack))
+
+    for m in _TAG_RE.finditer(tagged):
+        if m.start() > last:
+            flush(tagged[last:m.start()])
+        tag = m.group()
+        if tag.startswith("</"):
+            if stack and stack[-1] == tag[2]:
+                stack.pop()
+        else:
+            stack.append(tag[1])
+        last = m.end()
+    if last < len(tagged):
+        flush(tagged[last:])
+    return segments
+
+
+def _paragraph_has_non_run_children(paragraph) -> bool:
+    """True nếu paragraph có hyperlink/field/... — không rebuild runs an toàn được."""
+    for child in paragraph._p.iterchildren():
+        tag = child.tag.split("}", 1)[-1]
+        if tag not in ("pPr", "r"):
+            return True
+    return False
+
+
 def replace_paragraph_text_keep_format(paragraph, new_text: str):
-    """Thay text trong paragraph mà GIỮ ĐƯỢC format của run đầu tiên."""
+    """
+    Path 1 (legacy, dùng khi không có inline format hoặc paragraph phức tạp):
+    Thay text trong paragraph mà giữ format của run đầu tiên.
+    """
     runs = paragraph.runs
     if not runs:
         paragraph.add_run(new_text)
@@ -85,6 +175,55 @@ def replace_paragraph_text_keep_format(paragraph, new_text: str):
             continue
         if after and run.text:
             run.text = ""
+
+
+def replace_paragraph_with_tagged(paragraph, tagged_text: str):
+    """
+    Path 2 (new): parse <b><i><u> tags trong tagged_text và rebuild runs để
+    giữ inline format. Inherit font/size/color từ run đầu tiên có text.
+    Fallback về `replace_paragraph_text_keep_format` nếu paragraph có
+    hyperlink/field, hoặc không parse được tag.
+    """
+    if _paragraph_has_non_run_children(paragraph):
+        replace_paragraph_text_keep_format(paragraph, strip_tags(tagged_text))
+        return
+
+    segments = _parse_tagged(tagged_text)
+    if not segments:
+        replace_paragraph_text_keep_format(paragraph, strip_tags(tagged_text))
+        return
+
+    # Lấy template format từ run đầu có text
+    runs     = paragraph.runs
+    template = next((r for r in runs if r.text), runs[0] if runs else None)
+    tpl_name = tpl_size = tpl_color = None
+    if template is not None:
+        try: tpl_name  = template.font.name
+        except Exception: pass
+        try: tpl_size  = template.font.size
+        except Exception: pass
+        try: tpl_color = template.font.color.rgb
+        except Exception: pass
+
+    # Xóa hết runs cũ
+    p_elem = paragraph._p
+    for run in list(runs):
+        try: p_elem.remove(run._r)
+        except Exception: pass
+
+    # Thêm runs mới theo segments
+    for text, bold, italic, underline in segments:
+        if not text:
+            continue
+        run = paragraph.add_run(text)
+        if bold:      run.bold      = True
+        if italic:    run.italic    = True
+        if underline: run.underline = True
+        if tpl_name:  run.font.name = tpl_name
+        if tpl_size:  run.font.size = tpl_size
+        if tpl_color:
+            try: run.font.color.rgb = tpl_color
+            except Exception: pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -187,14 +326,22 @@ def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
         text = para.text.strip()
         if not text:
             continue
-        pid  = id(para._element)
-        role = _detect_role(
+        pid    = id(para._element)
+        role   = _detect_role(
             para,
             pid in table_para_set,
             pid in header_para_set,
             pid in footer_para_set,
         )
-        blocks.append({"id": f"p{idx}", "text": text, "role": role, "para_idx": idx})
+        tagged = runs_to_tagged_text(para)
+        blocks.append({
+            "id":          f"p{idx}",
+            "text":        text,
+            "text_tagged": tagged,
+            "has_format":  has_inline_format(tagged),
+            "role":        role,
+            "para_idx":    idx,
+        })
 
     _mark_repeating_as_hf(blocks)
     return blocks
@@ -211,6 +358,60 @@ def count_by_role(blocks: list[dict]) -> dict:
         "body_repeated": counter.get("body_repeated", 0),
         "hf_total":    sum(counter.get(r, 0) for r in NO_TRANSLATE_ROLES),
         "by_role":     dict(counter),
+    }
+
+
+_NOUN_PHRASE_RE = re.compile(r"\b[A-Z][a-zA-Z\-]+(?:\s+[A-Z]?[a-zA-Z\-]+){0,3}\b")
+_TECH_TERM_RE   = re.compile(r"\b[A-Z][a-zA-Z]{4,}\b")
+
+
+def build_glossary(client, blocks: list[dict], target_lang: str,
+                   top_n: int = 30, min_repeat: int = 3) -> dict:
+    """
+    One-shot AI call để dịch top-N thuật ngữ lặp lại trong doc.
+    Inject vào mọi chunk prompt để dịch consistent cross-chunk.
+
+    Heuristic candidates:
+    - Noun phrases (capitalized, 1-4 words) — "Hoistway Door", "Control Panel"
+    - Single technical terms (CamelCase, ≥5 chars) — "Inverter", "Calibration"
+
+    Trả về {} nếu API fail hoặc không tìm thấy term.
+    """
+    text_all = " ".join(b["text"] for b in blocks
+                        if b["role"] not in NO_TRANSLATE_ROLES)
+    if not text_all:
+        return {}
+
+    candidates = _NOUN_PHRASE_RE.findall(text_all) + _TECH_TERM_RE.findall(text_all)
+    counter    = Counter(candidates)
+    top_terms  = [w for w, c in counter.most_common(top_n * 2) if c >= min_repeat][:top_n]
+    if not top_terms:
+        return {}
+
+    prompt = f"""Translate these technical terms to {target_lang}.
+Return ONLY a JSON object: {{"term": "translation", ...}}
+
+Rules:
+- Use formal, consistent terminology suitable for technical documents.
+- Keep proper nouns / company names / product codes / brand names UNCHANGED.
+- Keep numbers, units, model codes UNCHANGED.
+- Each term gets exactly ONE canonical translation.
+
+Terms ({len(top_terms)}):
+{json.dumps(top_terms, ensure_ascii=False)}"""
+
+    try:
+        raw, _, _ = call_gemini(client, prompt)
+    except Exception:
+        return {}
+    parsed = parse_json_loose(raw)
+    if not isinstance(parsed, dict):
+        return {}
+    # Filter — chỉ giữ entry hợp lệ
+    return {
+        str(k).strip(): str(v).strip()
+        for k, v in parsed.items()
+        if k and v and isinstance(v, str) and v.strip() != str(k).strip()
     }
 
 
@@ -271,10 +472,11 @@ def chunk_blocks(blocks: list[dict],
 def call_gemini(client, prompt: str) -> tuple[str, int, int]:
     """
     Gọi Gemini với fallback chain. Trả về (text, in_tokens, out_tokens).
-    Raise RuntimeError nếu tất cả model đều fail.
+    Raise RuntimeError nếu tất cả model đều fail. Thread-safe.
     """
-    models = ([_working_model[0]] if _working_model[0] else []) + \
-             [m for m in WORD_MODELS if m != _working_model[0]]
+    with _model_lock:
+        cur = _working_model[0]
+    models = ([cur] if cur else []) + [m for m in WORD_MODELS if m != cur]
     last_err = "no models"
     for model in models:
         try:
@@ -285,7 +487,8 @@ def call_gemini(client, prompt: str) -> tuple[str, int, int]:
                 last_err = "empty response"
                 continue
             in_t, out_t = usage_tokens(resp)
-            _working_model[0] = model
+            with _model_lock:
+                _working_model[0] = model
             return text, in_t, out_t
         except Exception as e:
             last_err = str(e)
@@ -293,22 +496,47 @@ def call_gemini(client, prompt: str) -> tuple[str, int, int]:
 
 
 def get_working_model() -> str | None:
-    return _working_model[0]
+    with _model_lock:
+        return _working_model[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TRANSLATE chunk (raw + retry)
 # ══════════════════════════════════════════════════════════════════════════════
-def _build_chunk_prompt(chunk: list[dict], target_lang: str, doc_context: str) -> str:
+def _build_chunk_prompt(chunk: list[dict], target_lang: str, doc_context: str,
+                        glossary: dict | None = None) -> str:
+    """Build prompt. Dùng `text_tagged` nếu có (preserve inline format)."""
     payload = json.dumps(
-        [{"id": b["id"], "text": b["text"], "role": b.get("role", "paragraph")}
-         for b in chunk],
+        [{
+            "id":   b["id"],
+            "text": b.get("text_tagged") or b["text"],
+            "role": b.get("role", "paragraph"),
+        } for b in chunk],
         ensure_ascii=False,
     )
+
+    has_format = any(b.get("has_format") for b in chunk)
+    format_rule = (
+        "- Some texts contain HTML-like tags <b>, <i>, <u> marking bold/italic/underline. "
+        "PRESERVE these tags EXACTLY in the translation, wrapping the equivalent translated words. "
+        "Do NOT add new tags where source has none. Do NOT use markdown (** or _).\n"
+        if has_format else ""
+    )
+
+    glossary_section = ""
+    if glossary:
+        # Limit glossary size để không bloat prompt
+        items = list(glossary.items())[:50]
+        glossary_str = "\n".join(f"  {en} → {vi}" for en, vi in items)
+        glossary_section = (
+            f"\nGlossary (USE THESE EXACT translations for consistency across the document):\n"
+            f"{glossary_str}\n"
+        )
+
     return f"""Translate these Word document blocks into {target_lang}.
 
 Document context:
-{doc_context}
+{doc_context}{glossary_section}
 
 Rules:
 - Return ONLY valid JSON array. No markdown, no explanation.
@@ -318,7 +546,7 @@ Rules:
 - Do NOT translate company names (e.g. INVENTIO AG, Schindler, Otis).
 - Preserve ALL punctuation, whitespace, tabs (\\t), line breaks (\\n).
 - Match source sentence count — do NOT merge or split sentences.
-- For toc: translate heading text only; preserve numbering, dot leaders (...), page numbers.
+{format_rule}- For toc: translate heading text only; preserve numbering, dot leaders (...), page numbers.
 - For bullet: concise imperative, keep bullet symbol.
 - For heading/section_heading: concise technical, match source brevity.
 - For table_cell: concise, consistent across row.
@@ -333,12 +561,13 @@ Blocks:
 
 
 def translate_chunk(client, chunk: list[dict], target_lang: str,
-                    doc_context: str) -> tuple[dict, int, int]:
+                    doc_context: str,
+                    glossary: dict | None = None) -> tuple[dict, int, int]:
     """
     Dịch 1 chunk → (translations_dict, in_tokens, out_tokens).
     RAISE exception nếu API fail. Block bị model bỏ sót → fallback giữ text gốc.
     """
-    prompt = _build_chunk_prompt(chunk, target_lang, doc_context)
+    prompt = _build_chunk_prompt(chunk, target_lang, doc_context, glossary)
     raw, in_t, out_t = call_gemini(client, prompt)
     parsed = parse_json_loose(raw) or []
     if not isinstance(parsed, list):
@@ -348,13 +577,15 @@ def translate_chunk(client, chunk: list[dict], target_lang: str,
         if isinstance(item, dict) and item.get("id") and item.get("text") is not None:
             result[item["id"]] = str(item["text"])
     for b in chunk:
-        result.setdefault(b["id"], b["text"])
+        # Fallback: nếu có tagged thì dùng tagged để preserve format khi không dịch được
+        result.setdefault(b["id"], b.get("text_tagged") or b["text"])
     return result, in_t, out_t
 
 
 def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
                                doc_context: str,
-                               retries: int = CHUNK_RETRIES
+                               retries: int = CHUNK_RETRIES,
+                               glossary: dict | None = None
                                ) -> tuple[dict, int, int, str | None]:
     """
     Wrapper với exponential backoff. Trả về (translations, in_t, out_t, error).
@@ -363,13 +594,14 @@ def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
     last_err = None
     for attempt in range(retries):
         try:
-            t, in_t, out_t = translate_chunk(client, chunk, target_lang, doc_context)
+            t, in_t, out_t = translate_chunk(client, chunk, target_lang, doc_context, glossary)
             return t, in_t, out_t, None
         except Exception as e:
             last_err = str(e)
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)   # 1s, 2s, 4s
-    return {b["id"]: b["text"] for b in chunk}, 0, 0, last_err
+    fallback = {b["id"]: b.get("text_tagged") or b["text"] for b in chunk}
+    return fallback, 0, 0, last_err
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -378,7 +610,8 @@ def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
 def translate_parallel(holder: dict, client,
                        chunks: list[list[dict]],
                        target_lang: str, doc_context: str,
-                       max_workers: int):
+                       max_workers: int,
+                       glossary: dict | None = None):
     """
     Background worker: dịch nhiều chunk song song với ThreadPoolExecutor.
 
@@ -394,7 +627,7 @@ def translate_parallel(holder: dict, client,
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
                 ex.submit(translate_chunk_with_retry,
-                          client, c, target_lang, doc_context): (i, c)
+                          client, c, target_lang, doc_context, CHUNK_RETRIES, glossary): (i, c)
                 for i, c in enumerate(chunks)
             }
             for future in as_completed(futures):
@@ -441,7 +674,10 @@ def apply_translations(original_bytes: bytes, blocks: list[dict],
         if not tr or para is None:
             continue
         try:
-            replace_paragraph_text_keep_format(para, tr)
+            if block.get("has_format"):
+                replace_paragraph_with_tagged(para, tr)
+            else:
+                replace_paragraph_text_keep_format(para, tr)
         except Exception:
             pass
 
