@@ -225,6 +225,7 @@ def _render_results():
     # Quality score + breakdown
     metrics = compute_quality_score(reviews, pairs)
     score   = metrics["overall"]
+    total   = metrics["total"]
     score_color = "#16a34a" if score >= 85 else ("#d97706" if score >= 60 else "#dc2626")
 
     sc_col, br_col = st.columns([1, 2])
