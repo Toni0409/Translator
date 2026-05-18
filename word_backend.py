@@ -9,6 +9,7 @@ parallel chunks), ghi lại DOCX giữ nguyên format runs.
               `translate_parallel` (background worker entry)
 3. Render   : `apply_translations`, `replace_paragraph_text_keep_format`
 """
+import hashlib
 import io
 import json
 import re
@@ -18,6 +19,8 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from docx import Document
+from docx.text.paragraph import Paragraph
+from docx.oxml.ns import qn
 
 from config import (
     WORD_MODELS, MAX_WORD_TOKENS, NO_TRANSLATE_ROLES,
@@ -45,27 +48,77 @@ def _iter_paragraphs_in_table(table):
                 yield from _iter_paragraphs_in_table(nested)
 
 
-def iter_all_paragraphs(doc):
-    """Lặp qua toàn bộ paragraph: body → tables → headers → footers."""
+def _iter_blocks_with_meta(doc):
+    """
+    Single-walk generator → yield (paragraph, meta_dict) theo thứ tự ổn định.
+
+    Meta = {
+      "role_hint":  "body" | "header" | "footer" | "textbox",
+      "in_table":   bool,
+      "table_cell": (T#, R#, C#) tuple 1-based, hoặc None,
+    }
+
+    Lý do single-walk: lxml element proxy có Python `id()` KHÔNG ổn định
+    (cùng XML element được wrap nhiều proxy khác nhau ở các thời điểm khác nhau,
+    và id có thể collide). → KHÔNG dùng `id(elem)` làm dict key cross-walk.
+    → Dùng position index (idx) khi cần map extract ↔ apply.
+    """
+    t_counter = [0]
+
+    def _walk_table(table, t_idx, role_hint):
+        for r_idx, row in enumerate(table.rows, 1):
+            for c_idx, cell in enumerate(row.cells, 1):
+                for para in cell.paragraphs:
+                    yield para, {
+                        "role_hint": role_hint,
+                        "in_table":  True,
+                        "table_cell": (t_idx, r_idx, c_idx),
+                    }
+                for nested in cell.tables:
+                    yield from _walk_table(nested, t_idx, role_hint)
+
+    # Body paragraphs
     for para in doc.paragraphs:
-        yield para
-    for table in doc.tables:
-        yield from _iter_paragraphs_in_table(table)
+        yield para, {"role_hint": "body", "in_table": False, "table_cell": None}
+    # Body tables
+    for tbl in doc.tables:
+        t_counter[0] += 1
+        yield from _walk_table(tbl, t_counter[0], "body")
+    # Headers + footers
     for section in doc.sections:
         try:
             for para in section.header.paragraphs:
-                yield para
+                yield para, {"role_hint": "header", "in_table": False, "table_cell": None}
             for tbl in section.header.tables:
-                yield from _iter_paragraphs_in_table(tbl)
+                t_counter[0] += 1
+                yield from _walk_table(tbl, t_counter[0], "header")
         except Exception:
             pass
         try:
             for para in section.footer.paragraphs:
-                yield para
+                yield para, {"role_hint": "footer", "in_table": False, "table_cell": None}
             for tbl in section.footer.tables:
-                yield from _iter_paragraphs_in_table(tbl)
+                t_counter[0] += 1
+                yield from _walk_table(tbl, t_counter[0], "footer")
         except Exception:
             pass
+    # Text-boxes / shapes trong body document part
+    # (text-boxes trong header/footer parts chưa cover ở iteration này)
+    # parent=doc để `para.style` resolve được qua doc.part.styles
+    for txbx in doc.element.iter(qn("w:txbxContent")):
+        for p_elem in txbx.iter(qn("w:p")):
+            yield Paragraph(p_elem, parent=doc), {
+                "role_hint": "textbox", "in_table": False, "table_cell": None,
+            }
+
+
+def iter_all_paragraphs(doc):
+    """
+    Lặp qua toàn bộ paragraph: body → tables → headers → footers → text-boxes.
+    Thin wrapper around `_iter_blocks_with_meta` — guarantee cùng thứ tự với extract.
+    """
+    for para, _meta in _iter_blocks_with_meta(doc):
+        yield para
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -286,53 +339,29 @@ def _mark_repeating_as_hf(blocks: list[dict],
 
 def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
     """
-    Đọc DOCX → list block {id, text, role, para_idx}.
+    Đọc DOCX → list block {id, text, role, para_idx, table_cell, ...}.
 
+    Single-walk extraction (xem `_iter_blocks_with_meta` để biết tại sao).
     Role:
-    - header / footer     : nằm trong section.header / section.footer
-    - body_repeated       : text lặp lại ≥ 3 lần trong body (heuristic H/F)
+    - header / footer / textbox : từ meta hint
+    - body_repeated             : text lặp lại ≥ 3 lần trong body (heuristic H/F)
     - section_heading / title / bullet / table_cell / note / toc / paragraph
     """
     doc = Document(io.BytesIO(docx_bytes))
-
-    table_para_set:  set = set()
-    header_para_set: set = set()
-    footer_para_set: set = set()
-
-    for tbl in doc.tables:
-        for para in _iter_paragraphs_in_table(tbl):
-            table_para_set.add(id(para._element))
-
-    for section in doc.sections:
-        try:
-            for para in section.header.paragraphs:
-                header_para_set.add(id(para._element))
-            for tbl in section.header.tables:
-                for para in _iter_paragraphs_in_table(tbl):
-                    header_para_set.add(id(para._element))
-        except Exception:
-            pass
-        try:
-            for para in section.footer.paragraphs:
-                footer_para_set.add(id(para._element))
-            for tbl in section.footer.tables:
-                for para in _iter_paragraphs_in_table(tbl):
-                    footer_para_set.add(id(para._element))
-        except Exception:
-            pass
-
     blocks = []
-    for idx, para in enumerate(iter_all_paragraphs(doc)):
+    for idx, (para, meta) in enumerate(_iter_blocks_with_meta(doc)):
         text = para.text.strip()
         if not text:
             continue
-        pid    = id(para._element)
-        role   = _detect_role(
+        role = _detect_role(
             para,
-            pid in table_para_set,
-            pid in header_para_set,
-            pid in footer_para_set,
+            meta["in_table"],
+            meta["role_hint"] == "header",
+            meta["role_hint"] == "footer",
         )
+        # Override: textbox role chỉ khi không phải H/F
+        if meta["role_hint"] == "textbox" and role not in ("header", "footer"):
+            role = "textbox"
         tagged = runs_to_tagged_text(para)
         blocks.append({
             "id":          f"p{idx}",
@@ -341,8 +370,8 @@ def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
             "has_format":  has_inline_format(tagged),
             "role":        role,
             "para_idx":    idx,
+            "table_cell":  meta["table_cell"],   # (T,R,C) tuple hoặc None
         })
-
     _mark_repeating_as_hf(blocks)
     return blocks
 
@@ -503,24 +532,46 @@ def get_working_model() -> str | None:
 # ══════════════════════════════════════════════════════════════════════════════
 # TRANSLATE chunk (raw + retry)
 # ══════════════════════════════════════════════════════════════════════════════
+_TABLE_PREFIX_RE = re.compile(r"^\s*\(T\d+\s+R\d+\s+C\d+\)\s*")
+
+
+def _format_block_text(b: dict) -> str:
+    """Prefix (T#R#C#) cho table cell, dùng tagged text nếu có inline format."""
+    text = b.get("text_tagged") or b["text"]
+    tc   = b.get("table_cell")
+    if tc:
+        return f"(T{tc[0]} R{tc[1]} C{tc[2]}) {text}"
+    return text
+
+
 def _build_chunk_prompt(chunk: list[dict], target_lang: str, doc_context: str,
                         glossary: dict | None = None) -> str:
     """Build prompt. Dùng `text_tagged` nếu có (preserve inline format)."""
     payload = json.dumps(
         [{
             "id":   b["id"],
-            "text": b.get("text_tagged") or b["text"],
+            "text": _format_block_text(b),
             "role": b.get("role", "paragraph"),
         } for b in chunk],
         ensure_ascii=False,
     )
 
     has_format = any(b.get("has_format") for b in chunk)
+    has_tables = any(b.get("table_cell") for b in chunk)
+
     format_rule = (
         "- Some texts contain HTML-like tags <b>, <i>, <u> marking bold/italic/underline. "
         "PRESERVE these tags EXACTLY in the translation, wrapping the equivalent translated words. "
         "Do NOT add new tags where source has none. Do NOT use markdown (** or _).\n"
         if has_format else ""
+    )
+    table_rule = (
+        "- Table cells are prefixed with (T# R# C#) — table/row/column context. "
+        "DO NOT include this prefix in the translation output. "
+        "Cells in the same column (same C#) MUST use the same terminology. "
+        "Row 1 (R1) is the header — keep concise. "
+        "Preserve numbers, units, model codes in cells verbatim.\n"
+        if has_tables else ""
     )
 
     glossary_section = ""
@@ -546,7 +597,7 @@ Rules:
 - Do NOT translate company names (e.g. INVENTIO AG, Schindler, Otis).
 - Preserve ALL punctuation, whitespace, tabs (\\t), line breaks (\\n).
 - Match source sentence count — do NOT merge or split sentences.
-{format_rule}- For toc: translate heading text only; preserve numbering, dot leaders (...), page numbers.
+{format_rule}{table_rule}- For toc: translate heading text only; preserve numbering, dot leaders (...), page numbers.
 - For bullet: concise imperative, keep bullet symbol.
 - For heading/section_heading: concise technical, match source brevity.
 - For table_cell: concise, consistent across row.
@@ -575,7 +626,9 @@ def translate_chunk(client, chunk: list[dict], target_lang: str,
     result = {}
     for item in parsed:
         if isinstance(item, dict) and item.get("id") and item.get("text") is not None:
-            result[item["id"]] = str(item["text"])
+            text = str(item["text"])
+            text = _TABLE_PREFIX_RE.sub("", text)   # AI lỡ giữ prefix → strip
+            result[item["id"]] = text
     for b in chunk:
         # Fallback: nếu có tagged thì dùng tagged để preserve format khi không dịch được
         result.setdefault(b["id"], b.get("text_tagged") or b["text"])
@@ -689,6 +742,46 @@ def apply_translations(original_bytes: bytes, blocks: list[dict],
 def _is_untranslated(b: dict, translations: dict) -> bool:
     tr = translations.get(b["id"], "")
     return (not tr) or tr == b["text"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRANSLATION MEMORY — hash-based cache (session-scoped)
+# ══════════════════════════════════════════════════════════════════════════════
+def tm_key(text: str, target_lang: str) -> str:
+    """Hash key: language-specific để tránh nhầm bản dịch khi đổi target."""
+    return hashlib.md5(f"{target_lang}|{text}".encode("utf-8")).hexdigest()[:16]
+
+
+def tm_lookup(blocks: list[dict], tm: dict, target_lang: str
+              ) -> tuple[dict, list[dict]]:
+    """
+    Trả về (cached_translations, remaining_blocks).
+    `cached_translations`: {block_id → translated_text} từ TM hit.
+    `remaining_blocks`   : list block chưa có trong TM, cần dịch.
+    """
+    cached, remaining = {}, []
+    for b in blocks:
+        key = tm_key(b["text"], target_lang)
+        if key in tm:
+            cached[b["id"]] = tm[key]
+        else:
+            remaining.append(b)
+    return cached, remaining
+
+
+def tm_store(blocks: list[dict], translations: dict, tm: dict,
+             target_lang: str) -> int:
+    """Ghi translations mới vào TM. Trả về số entry thêm vào."""
+    added = 0
+    for b in blocks:
+        tr = translations.get(b["id"])
+        if not tr or tr == b["text"]:
+            continue
+        key = tm_key(b["text"], target_lang)
+        if key not in tm:
+            tm[key] = tr
+            added += 1
+    return added
 
 
 def find_missed(blocks: list[dict], translations: dict,
