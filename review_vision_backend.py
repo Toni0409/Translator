@@ -119,11 +119,19 @@ def parse_page_spec(spec: str, max_pages: int) -> list[int]:
 # ══════════════════════════════════════════════════════════════════════════════
 # COMPARISON — send (orig, trans) page pair to Gemini Vision
 # ══════════════════════════════════════════════════════════════════════════════
-def _build_vision_compare_prompt(target_lang: str, page_num: int) -> str:
+def _build_vision_compare_prompt(target_lang: str, page_num: int,
+                                 focus_areas: str = "") -> str:
+    focus_block = ""
+    if (focus_areas or "").strip():
+        focus_block = (
+            f"\nUSER FOCUS — pay extra attention to:\n"
+            f"  {focus_areas.strip()}\n"
+        )
     return (
         f"You are comparing TWO pages from the SAME document:\n"
         f"  • Image 1 = ORIGINAL page {page_num}\n"
-        f"  • Image 2 = TRANSLATION into {target_lang}, page {page_num}\n\n"
+        f"  • Image 2 = TRANSLATION into {target_lang}, page {page_num}\n"
+        f"{focus_block}\n"
         f"Compare them as a professional translation reviewer. Focus ONLY on what matters:\n"
         f"  ✅ Translation accuracy & completeness (meaning preserved? content missing/added?)\n"
         f"  ✅ Terminology consistency for domain terms\n"
@@ -163,10 +171,11 @@ def _build_vision_compare_prompt(target_lang: str, page_num: int) -> str:
 
 
 def _compare_pair(client, orig_png: bytes, trans_png: bytes,
-                  page_num: int, target_lang: str) -> tuple[dict, int, int]:
+                  page_num: int, target_lang: str,
+                  focus_areas: str = "") -> tuple[dict, int, int]:
     """Send one page pair to Gemini Vision; return (result, in_tok, out_tok)."""
     model = get_working_model() or WORD_MODELS[0]
-    prompt = _build_vision_compare_prompt(target_lang, page_num)
+    prompt = _build_vision_compare_prompt(target_lang, page_num, focus_areas)
 
     last_err: Exception | None = None
     for _ in range(VISION_PAGE_RETRIES):
@@ -205,10 +214,12 @@ def _compare_pair(client, orig_png: bytes, trans_png: bytes,
 def compare_pages_parallel(holder, client, orig_images: list[bytes],
                            trans_images: list[bytes], target_lang: str,
                            page_nums: list[int] | None = None,
+                           focus_areas: str = "",
                            max_workers: int = MAX_VISION_WORKERS):
     """
     Background runner. holder is a shared dict updated as page pairs finish.
     page_nums (1-indexed) limits which page pairs to send; default = every pair.
+    focus_areas is appended to each per-page prompt as USER FOCUS.
     """
     try:
         n_pairs = min(len(orig_images), len(trans_images))
@@ -226,7 +237,7 @@ def compare_pages_parallel(holder, client, orig_images: list[bytes],
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
                 ex.submit(_compare_pair, client, orig_images[p - 1],
-                          trans_images[p - 1], p, target_lang): p
+                          trans_images[p - 1], p, target_lang, focus_areas): p
                 for p in page_nums
             }
             for fut in as_completed(futures):
@@ -314,6 +325,55 @@ def synthesize_overall_summary(client, pages: list[dict],
 # ══════════════════════════════════════════════════════════════════════════════
 # AGGREGATE — quality score + DOCX report
 # ══════════════════════════════════════════════════════════════════════════════
+def aggregate_issues_by_category(pages: list[dict]) -> list[dict]:
+    """
+    Aggregate all issues across pages by (category, severity).
+    Returns sorted list of {category, total, critical, major, minor, pages}.
+    """
+    from collections import defaultdict
+    bucket: dict[str, dict] = defaultdict(
+        lambda: {"critical": 0, "major": 0, "minor": 0, "pages": set()}
+    )
+    for p in pages:
+        page_num = p.get("page")
+        for iss in p.get("issues") or []:
+            cat = (iss.get("category") or "other").strip().lower() or "other"
+            sev = iss.get("severity", "minor")
+            slot = bucket[cat]
+            if sev in slot:
+                slot[sev] += 1
+            if page_num is not None:
+                slot["pages"].add(page_num)
+
+    rows = []
+    for cat, slot in bucket.items():
+        total = slot["critical"] + slot["major"] + slot["minor"]
+        rows.append({
+            "category": cat,
+            "total":    total,
+            "critical": slot["critical"],
+            "major":    slot["major"],
+            "minor":    slot["minor"],
+            "pages":    sorted(slot["pages"]),
+        })
+    rows.sort(key=lambda r: (-r["critical"], -r["major"], -r["minor"]))
+    return rows
+
+
+def flatten_issues(pages: list[dict]) -> list[dict]:
+    """Flatten all per-page issues into a single sorted list with `page` field."""
+    sev_order = {"critical": 0, "major": 1, "minor": 2}
+    out = []
+    for p in pages:
+        page_num = p.get("page")
+        for iss in p.get("issues") or []:
+            row = dict(iss)
+            row["page"] = page_num
+            out.append(row)
+    out.sort(key=lambda r: (sev_order.get(r.get("severity"), 9), r.get("page", 0)))
+    return out
+
+
 def vision_quality_score(pages: list[dict]) -> dict:
     """Compute overall score + issue/page distribution."""
     counts = {"critical": 0, "major": 0, "minor": 0, "ok": 0}
