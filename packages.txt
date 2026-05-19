@@ -1,2 +1,4 @@
 fonts-crosextra-carlito
 fonts-dejavu-core
+libreoffice-writer
+libreoffice-core
