@@ -23,6 +23,7 @@ from review_vision_backend import (
     render_doc_as_page_images, compare_pages_parallel,
     vision_quality_score, build_vision_report_docx,
     parse_page_spec, synthesize_overall_summary,
+    aggregate_issues_by_category, flatten_issues,
 )
 
 
@@ -33,7 +34,8 @@ SS_KEYS = ("rv_reviews", "rv_pairs", "rv_target_lang", "rv_orig_name",
            "rv_v_pages", "rv_v_orig_images", "rv_v_trans_images",
            "rv_v_target_lang", "rv_v_orig_name", "rv_v_trans_name",
            "rv_v_tok_in", "rv_v_tok_out", "rv_v_elapsed",
-           "rv_v_overall_summary", "rv_v_page_spec", "rv_v_done_pages")
+           "rv_v_overall_summary", "rv_v_page_spec", "rv_v_done_pages",
+           "rv_v_focus_areas")
 
 
 def _clear_state():
@@ -98,10 +100,21 @@ def render():
                 _clear_state()
                 st.rerun()
 
+        focus_areas = st.text_area(
+            "🎯 Trọng tâm review (tuỳ chọn):",
+            value="",
+            placeholder="vd: Tôi đặc biệt quan tâm thuật ngữ kỹ thuật và các bảng số liệu. "
+                        "Bỏ qua phần mục lục và phụ lục.",
+            height=70,
+            key="rv_v_focus_input",
+            help="Gemini sẽ ưu tiên kiểm tra những điểm bạn nêu ở đây cho từng trang.",
+        )
+
         if st.button("🚀 So sánh theo trang (Vision)", type="primary",
                      disabled=not (orig_file and trans_file),
                      use_container_width=True):
-            _run_vision_review(orig_file, trans_file, target_lang, page_spec)
+            _run_vision_review(orig_file, trans_file, target_lang,
+                               page_spec, focus_areas)
 
         if "rv_v_pages" in st.session_state:
             _render_vision_results()
@@ -475,7 +488,8 @@ def _render_results():
 # ══════════════════════════════════════════════════════════════════════════════
 # VISION MODE — render pages → Gemini Vision per-page comparison
 # ══════════════════════════════════════════════════════════════════════════════
-def _run_vision_review(orig_file, trans_file, target_lang, page_spec: str = ""):
+def _run_vision_review(orig_file, trans_file, target_lang,
+                       page_spec: str = "", focus_areas: str = ""):
     log_ph = st.empty()
     log_lines: list = []
     add_log = make_log_adder(log_lines, log_ph)
@@ -541,7 +555,7 @@ def _run_vision_review(orig_file, trans_file, target_lang, page_spec: str = ""):
         threading.Thread(
             target=compare_pages_parallel,
             args=(holder, get_client(), orig_images, trans_images,
-                  target_lang, selected_pages),
+                  target_lang, selected_pages, focus_areas),
             daemon=True,
         ).start()
 
@@ -617,6 +631,7 @@ def _run_vision_review(orig_file, trans_file, target_lang, page_spec: str = ""):
         st.session_state["rv_v_overall_summary"]  = overall
         st.session_state["rv_v_page_spec"]        = page_spec
         st.session_state["rv_v_done_pages"]       = sorted({p.get("page") for p in pages})
+        st.session_state["rv_v_focus_areas"]      = focus_areas
 
         usd, vnd = calc_cost(holder["tok_in"], holder["tok_out"])
         add_log("─" * 44)
@@ -639,6 +654,7 @@ def _retry_failed_vision_pages():
     orig_images  = st.session_state.get("rv_v_orig_images")  or []
     trans_images = st.session_state.get("rv_v_trans_images") or []
     target_lang  = st.session_state.get("rv_v_target_lang", "")
+    focus_areas  = st.session_state.get("rv_v_focus_areas", "")
 
     holder = {
         "pages": [], "tok_in": 0, "tok_out": 0,
@@ -649,7 +665,7 @@ def _retry_failed_vision_pages():
         t = threading.Thread(
             target=compare_pages_parallel,
             args=(holder, get_client(), orig_images, trans_images,
-                  target_lang, error_pages),
+                  target_lang, error_pages, focus_areas),
             daemon=True,
         )
         t.start()
@@ -776,15 +792,80 @@ def _render_vision_results():
                 _retry_failed_vision_pages()
                 st.rerun()
 
-    # Filter
-    st.markdown("#### 🔎 Hiển thị trang")
-    sev_filter = st.multiselect(
-        "Severity của trang:",
-        ["critical", "major", "minor", "ok", "error"],
-        default=["critical", "major", "minor"],
-        key="rv_v_filter",
-    )
+    # Category aggregation
+    by_cat = aggregate_issues_by_category(pages)
+    if by_cat:
+        with st.expander(f"📊 Tổng hợp theo loại vấn đề ({len(by_cat)} loại)",
+                         expanded=False):
+            cat_rows = [{
+                "Loại":      r["category"],
+                "Tổng":      r["total"],
+                "🔴":        r["critical"],
+                "🟠":        r["major"],
+                "🟡":        r["minor"],
+                "Trang xuất hiện": ", ".join(str(p) for p in r["pages"][:12])
+                                   + ("..." if len(r["pages"]) > 12 else ""),
+            } for r in by_cat]
+            st.dataframe(pd.DataFrame(cat_rows), hide_index=True,
+                         use_container_width=True)
 
+    # View mode toggle + filter
+    st.markdown("#### 🔎 Hiển thị")
+    vc1, vc2 = st.columns([1, 2])
+    with vc1:
+        view_mode = st.radio(
+            "Sắp xếp:", ["Theo trang", "Theo mức độ"],
+            horizontal=True, key="rv_v_view_mode",
+        )
+    with vc2:
+        sev_filter = st.multiselect(
+            "Severity:",
+            ["critical", "major", "minor", "ok", "error"],
+            default=["critical", "major", "minor"],
+            key="rv_v_filter",
+        )
+
+    if view_mode == "Theo trang":
+        _render_vision_by_page(pages, sev_filter, orig_images, trans_images)
+    else:
+        _render_vision_by_severity(pages, sev_filter)
+
+
+def _render_issue_card(iss: dict, page_num=None):
+    isev = iss.get("severity", "minor")
+    isev_emoji = {"critical": "🔴", "major": "🟠", "minor": "🟡"}.get(isev, "⚪")
+    with st.container(border=True):
+        head = st.columns([2, 2, 1])
+        head[0].markdown(f"**{isev_emoji} {isev.upper()}** "
+                         f"· `{iss.get('category', '')}`")
+        head[1].markdown(f"*{iss.get('location', '')}*")
+        if page_num is not None:
+            head[2].markdown(f"📄 Trang {page_num}")
+
+        if iss.get("original") or iss.get("translated"):
+            cc1, cc2 = st.columns(2)
+            cc1.markdown("**Gốc:**")
+            cc1.markdown(
+                f"<div style='padding:8px;background:#fff7f7;"
+                f"border:1px solid #ffd0d0;border-radius:6px;"
+                f"color:#1a1a1a'>{iss.get('original','') or '—'}</div>",
+                unsafe_allow_html=True,
+            )
+            cc2.markdown("**Dịch:**")
+            cc2.markdown(
+                f"<div style='padding:8px;background:#f7fff7;"
+                f"border:1px solid #d0ffd0;border-radius:6px;"
+                f"color:#1a1a1a'>{iss.get('translated','') or '—'}</div>",
+                unsafe_allow_html=True,
+            )
+
+        if iss.get("description"):
+            st.markdown(f"**📝 Mô tả:** {iss['description']}")
+        if iss.get("suggested"):
+            st.markdown(f"**💡 Đề xuất:** {iss['suggested']}")
+
+
+def _render_vision_by_page(pages, sev_filter, orig_images, trans_images):
     sev_order = {"critical": 0, "major": 1, "minor": 2, "ok": 3, "error": 4}
     visible = [p for p in pages if p.get("severity", "ok") in sev_filter]
     visible.sort(key=lambda p: (sev_order.get(p.get("severity"), 5),
@@ -812,7 +893,7 @@ def _render_vision_results():
             if page.get("summary"):
                 st.markdown(f"**📝 Tổng quan:** {page['summary']}")
 
-            if show_pages_btn:
+            if show_pages_btn and isinstance(page_num, int):
                 idx = page_num - 1
                 if 0 <= idx < len(orig_images) and 0 <= idx < len(trans_images):
                     img_c1, img_c2 = st.columns(2)
@@ -822,33 +903,22 @@ def _render_vision_results():
                     img_c2.image(trans_images[idx], use_container_width=True)
 
             for iss in page.get("issues") or []:
-                isev = iss.get("severity", "minor")
-                isev_emoji = {"critical": "🔴", "major": "🟠",
-                              "minor": "🟡"}.get(isev, "⚪")
-                with st.container(border=True):
-                    head = st.columns([2, 3])
-                    head[0].markdown(f"**{isev_emoji} {isev.upper()}** "
-                                     f"· `{iss.get('category', '')}`")
-                    head[1].markdown(f"*{iss.get('location', '')}*")
+                _render_issue_card(iss)
 
-                    if iss.get("original") or iss.get("translated"):
-                        cc1, cc2 = st.columns(2)
-                        cc1.markdown("**Gốc:**")
-                        cc1.markdown(
-                            f"<div style='padding:8px;background:#fff7f7;"
-                            f"border:1px solid #ffd0d0;border-radius:6px;"
-                            f"color:#1a1a1a'>{iss.get('original','') or '—'}</div>",
-                            unsafe_allow_html=True,
-                        )
-                        cc2.markdown("**Dịch:**")
-                        cc2.markdown(
-                            f"<div style='padding:8px;background:#f7fff7;"
-                            f"border:1px solid #d0ffd0;border-radius:6px;"
-                            f"color:#1a1a1a'>{iss.get('translated','') or '—'}</div>",
-                            unsafe_allow_html=True,
-                        )
 
-                    if iss.get("description"):
-                        st.markdown(f"**📝 Mô tả:** {iss['description']}")
-                    if iss.get("suggested"):
-                        st.markdown(f"**💡 Đề xuất:** {iss['suggested']}")
+def _render_vision_by_severity(pages, sev_filter):
+    issues = flatten_issues(pages)
+    issues = [i for i in issues if i.get("severity", "minor") in sev_filter]
+    st.caption(f"Hiển thị {len(issues)} vấn đề (đã sort theo mức độ)")
+
+    if not issues:
+        st.info("Không có vấn đề nào khớp với bộ lọc.")
+        return
+
+    LIMIT = 200
+    for iss in issues[:LIMIT]:
+        _render_issue_card(iss, page_num=iss.get("page"))
+
+    if len(issues) > LIMIT:
+        st.info(f"Chỉ hiển thị {LIMIT}/{len(issues)} vấn đề. "
+                f"Tải DOCX/CSV để xem đầy đủ.")
