@@ -22,6 +22,7 @@ from review_backend import (
 from review_vision_backend import (
     render_doc_as_page_images, compare_pages_parallel,
     vision_quality_score, build_vision_report_docx,
+    parse_page_spec, synthesize_overall_summary,
 )
 
 
@@ -31,7 +32,8 @@ SS_KEYS = ("rv_reviews", "rv_pairs", "rv_target_lang", "rv_orig_name",
            "rv_edits", "rv_smart_align",
            "rv_v_pages", "rv_v_orig_images", "rv_v_trans_images",
            "rv_v_target_lang", "rv_v_orig_name", "rv_v_trans_name",
-           "rv_v_tok_in", "rv_v_tok_out", "rv_v_elapsed")
+           "rv_v_tok_in", "rv_v_tok_out", "rv_v_elapsed",
+           "rv_v_overall_summary", "rv_v_page_spec", "rv_v_done_pages")
 
 
 def _clear_state():
@@ -79,11 +81,18 @@ def render():
                                       key="rv_trans_upload")
 
     if is_vision:
-        c1, c2 = st.columns([3, 1])
+        c1, c2, c3 = st.columns([2, 2, 1])
         with c1:
             target_lang = st.selectbox("Ngôn ngữ bản dịch:", LANGUAGES,
                                        index=0, key="rv_lang_v")
         with c2:
+            page_spec = st.text_input(
+                "Trang cần so sánh:", value="",
+                placeholder="vd: 1-5,7  (để trống = tất cả)",
+                key="rv_v_page_spec_input",
+                help="1-indexed. VD: '1-3,5,8-10'. Trống = so sánh toàn bộ.",
+            )
+        with c3:
             st.markdown("&nbsp;", unsafe_allow_html=True)
             if st.button("🗑 Xoá kết quả", use_container_width=True, key="rv_clear_v"):
                 _clear_state()
@@ -92,7 +101,7 @@ def render():
         if st.button("🚀 So sánh theo trang (Vision)", type="primary",
                      disabled=not (orig_file and trans_file),
                      use_container_width=True):
-            _run_vision_review(orig_file, trans_file, target_lang)
+            _run_vision_review(orig_file, trans_file, target_lang, page_spec)
 
         if "rv_v_pages" in st.session_state:
             _render_vision_results()
@@ -466,7 +475,7 @@ def _render_results():
 # ══════════════════════════════════════════════════════════════════════════════
 # VISION MODE — render pages → Gemini Vision per-page comparison
 # ══════════════════════════════════════════════════════════════════════════════
-def _run_vision_review(orig_file, trans_file, target_lang):
+def _run_vision_review(orig_file, trans_file, target_lang, page_spec: str = ""):
     log_ph = st.empty()
     log_lines: list = []
     add_log = make_log_adder(log_lines, log_ph)
@@ -476,11 +485,21 @@ def _run_vision_review(orig_file, trans_file, target_lang):
         trans_bytes = trans_file.read()
         add_log(f"📄 Gốc: {orig_file.name}")
         add_log(f"📝 Dịch: {trans_file.name}")
-        add_log("🖼 Đang render trang gốc thành ảnh...")
-        orig_images = render_doc_as_page_images(orig_bytes, orig_file.name)
+
+        render_ph = st.empty()
+
+        def _render_log(label):
+            def cb(done, total, stage):
+                if stage == "converting":
+                    render_ph.info(f"🔄 {label}: đang chuyển DOCX → PDF...")
+                else:
+                    render_ph.info(f"🖼 {label}: render {done}/{total} trang...")
+            return cb
+
+        orig_images  = render_doc_as_page_images(orig_bytes,  orig_file.name,  _render_log("Gốc"))
+        trans_images = render_doc_as_page_images(trans_bytes, trans_file.name, _render_log("Dịch"))
+        render_ph.empty()
         add_log(f"   • Gốc: {len(orig_images)} trang")
-        add_log("🖼 Đang render trang dịch thành ảnh...")
-        trans_images = render_doc_as_page_images(trans_bytes, trans_file.name)
         add_log(f"   • Dịch: {len(trans_images)} trang")
 
         if not orig_images or not trans_images:
@@ -490,16 +509,24 @@ def _run_vision_review(orig_file, trans_file, target_lang):
         n_pairs = min(len(orig_images), len(trans_images))
         if len(orig_images) != len(trans_images):
             add_log(f"⚠️ Số trang khác: gốc={len(orig_images)} vs dịch={len(trans_images)}. "
-                    f"So sánh {n_pairs} cặp đầu.")
+                    f"Ghép {n_pairs} cặp đầu.")
 
+        selected_pages = parse_page_spec(page_spec, n_pairs)
+        if not selected_pages:
+            st.error(f"Không có trang hợp lệ trong '{page_spec}'. Tài liệu có {n_pairs} trang.")
+            return
+        if len(selected_pages) < n_pairs:
+            add_log(f"📌 Chỉ so sánh {len(selected_pages)}/{n_pairs} trang theo yêu cầu: {page_spec}")
+
+        n_compare = len(selected_pages)
         timer_ph = st.empty()
         c1, c2, c3, c4 = st.columns(4)
         p1, p2, p3, p4 = c1.empty(), c2.empty(), c3.empty(), c4.empty()
 
         def render_stats(done_c, tok_in, tok_out):
             usd, vnd = calc_cost(tok_in, tok_out)
-            p1.markdown(stat_box_html(f"{n_pairs}", "Trang"), unsafe_allow_html=True)
-            p2.markdown(stat_box_html(f"{done_c}/{n_pairs}", "Đã so sánh"), unsafe_allow_html=True)
+            p1.markdown(stat_box_html(f"{n_compare}", "Trang gửi"), unsafe_allow_html=True)
+            p2.markdown(stat_box_html(f"{done_c}/{n_compare}", "Đã so sánh"), unsafe_allow_html=True)
             p3.markdown(stat_box_html(f"${usd:.4f}", "USD"), unsafe_allow_html=True)
             p4.markdown(stat_box_html(f"{vnd:,.0f}₫", "VND"), unsafe_allow_html=True)
         render_stats(0, 0, 0)
@@ -513,7 +540,8 @@ def _run_vision_review(orig_file, trans_file, target_lang):
         t0 = time.time()
         threading.Thread(
             target=compare_pages_parallel,
-            args=(holder, get_client(), orig_images, trans_images, target_lang),
+            args=(holder, get_client(), orig_images, trans_images,
+                  target_lang, selected_pages),
             daemon=True,
         ).start()
 
@@ -536,8 +564,8 @@ def _run_vision_review(orig_file, trans_file, target_lang):
                 timer_box_html(elapsed, f"🔄 So sánh trang song song{dots}"),
                 unsafe_allow_html=True,
             )
-            pct = int(holder["page_done"] / n_pairs * 95) if n_pairs else 0
-            prog.progress(pct, text=f"{holder['page_done']}/{n_pairs} trang...")
+            pct = int(holder["page_done"] / n_compare * 95) if n_compare else 0
+            prog.progress(pct, text=f"{holder['page_done']}/{n_compare} trang...")
             render_stats(holder["page_done"], holder["tok_in"], holder["tok_out"])
             dot += 1
             time.sleep(0.5)
@@ -557,23 +585,38 @@ def _run_vision_review(orig_file, trans_file, target_lang):
             st.error(holder["error"])
             return
 
+        pages = sorted(holder["pages"], key=lambda x: x.get("page", 0))
+
+        # Executive summary across all pages
+        prog.progress(96, text="✍️ Tổng hợp báo cáo chung...")
+        add_log("✍️ Tổng hợp executive summary...")
+        overall, in_t, out_t = synthesize_overall_summary(get_client(), pages, target_lang)
+        holder["tok_in"]  += in_t
+        holder["tok_out"] += out_t
+        if overall:
+            add_log(f"   ✅ Summary ({in_t:,}in/{out_t:,}out tok)")
+        else:
+            add_log("   ⚠️ Không tạo được summary (bỏ qua)")
+
         elapsed = time.time() - t0
         prog.progress(100, text="✅ Xong!")
         timer_ph.markdown(
-            timer_done_html(elapsed, f"So sánh {n_pairs} trang xong!"),
+            timer_done_html(elapsed, f"So sánh {n_compare} trang xong!"),
             unsafe_allow_html=True,
         )
 
-        pages = sorted(holder["pages"], key=lambda x: x.get("page", 0))
-        st.session_state["rv_v_pages"]         = pages
-        st.session_state["rv_v_orig_images"]   = orig_images
-        st.session_state["rv_v_trans_images"]  = trans_images
-        st.session_state["rv_v_target_lang"]   = target_lang
-        st.session_state["rv_v_orig_name"]     = orig_file.name
-        st.session_state["rv_v_trans_name"]    = trans_file.name
-        st.session_state["rv_v_tok_in"]        = holder["tok_in"]
-        st.session_state["rv_v_tok_out"]       = holder["tok_out"]
-        st.session_state["rv_v_elapsed"]       = elapsed
+        st.session_state["rv_v_pages"]            = pages
+        st.session_state["rv_v_orig_images"]      = orig_images
+        st.session_state["rv_v_trans_images"]     = trans_images
+        st.session_state["rv_v_target_lang"]      = target_lang
+        st.session_state["rv_v_orig_name"]        = orig_file.name
+        st.session_state["rv_v_trans_name"]       = trans_file.name
+        st.session_state["rv_v_tok_in"]           = holder["tok_in"]
+        st.session_state["rv_v_tok_out"]          = holder["tok_out"]
+        st.session_state["rv_v_elapsed"]          = elapsed
+        st.session_state["rv_v_overall_summary"]  = overall
+        st.session_state["rv_v_page_spec"]        = page_spec
+        st.session_state["rv_v_done_pages"]       = sorted({p.get("page") for p in pages})
 
         usd, vnd = calc_cost(holder["tok_in"], holder["tok_out"])
         add_log("─" * 44)
@@ -585,6 +628,51 @@ def _run_vision_review(orig_file, trans_file, target_lang):
         st.error(f"Lỗi: {e}")
 
 
+def _retry_failed_vision_pages():
+    """Re-run only error pages from previous result."""
+    pages = st.session_state.get("rv_v_pages") or []
+    error_pages = [p.get("page") for p in pages
+                   if p.get("severity") == "error" or not p.get("page")]
+    if not error_pages:
+        return
+
+    orig_images  = st.session_state.get("rv_v_orig_images")  or []
+    trans_images = st.session_state.get("rv_v_trans_images") or []
+    target_lang  = st.session_state.get("rv_v_target_lang", "")
+
+    holder = {
+        "pages": [], "tok_in": 0, "tok_out": 0,
+        "page_done": 0, "page_log": [], "warnings": [],
+        "done": False, "error": None,
+    }
+    with st.spinner(f"🔄 Chạy lại {len(error_pages)} trang lỗi..."):
+        t = threading.Thread(
+            target=compare_pages_parallel,
+            args=(holder, get_client(), orig_images, trans_images,
+                  target_lang, error_pages),
+            daemon=True,
+        )
+        t.start()
+        t.join(timeout=600)
+
+    if holder["error"]:
+        st.error(holder["error"])
+        return
+
+    # Merge: replace error pages with retried pages
+    retried_by_page = {p.get("page"): p for p in holder["pages"]}
+    merged = []
+    for p in pages:
+        pn = p.get("page")
+        if pn in retried_by_page:
+            merged.append(retried_by_page[pn])
+        else:
+            merged.append(p)
+    st.session_state["rv_v_pages"] = sorted(merged, key=lambda x: x.get("page", 0))
+    st.session_state["rv_v_tok_in"]  = (st.session_state.get("rv_v_tok_in")  or 0) + holder["tok_in"]
+    st.session_state["rv_v_tok_out"] = (st.session_state.get("rv_v_tok_out") or 0) + holder["tok_out"]
+
+
 def _render_vision_results():
     pages = st.session_state["rv_v_pages"]
     orig_images  = st.session_state.get("rv_v_orig_images")  or []
@@ -592,9 +680,15 @@ def _render_vision_results():
     target_lang  = st.session_state.get("rv_v_target_lang", "")
     orig_name    = st.session_state.get("rv_v_orig_name",  "orig")
     trans_name   = st.session_state.get("rv_v_trans_name", "trans")
+    overall_sum  = st.session_state.get("rv_v_overall_summary", "")
 
     st.markdown("---")
     st.markdown("### 📊 Kết quả so sánh (Vision mode)")
+
+    if overall_sum:
+        with st.container(border=True):
+            st.markdown("#### 📋 Tóm tắt tổng quan")
+            st.markdown(overall_sum)
 
     metrics = vision_quality_score(pages)
     score = metrics["overall"]
@@ -636,7 +730,8 @@ def _render_vision_results():
     # Export DOCX + CSV
     cA, cB = st.columns(2)
     with cA:
-        report = build_vision_report_docx(pages, orig_name, trans_name, target_lang)
+        report = build_vision_report_docx(pages, orig_name, trans_name,
+                                          target_lang, overall_sum)
         st.download_button(
             "⬇️ Tải báo cáo DOCX",
             data=report,
@@ -669,6 +764,17 @@ def _render_vision_results():
             use_container_width=True,
             key="rv_v_dl_csv",
         )
+
+    # Retry failed pages
+    error_pages = [p.get("page") for p in pages if p.get("severity") == "error"]
+    if error_pages:
+        rc1, rc2 = st.columns([3, 1])
+        rc1.warning(f"⚠️ Có {len(error_pages)} trang lỗi: {sorted(error_pages)}")
+        with rc2:
+            if st.button("🔄 Thử lại trang lỗi", use_container_width=True,
+                         key="rv_v_retry"):
+                _retry_failed_vision_pages()
+                st.rerun()
 
     # Filter
     st.markdown("#### 🔎 Hiển thị trang")

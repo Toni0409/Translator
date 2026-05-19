@@ -55,21 +55,65 @@ def _docx_to_pdf_bytes(docx_bytes: bytes) -> bytes:
             return f.read()
 
 
-def render_doc_as_page_images(file_bytes: bytes, file_name: str) -> list[bytes]:
-    """Render every page of the document as a PNG. DOCX goes through soffice."""
+def render_doc_as_page_images(file_bytes: bytes, file_name: str,
+                              on_progress=None) -> list[bytes]:
+    """
+    Render every page of the document as a PNG. DOCX goes through soffice.
+    on_progress(done, total, stage) optionally called as rendering proceeds.
+    """
     name_lower = (file_name or "").lower()
     if name_lower.endswith(".docx"):
+        if on_progress:
+            on_progress(0, 0, "converting")
         pdf_bytes = _docx_to_pdf_bytes(file_bytes)
     else:
         pdf_bytes = file_bytes
 
     images: list[bytes] = []
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        total = doc.page_count
         mat = fitz.Matrix(VISION_DPI_SCALE, VISION_DPI_SCALE)
-        for page in doc:
+        for i, page in enumerate(doc):
             pix = page.get_pixmap(matrix=mat, alpha=False)
             images.append(pix.tobytes("png"))
+            if on_progress:
+                on_progress(i + 1, total, "rendering")
     return images
+
+
+def parse_page_spec(spec: str, max_pages: int) -> list[int]:
+    """
+    Parse a 1-indexed page spec like "1-5,7,9-12" → sorted list of ints.
+    Empty / "all" / "*" returns all pages.
+    Out-of-range values are clipped; invalid tokens are skipped silently.
+    """
+    spec = (spec or "").strip().lower()
+    if not spec or spec in ("all", "*", "tat ca", "tất cả"):
+        return list(range(1, max_pages + 1))
+    out: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            try:
+                start = max(1, int(a))
+                end = min(max_pages, int(b))
+                if end < start:
+                    start, end = end, start
+                for v in range(start, end + 1):
+                    out.add(v)
+            except ValueError:
+                continue
+        else:
+            try:
+                v = int(part)
+                if 1 <= v <= max_pages:
+                    out.add(v)
+            except ValueError:
+                continue
+    return sorted(out)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -160,10 +204,19 @@ def _compare_pair(client, orig_png: bytes, trans_png: bytes,
 
 def compare_pages_parallel(holder, client, orig_images: list[bytes],
                            trans_images: list[bytes], target_lang: str,
+                           page_nums: list[int] | None = None,
                            max_workers: int = MAX_VISION_WORKERS):
-    """Background runner. holder is shared dict updated as page pairs finish."""
+    """
+    Background runner. holder is a shared dict updated as page pairs finish.
+    page_nums (1-indexed) limits which page pairs to send; default = every pair.
+    """
     try:
         n_pairs = min(len(orig_images), len(trans_images))
+        if page_nums is None:
+            page_nums = list(range(1, n_pairs + 1))
+        else:
+            page_nums = [p for p in page_nums if 1 <= p <= n_pairs]
+
         if len(orig_images) != len(trans_images):
             holder["warnings"].append(
                 f"⚠️ Số trang khác nhau: gốc={len(orig_images)}, "
@@ -172,12 +225,12 @@ def compare_pages_parallel(holder, client, orig_images: list[bytes],
 
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
-                ex.submit(_compare_pair, client, orig_images[i],
-                          trans_images[i], i + 1, target_lang): i
-                for i in range(n_pairs)
+                ex.submit(_compare_pair, client, orig_images[p - 1],
+                          trans_images[p - 1], p, target_lang): p
+                for p in page_nums
             }
             for fut in as_completed(futures):
-                idx = futures[fut]
+                page = futures[fut]
                 try:
                     result, in_t, out_t = fut.result()
                     holder["pages"].append(result)
@@ -185,7 +238,7 @@ def compare_pages_parallel(holder, client, orig_images: list[bytes],
                     holder["tok_out"] += out_t
                     holder["page_done"] += 1
                     holder["page_log"].append({
-                        "page": idx + 1,
+                        "page": page,
                         "severity": result.get("severity", "ok"),
                         "issues": len(result.get("issues") or []),
                         "in_t": in_t, "out_t": out_t, "error": None,
@@ -193,13 +246,69 @@ def compare_pages_parallel(holder, client, orig_images: list[bytes],
                 except Exception as e:
                     holder["page_done"] += 1
                     holder["page_log"].append({
-                        "page": idx + 1, "severity": "error", "issues": 0,
+                        "page": page, "severity": "error", "issues": 0,
                         "in_t": 0, "out_t": 0, "error": str(e)[:200],
                     })
     except Exception as e:
         holder["error"] = str(e)
     finally:
         holder["done"] = True
+
+
+def synthesize_overall_summary(client, pages: list[dict],
+                               target_lang: str) -> tuple[str, int, int]:
+    """
+    Build an executive summary in Vietnamese across all per-page results.
+    Returns (summary_text, in_tokens, out_tokens). On error returns ("", 0, 0).
+    """
+    if not pages:
+        return "", 0, 0
+
+    lines: list[str] = []
+    for p in sorted(pages, key=lambda x: x.get("page", 0)):
+        page_num = p.get("page", "?")
+        sev = p.get("severity", "ok")
+        summary = (p.get("summary") or "").strip()
+        issues = p.get("issues") or []
+        lines.append(f"- Page {page_num} [{sev}]: {summary} ({len(issues)} issue)")
+        for iss in issues[:3]:
+            lines.append(
+                f"    • {iss.get('severity','')}/{iss.get('category','')} "
+                f"@ {iss.get('location','')}: "
+                f"{(iss.get('description','') or '')[:160]}"
+            )
+
+    prompt = (
+        f"You are a senior translation reviewer. The translation target language is {target_lang}.\n"
+        f"Below are per-page review summaries of a translated document.\n\n"
+        f"Write an EXECUTIVE SUMMARY in Vietnamese, 3-5 short paragraphs:\n"
+        f"1. Đánh giá chung chất lượng bản dịch (1 đoạn)\n"
+        f"2. Các lỗi/mẫu lặp lại nổi bật ở nhiều trang (1 đoạn)\n"
+        f"3. Trang/vấn đề cần ưu tiên sửa nhất (1 đoạn, liệt kê số trang)\n"
+        f"4. Khuyến nghị cho người dịch (1 đoạn)\n\n"
+        f"Return ONLY a JSON object: {{\"summary\": \"<văn bản markdown, dùng \\n\\n giữa các đoạn>\"}}\n\n"
+        f"Per-page data:\n" + "\n".join(lines)
+    )
+
+    model = get_working_model() or WORD_MODELS[0]
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=gtypes.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.3,
+            ),
+        )
+        meta = getattr(response, "usage_metadata", None)
+        in_t  = getattr(meta, "prompt_token_count",     0) or 0
+        out_t = getattr(meta, "candidates_token_count", 0) or 0
+        data = parse_json_loose(response.text) or {}
+        if isinstance(data, dict):
+            return str(data.get("summary", "") or "").strip(), in_t, out_t
+        return "", in_t, out_t
+    except Exception:
+        return "", 0, 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -235,7 +344,8 @@ def vision_quality_score(pages: list[dict]) -> dict:
 
 
 def build_vision_report_docx(pages: list[dict], orig_name: str,
-                             trans_name: str, target_lang: str) -> bytes:
+                             trans_name: str, target_lang: str,
+                             overall_summary: str = "") -> bytes:
     from docx import Document
     from docx.shared import RGBColor, Inches
 
@@ -259,6 +369,13 @@ def build_vision_report_docx(pages: list[dict], orig_name: str,
     p.add_run(f"🔴 Critical: {ic['critical']}  ").font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
     p.add_run(f"🟠 Major: {ic['major']}  ").font.color.rgb = RGBColor(0xD0, 0x70, 0x00)
     p.add_run(f"🟡 Minor: {ic['minor']}").font.color.rgb = RGBColor(0x80, 0x80, 0x00)
+
+    if overall_summary:
+        doc.add_heading("Tóm tắt tổng quan", level=1)
+        for para in overall_summary.split("\n\n"):
+            para = para.strip()
+            if para:
+                doc.add_paragraph(para)
 
     for page in sorted(pages, key=lambda x: x.get("page", 0)):
         page_num = page.get("page", "?")
