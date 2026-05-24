@@ -962,7 +962,7 @@ def translate_parallel(holder: dict, client,
     """
     Background worker: dịch nhiều chunk song song với ThreadPoolExecutor.
 
-    `holder` (dict shared với main thread) sẽ được update:
+    `holder` (dict shared với main thread) sẽ được update dưới lock:
     - translations  : dict {block_id -> translated_text}
     - tok_in/tok_out: cumulative tokens
     - chunk_done    : số chunk đã xong
@@ -970,6 +970,7 @@ def translate_parallel(holder: dict, client,
     - done          : True khi xong tất cả
     - error         : str nếu fatal error
     """
+    lock = threading.Lock()
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
@@ -985,17 +986,18 @@ def translate_parallel(holder: dict, client,
                     result, in_t, out_t, err = (
                         {b["id"]: b["text"] for b in chunk}, 0, 0, str(e)
                     )
-                holder["translations"].update(result)
-                holder["tok_in"]  += in_t
-                holder["tok_out"] += out_t
-                holder["chunk_log"].append({
-                    "idx":   idx,
-                    "size":  len(chunk),
-                    "in_t":  in_t,
-                    "out_t": out_t,
-                    "error": err,
-                })
-                holder["chunk_done"] += 1
+                with lock:
+                    holder["translations"].update(result)
+                    holder["tok_in"]  += in_t
+                    holder["tok_out"] += out_t
+                    holder["chunk_log"].append({
+                        "idx":   idx,
+                        "size":  len(chunk),
+                        "in_t":  in_t,
+                        "out_t": out_t,
+                        "error": err,
+                    })
+                    holder["chunk_done"] += 1
         holder["done"] = True
     except Exception as e:
         holder["error"] = str(e)
@@ -1112,23 +1114,34 @@ def _is_untranslated(b: dict, translations: dict) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 # TRANSLATION MEMORY — hash-based cache (session-scoped)
 # ══════════════════════════════════════════════════════════════════════════════
-def tm_key(text: str, target_lang: str) -> str:
-    """Hash key: language-specific để tránh nhầm bản dịch khi đổi target."""
-    return hashlib.md5(f"{target_lang}|{text}".encode("utf-8")).hexdigest()[:16]
+def tm_key(text: str, target_lang: str, role: str = "") -> str:
+    """
+    Hash key: language + (optional) role + text.
+    Role-aware để giữ style consistency — heading vs body cùng text vẫn dịch riêng.
+    Role rỗng = legacy key (backward compat khi caller không có role).
+    """
+    role_part = f"|{role}" if role else ""
+    return hashlib.md5(
+        f"{target_lang}{role_part}|{text}".encode("utf-8")
+    ).hexdigest()[:16]
 
 
 def tm_lookup(blocks: list[dict], tm: dict, target_lang: str
               ) -> tuple[dict, list[dict]]:
     """
     Trả về (cached_translations, remaining_blocks).
-    `cached_translations`: {block_id → translated_text} từ TM hit.
-    `remaining_blocks`   : list block chưa có trong TM, cần dịch.
+    Thử key role-specific trước; nếu miss thì fall back legacy key (no role)
+    để dùng entry cũ trong session.
     """
     cached, remaining = {}, []
     for b in blocks:
-        key = tm_key(b["text"], target_lang)
-        if key in tm:
-            cached[b["id"]] = tm[key]
+        role = b.get("role", "")
+        key_role   = tm_key(b["text"], target_lang, role)
+        key_legacy = tm_key(b["text"], target_lang)
+        if key_role in tm:
+            cached[b["id"]] = tm[key_role]
+        elif key_legacy in tm:
+            cached[b["id"]] = tm[key_legacy]
         else:
             remaining.append(b)
     return cached, remaining
@@ -1136,13 +1149,13 @@ def tm_lookup(blocks: list[dict], tm: dict, target_lang: str
 
 def tm_store(blocks: list[dict], translations: dict, tm: dict,
              target_lang: str) -> int:
-    """Ghi translations mới vào TM. Trả về số entry thêm vào."""
+    """Ghi translations mới vào TM với role-specific key. Trả về số entry thêm vào."""
     added = 0
     for b in blocks:
         tr = translations.get(b["id"])
         if not tr or tr == b["text"]:
             continue
-        key = tm_key(b["text"], target_lang)
+        key = tm_key(b["text"], target_lang, b.get("role", ""))
         if key not in tm:
             tm[key] = tr
             added += 1
@@ -1156,7 +1169,8 @@ import os, pickle as _pickle
 
 
 def _checkpoint_path(docx_bytes: bytes, target_lang: str) -> str:
-    h = hashlib.md5(docx_bytes[:8192]).hexdigest()[:12]
+    # Hash TOÀN BỘ file để tránh collision khi 2 docx khác nhau cùng prefix 8KB.
+    h = hashlib.md5(docx_bytes).hexdigest()[:16]
     slug = target_lang.replace(" ", "_")[:12]
     return f"/tmp/tr_ckpt_{h}_{slug}.pkl"
 

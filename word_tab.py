@@ -225,11 +225,28 @@ def _run_analysis(uploaded_docx, lang_word):
 
         target_lang = LANG_EN[lang_word]
 
-        # TM preview
+        # TM preview — kèm breakdown per role
         tm           = _ensure_tm()
         tm_cached, _ = tm_lookup(translatable, tm, target_lang)
         if tm_cached:
             add_log(f"💾 TM: {len(tm_cached):,}/{len(translatable):,} đoạn dùng cache (skip API)")
+            # Per-role hit rate breakdown
+            id_to_role = {b["id"]: b.get("role", "?") for b in translatable}
+            role_total: dict = {}
+            role_hits:  dict = {}
+            for b in translatable:
+                role_total[b["role"]] = role_total.get(b["role"], 0) + 1
+            for bid in tm_cached:
+                r = id_to_role.get(bid, "?")
+                role_hits[r] = role_hits.get(r, 0) + 1
+            role_lines = [
+                f"      {r}: {role_hits[r]}/{role_total[r]}"
+                for r in sorted(role_hits, key=lambda x: -role_hits[x])
+            ]
+            if role_lines:
+                add_log("   TM hit theo role:")
+                for line in role_lines[:6]:
+                    add_log(line)
         else:
             add_log(f"💾 TM: 0 hit (TM hiện có {len(tm):,} entry)")
 
@@ -255,6 +272,8 @@ def _run_analysis(uploaded_docx, lang_word):
             "tm_hits":       len(tm_cached),
             "doc_context":   build_doc_context(blocks),
             "glossary":      glossary,
+            # Snapshot để restore khi user lỡ xoá entries trong editor
+            "_glossary_initial": dict(glossary),
             "docx_bytes":    docx_bytes,
             "filename":      uploaded_docx.name,
             "lang":          lang_word,
@@ -402,6 +421,8 @@ def _render_analysis_panel():
                 "Xóa cell **Bản dịch** (để trống) để loại entry khỏi glossary. "
                 "Có thể thêm dòng mới."
             )
+            # Versioned key — đổi khi restore để force re-render editor
+            gver = st.session_state.get("word_glossary_editor_ver", 0)
             df = pd.DataFrame([
                 {"Thuật ngữ gốc": k, "Bản dịch": v}
                 for k, v in a["glossary"].items()
@@ -414,7 +435,7 @@ def _render_analysis_panel():
                 },
                 use_container_width=True, hide_index=True,
                 num_rows="dynamic",
-                key="word_glossary_editor",
+                key=f"word_glossary_editor_v{gver}",
             )
             # Sync edits back
             new_gloss = {}
@@ -425,6 +446,26 @@ def _render_analysis_panel():
                     new_gloss[en] = vi
             a["glossary"] = new_gloss
             st.session_state["word_analysis"] = a
+
+            # Diff so với glossary ban đầu — cảnh báo nếu user lỡ xoá entries
+            initial = a.get("_glossary_initial") or {}
+            removed = set(initial) - set(new_gloss)
+            added   = set(new_gloss) - set(initial)
+            if removed or added:
+                cols = st.columns([4, 1])
+                msg = f"📊 Glossary: {len(initial)} → {len(new_gloss)}"
+                if removed:
+                    msg += f"  •  ⚠️ Đã loại **{len(removed)}** entry"
+                if added:
+                    msg += f"  •  ➕ Thêm **{len(added)}**"
+                cols[0].caption(msg)
+                if removed:
+                    if cols[1].button("↩️ Khôi phục", key="word_glossary_restore",
+                                      help="Reset glossary về kết quả phân tích ban đầu"):
+                        a["glossary"] = dict(initial)
+                        st.session_state["word_analysis"] = a
+                        st.session_state["word_glossary_editor_ver"] = gver + 1
+                        st.rerun()
 
         # Glossary export/import — always shown so user can import even when empty
         gcolA, gcolB = st.columns(2)
@@ -966,15 +1007,15 @@ def _render_editor():
 def _clear_state():
     for k in SS_KEYS:
         st.session_state.pop(k, None)
-    st.session_state.pop("word_translated_bytes_cache", None)
-    st.session_state.pop("word_translations_version", None)
-    st.session_state.pop("word_validation", None)
-    st.session_state.pop("word_role_toggles", None)
-    st.session_state.pop("word_skip_roles", None)
+    for k in ("word_translated_bytes_cache", "word_translations_version",
+              "word_validation", "word_role_toggles", "word_skip_roles",
+              "word_glossary_editor_ver", "word_image_ocr",
+              "word_review_df", "word_review_df_version",
+              "word_batch_result"):
+        st.session_state.pop(k, None)
     for k in list(st.session_state.keys()):
-        if k.startswith("word_editor") or k in ("word_only_missed_filter",
-                                                  "word_show_hf_filter",
-                                                  "word_glossary_editor"):
+        if k.startswith("word_editor") or k.startswith("word_glossary_editor") \
+                or k in ("word_only_missed_filter", "word_show_hf_filter"):
             st.session_state.pop(k, None)
     st.session_state["word_editor_version"] = 0
     # KHÔNG xóa "word_tm" — TM persist xuyên suốt session
@@ -1036,20 +1077,67 @@ def _run_batch(uploaded_files, lang_word):
             "Trạng thái": list(file_status.values()),
         })
 
+    # Lưu kết quả vào session_state để hiện summary + download persist qua rerun
     if results:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for fname, data in results.items():
                 zf.writestr(fname.replace(".docx", f"_{lang_word[:2]}.docx"), data)
         buf.seek(0)
-        st.download_button(
+        st.session_state["word_batch_result"] = {
+            "zip_bytes": buf.getvalue(),
+            "zip_name":  f"translated_{lang_word[:8]}.zip",
+            "status":    dict(file_status),
+            "lang":      lang_word,
+            "ok_count":  sum(1 for v in file_status.values() if v.startswith("✅")),
+            "fail_count": sum(1 for v in file_status.values() if v.startswith("❌")),
+        }
+    else:
+        # Mọi file đều fail — vẫn lưu status để hiển thị
+        st.session_state["word_batch_result"] = {
+            "zip_bytes": None, "zip_name": None,
+            "status":    dict(file_status),
+            "lang":      lang_word,
+            "ok_count":  0,
+            "fail_count": sum(1 for v in file_status.values() if v.startswith("❌")),
+        }
+
+
+def _render_batch_result():
+    """Render summary + download cho batch result đã chạy xong (persist qua rerun)."""
+    res = st.session_state.get("word_batch_result")
+    if not res:
+        return
+
+    n = len(res["status"])
+    if res["fail_count"] == 0:
+        st.success(f"✅ Batch xong: {res['ok_count']}/{n} file dịch thành công.")
+    elif res["ok_count"] == 0:
+        st.error(f"❌ Batch fail: 0/{n} file thành công.")
+    else:
+        st.warning(f"⚠️ Batch xong: {res['ok_count']}/{n} thành công, "
+                   f"{res['fail_count']}/{n} fail.")
+
+    # Status table
+    st.table({
+        "File":       list(res["status"].keys()),
+        "Trạng thái": list(res["status"].values()),
+    })
+
+    cols = st.columns([3, 1])
+    if res["zip_bytes"]:
+        cols[0].download_button(
             "⬇️ Tải ZIP tất cả file đã dịch",
-            data=buf.getvalue(),
-            file_name=f"translated_{lang_word[:8]}.zip",
+            data=res["zip_bytes"],
+            file_name=res["zip_name"],
             mime="application/zip",
             use_container_width=True,
             key="word_batch_zip_dl",
         )
+    if cols[1].button("🗑 Xoá kết quả batch", use_container_width=True,
+                      key="word_batch_clear"):
+        st.session_state.pop("word_batch_result", None)
+        st.rerun()
 
 
 def render():
@@ -1080,10 +1168,19 @@ def render():
     if uploaded_files and len(uploaded_files) > 1:
         if st.button("📚  Dịch tất cả file (batch)", use_container_width=True,
                      type="primary", key="word_batch_btn"):
+            st.session_state.pop("word_batch_result", None)
             _run_batch(uploaded_files, lang_word)
-        elif not st.session_state.get("word_batch_zip_dl"):
+            st.rerun()
+        elif "word_batch_result" not in st.session_state:
             st.info(f"📁 Đã chọn {len(uploaded_files)} file — bấm **Dịch tất cả file (batch)** để dịch.")
+        if "word_batch_result" in st.session_state:
+            st.divider()
+            _render_batch_result()
         return  # don't show single-file UI when batch
+
+    # Single-file mode: nếu batch result còn → clear (user vừa giảm xuống 1 file)
+    if uploaded_files and len(uploaded_files) <= 1 and "word_batch_result" in st.session_state:
+        st.session_state.pop("word_batch_result", None)
 
     # ── 2 NÚT: Dịch cơ bản / Dịch nâng cao ───────────────────────────────
     col_basic, col_adv = st.columns(2)
@@ -1245,8 +1342,9 @@ def render():
                     new_tr  = row["translation"]
                     if new_tr and new_tr != orig_tr:
                         translations[row["id"]] = new_tr
-                        # Also save to TM
-                        tm[tm_key(row["original"], target_lang)] = new_tr
+                        # Also save to TM với role-specific key
+                        tm[tm_key(row["original"], target_lang,
+                                  row.get("role", ""))] = new_tr
                         changed += 1
                 if changed:
                     st.session_state["word_translations"] = translations
