@@ -15,11 +15,14 @@ Mọi logic backend & UI chi tiết nằm trong các module riêng:
 """
 import streamlit as st
 
+import config
 import styles
 import auth
 import pdf_tab
 import word_tab
-import review_tab
+
+if config.REVIEW_TAB_ENABLED:
+    import review_tab  # noqa: F401  (đang ngủ — bật qua config.REVIEW_TAB_ENABLED)
 
 
 st.set_page_config(
@@ -45,12 +48,19 @@ with col_lo:
 st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_pdf, tab_word, tab_review = st.tabs([
-    "📄 Dịch PDF", "📝 Dịch Word", "🔍 So sánh / Đánh giá"
-])
-with tab_pdf:
-    pdf_tab.render()
-with tab_word:
-    word_tab.render()
-with tab_review:
-    review_tab.render()
+if config.REVIEW_TAB_ENABLED:
+    tab_pdf, tab_word, tab_review = st.tabs([
+        "📄 Dịch PDF", "📝 Dịch Word", "🔍 So sánh / Đánh giá"
+    ])
+    with tab_pdf:
+        pdf_tab.render()
+    with tab_word:
+        word_tab.render()
+    with tab_review:
+        review_tab.render()
+else:
+    tab_pdf, tab_word = st.tabs(["📄 Dịch PDF", "📝 Dịch Word"])
+    with tab_pdf:
+        pdf_tab.render()
+    with tab_word:
+        word_tab.render()
