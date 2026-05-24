@@ -1085,35 +1085,32 @@ def render():
             st.info(f"📁 Đã chọn {len(uploaded_files)} file — bấm **Dịch tất cả file (batch)** để dịch.")
         return  # don't show single-file UI when batch
 
-    # ── PHASE 1: Phân tích ────────────────────────────────────────────────
-    col_a, col_b = st.columns(2)
-    with col_a:
-        analyze_clicked = st.button(
-            "🔬  Phân tích + Glossary",
+    # ── 2 NÚT: Dịch cơ bản / Dịch nâng cao ───────────────────────────────
+    col_basic, col_adv = st.columns(2)
+    with col_basic:
+        basic_clicked = st.button(
+            "🚀  Dịch cơ bản",
             disabled=(uploaded_docx is None),
-            use_container_width=True, key="word_analyze",
-            help="Extract paragraphs + build glossary từ thuật ngữ lặp lại",
+            use_container_width=True, type="primary", key="word_basic",
+            help="Dịch nhanh với cài đặt mặc định — không cần chọn gì thêm",
         )
-    with col_b:
-        # Quick mode: phân tích + dịch luôn (skip glossary review)
-        quick_clicked = st.button(
-            "⚡  Phân tích & dịch luôn",
+    with col_adv:
+        advanced_clicked = st.button(
+            "⚙️  Dịch nâng cao",
             disabled=(uploaded_docx is None),
-            use_container_width=True, key="word_quick",
-            help="Dùng glossary auto-build, không cần review",
+            use_container_width=True, key="word_advanced",
+            help="Xem stats + chỉnh glossary, role, custom rules, TM... trước khi dịch",
         )
 
-    if analyze_clicked:
+    if basic_clicked:
         _clear_state()
         _run_analysis(uploaded_docx, lang_word)
-
-    if quick_clicked:
-        _clear_state()
-        _run_analysis(uploaded_docx, lang_word)
-        # Sau analysis xong, session_state["word_analysis"] đã có
-        # Trigger Phase 2 ngay — nhưng cần rerun trước để UI hiển thị analysis
-        # Quick mode set flag → Phase 1 done → render() check flag → run Phase 2
+        # Cơ bản = phân tích + dịch luôn, không show option
         st.session_state["word_quick_mode"] = True
+
+    if advanced_clicked:
+        _clear_state()
+        _run_analysis(uploaded_docx, lang_word)
 
     # ── PHASE 1 RESULT: stats + glossary editor + Dịch button ───────────
     if "word_analysis" in st.session_state:
