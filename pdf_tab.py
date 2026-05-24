@@ -542,87 +542,136 @@ def render():
                                 placeholder="Vd: 1-5,8  •  Để trống = tất cả",
                                 key="pdf_pages")
 
-    with st.expander("⚙️ Tuỳ chọn nâng cao", expanded=False):
-        c1, c2 = st.columns(2)
-        use_parallel = c1.checkbox(
-            "⚡ Dịch song song nhiều trang",
-            value=True, key="pdf_parallel",
-            help="Tăng tốc đáng kể với PDF nhiều trang. Tắt nếu muốn xem live timer từng trang.",
-        )
-        parallel_workers = c2.slider(
-            "Số worker song song", 2, 8, 4, key="pdf_workers",
-            disabled=not use_parallel,
-        )
-        use_glossary = st.checkbox(
-            "📚 Tự build glossary để dịch consistent",
-            value=True, key="pdf_glossary",
-            help="Phát hiện thuật ngữ lặp lại và đảm bảo dịch nhất quán xuyên suốt tài liệu.",
-        )
-        use_tm = st.checkbox(
-            "💾 Translation Memory (cache giữa các lần dịch)",
-            value=True, key="pdf_use_tm",
-            help="Cache bản dịch trong session — dòng đã dịch lần sau sẽ reuse, không tốn API call. Share giữa các file PDF khi batch mode.",
-        )
-        use_checkpoint = st.checkbox(
-            "♻️ Auto-checkpoint (resume nếu bị gián đoạn)",
-            value=True, key="pdf_checkpoint",
-            help="Lưu state sau mỗi trang. Nếu crash/disconnect, lần sau chạy lại sẽ resume từ trang cuối thay vì làm lại từ đầu.",
-        )
-        use_skip_toc = st.checkbox(
-            "⏭ Skip TOC / References / Index",
-            value=False, key="pdf_skip_toc",
-            help="Tự phát hiện trang mục lục, danh mục tham khảo, phụ lục — bỏ qua không dịch để tiết kiệm token.",
-        )
-        use_scanned_ocr = st.checkbox(
-            "🔎 Tự OCR trang scan (không có text layer)",
-            value=True, key="pdf_scanned_ocr",
-            help="Phát hiện trang chỉ chứa ảnh (PDF scan/photo). Tự OCR + dịch bằng Gemini Vision, chèn 1 trang text dịch ngay sau mỗi trang scan.",
-        )
-        use_ocr = st.checkbox(
-            "🖼 OCR text trong ảnh embedded",
-            value=False, key="pdf_ocr",
-            help="Trích ảnh từ PDF, OCR + dịch text trong ảnh, chèn vào PDF dưới dạng annotation màu vàng.",
-        )
-        use_bilingual = st.checkbox(
-            "📑 Xuất thêm PDF song ngữ (gốc + dịch xen kẽ)",
-            value=False, key="pdf_bilingual",
-            help="Tạo thêm 1 file PDF có pages xen kẽ: trang gốc → trang dịch → trang gốc...",
-        )
-        use_quality_check = st.checkbox(
-            "🔍 Quality check sau khi dịch",
-            value=True, key="pdf_qc",
-            help="Tự động phát hiện: số bị mất, dòng quá dài/ngắn bất thường, dòng chưa dịch.",
-        )
-
-        st.markdown("---")
-        st.markdown("**📝 Custom translation rules** *(tuỳ chọn)*")
-        custom_rules = st.text_area(
-            "Hướng dẫn dịch riêng cho tài liệu này",
-            value="", key="pdf_custom_rules", height=80,
-            placeholder="Vd: Dịch formal, giữ nguyên các thuật ngữ IT bằng tiếng Anh, dùng đại từ 'chúng tôi'...",
-        )
-        st.markdown("**📖 Custom glossary** *(tuỳ chọn)*")
-        custom_glossary_text = st.text_area(
-            "Mỗi dòng: source = target  (hoặc source,target  /  source -> target)",
-            value="", key="pdf_custom_glossary", height=100,
-            placeholder="API = giao diện lập trình\nendpoint = điểm cuối\nrequest -> yêu cầu",
-        )
-
-        tm_count = len(st.session_state.get("pdf_tm", {}))
-        if tm_count > 0:
-            cc1, cc2 = st.columns([3, 1])
-            cc1.caption(f"💾 TM hiện có **{tm_count:,}** entry")
-            if cc2.button("🗑 Xoá TM", key="pdf_clear_tm"):
-                st.session_state["pdf_tm"] = {}
-                st.rerun()
-
     st.divider()
-
     n_files = len(uploaded_pdfs or [])
-    btn_label = (f"▶  Bắt đầu dịch {n_files} file PDF" if n_files > 1
-                 else "▶  Bắt đầu dịch PDF")
 
-    if st.button(btn_label, disabled=(n_files == 0), key="pdf_run"):
+    # ── 2 NÚT: Dịch cơ bản / Dịch nâng cao ───────────────────────────────────
+    show_adv = st.session_state.get("pdf_show_advanced", False)
+    col_basic, col_adv = st.columns(2)
+    with col_basic:
+        basic_label = (f"🚀  Dịch cơ bản ({n_files} file)" if n_files > 1
+                       else "🚀  Dịch cơ bản")
+        basic_clicked = st.button(
+            basic_label,
+            disabled=(n_files == 0),
+            use_container_width=True, type="primary", key="pdf_basic_btn",
+            help="Dịch ngay với cài đặt mặc định — không cần chọn gì thêm",
+        )
+    with col_adv:
+        adv_label = "🔽  Ẩn tuỳ chọn nâng cao" if show_adv else "⚙️  Dịch nâng cao"
+        adv_toggle_clicked = st.button(
+            adv_label,
+            disabled=(n_files == 0),
+            use_container_width=True, key="pdf_adv_toggle",
+            help="Tuỳ chỉnh glossary, TM, OCR ảnh, custom rules, song ngữ... trước khi dịch",
+        )
+    if adv_toggle_clicked:
+        st.session_state["pdf_show_advanced"] = not show_adv
+        st.rerun()
+
+    # ── Defaults cho cả hai mode ─────────────────────────────────────────────
+    opts = dict(
+        use_parallel=True,
+        use_glossary=True,
+        use_ocr=False,
+        use_tm=True,
+        use_bilingual=False,
+        use_quality_check=True,
+        use_skip_toc=False,
+        use_checkpoint=True,
+        use_scanned_ocr=True,
+        custom_rules="",
+        custom_glossary_text="",
+        parallel_workers=4,
+    )
+
+    start_advanced_clicked = False
+
+    # ── Advanced mode: hiện expander với options + nút Bắt đầu riêng ─────────
+    if show_adv:
+        with st.container(border=True):
+            st.markdown("##### ⚙️ Tuỳ chọn nâng cao")
+            c1, c2 = st.columns(2)
+            opts["use_parallel"] = c1.checkbox(
+                "⚡ Dịch song song nhiều trang",
+                value=True, key="pdf_parallel",
+                help="Tăng tốc đáng kể với PDF nhiều trang.",
+            )
+            opts["parallel_workers"] = c2.slider(
+                "Số worker song song", 2, 8, 4, key="pdf_workers",
+                disabled=not opts["use_parallel"],
+            )
+            opts["use_glossary"] = st.checkbox(
+                "📚 Tự build glossary để dịch consistent",
+                value=True, key="pdf_glossary",
+                help="Phát hiện thuật ngữ lặp lại và đảm bảo dịch nhất quán xuyên suốt tài liệu.",
+            )
+            opts["use_tm"] = st.checkbox(
+                "💾 Translation Memory (cache giữa các lần dịch)",
+                value=True, key="pdf_use_tm",
+                help="Cache bản dịch trong session — dòng đã dịch lần sau sẽ reuse, không tốn API call.",
+            )
+            opts["use_checkpoint"] = st.checkbox(
+                "♻️ Auto-checkpoint (resume nếu bị gián đoạn)",
+                value=True, key="pdf_checkpoint",
+                help="Lưu state sau mỗi trang để resume khi crash/disconnect.",
+            )
+            opts["use_skip_toc"] = st.checkbox(
+                "⏭ Skip TOC / References / Index",
+                value=False, key="pdf_skip_toc",
+                help="Tự phát hiện trang mục lục/tham khảo/phụ lục, bỏ qua để tiết kiệm token.",
+            )
+            opts["use_scanned_ocr"] = st.checkbox(
+                "🔎 Tự OCR trang scan (không có text layer)",
+                value=True, key="pdf_scanned_ocr",
+                help="OCR + dịch trang scan bằng Gemini Vision, chèn 1 trang dịch sau mỗi trang scan.",
+            )
+            opts["use_ocr"] = st.checkbox(
+                "🖼 OCR text trong ảnh embedded",
+                value=False, key="pdf_ocr",
+                help="Trích ảnh từ PDF, OCR + dịch text trong ảnh, chèn vào PDF dưới dạng annotation.",
+            )
+            opts["use_bilingual"] = st.checkbox(
+                "📑 Xuất thêm PDF song ngữ (gốc + dịch xen kẽ)",
+                value=False, key="pdf_bilingual",
+            )
+            opts["use_quality_check"] = st.checkbox(
+                "🔍 Quality check sau khi dịch",
+                value=True, key="pdf_qc",
+                help="Tự phát hiện số bị mất, dòng quá dài/ngắn, dòng chưa dịch.",
+            )
+
+            st.markdown("---")
+            st.markdown("**📝 Custom translation rules** *(tuỳ chọn)*")
+            opts["custom_rules"] = st.text_area(
+                "Hướng dẫn dịch riêng cho tài liệu này",
+                value="", key="pdf_custom_rules", height=80,
+                placeholder="Vd: Dịch formal, giữ thuật ngữ IT bằng tiếng Anh, dùng đại từ 'chúng tôi'...",
+            )
+            st.markdown("**📖 Custom glossary** *(tuỳ chọn)*")
+            opts["custom_glossary_text"] = st.text_area(
+                "Mỗi dòng: source = target  (hoặc source,target  /  source -> target)",
+                value="", key="pdf_custom_glossary", height=100,
+                placeholder="API = giao diện lập trình\nendpoint = điểm cuối\nrequest -> yêu cầu",
+            )
+
+            tm_count = len(st.session_state.get("pdf_tm", {}))
+            if tm_count > 0:
+                cc1, cc2 = st.columns([3, 1])
+                cc1.caption(f"💾 TM hiện có **{tm_count:,}** entry")
+                if cc2.button("🗑 Xoá TM", key="pdf_clear_tm"):
+                    st.session_state["pdf_tm"] = {}
+                    st.rerun()
+
+            adv_btn_label = (f"▶  Bắt đầu dịch {n_files} file PDF" if n_files > 1
+                             else "▶  Bắt đầu dịch (nâng cao)")
+            start_advanced_clicked = st.button(
+                adv_btn_label, disabled=(n_files == 0), type="primary",
+                use_container_width=True, key="pdf_advanced_run",
+            )
+
+    # ── Trigger dịch (basic dùng defaults, advanced dùng opts đã chỉnh) ──────
+    if basic_clicked or start_advanced_clicked:
         for k in ("pdf_bytes", "pdf_out_name", "pdf_summary",
                   "pdf_bilingual_bytes", "pdf_quality_issues",
                   "pdf_batch_zip", "pdf_batch_name",
@@ -630,25 +679,10 @@ def render():
                   "pdf_lang_used"):
             st.session_state.pop(k, None)
 
-        common_kwargs = dict(
-            use_parallel=use_parallel,
-            use_glossary=use_glossary,
-            use_ocr=use_ocr,
-            use_tm=use_tm,
-            use_bilingual=use_bilingual,
-            use_quality_check=use_quality_check,
-            use_skip_toc=use_skip_toc,
-            use_checkpoint=use_checkpoint,
-            use_scanned_ocr=use_scanned_ocr,
-            custom_rules=custom_rules,
-            custom_glossary_text=custom_glossary_text,
-            parallel_workers=parallel_workers,
-        )
-
         if n_files == 1:
-            _run_pdf_translation(uploaded_pdfs[0], lang_pdf, pages_s, **common_kwargs)
+            _run_pdf_translation(uploaded_pdfs[0], lang_pdf, pages_s, **opts)
         else:
-            _run_batch_pdf_translation(uploaded_pdfs, lang_pdf, pages_s, **common_kwargs)
+            _run_batch_pdf_translation(uploaded_pdfs, lang_pdf, pages_s, **opts)
 
     if "pdf_bytes" in st.session_state:
         st.divider()
