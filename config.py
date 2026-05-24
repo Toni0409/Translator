@@ -5,6 +5,10 @@ import streamlit as st
 API_KEY      = st.secrets.get("GEMINI_API_KEY", "")
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 
+# ── Feature flags ─────────────────────────────────────────────────────────────
+# Tắt tab "So sánh / Đánh giá" — đang ngủ, chưa dùng. Bật lại bằng True.
+REVIEW_TAB_ENABLED = False
+
 # ── PDF ───────────────────────────────────────────────────────────────────────
 PDF_MODEL    = "gemini-2.5-flash"
 PRICE_INPUT  = 0.10       # USD / 1M input tokens (sẽ ×10 vì model tier)
