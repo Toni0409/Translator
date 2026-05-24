@@ -10,7 +10,7 @@ APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 REVIEW_TAB_ENABLED = False
 
 # ── PDF ───────────────────────────────────────────────────────────────────────
-PDF_MODEL    = "gemini-2.5-flash"
+PDF_MODEL    = "gemini-3.5-flash"
 PRICE_INPUT  = 0.10       # USD / 1M input tokens (sẽ ×10 vì model tier)
 PRICE_OUTPUT = 0.40       # USD / 1M output tokens
 USD_TO_VND   = 25_400
@@ -37,6 +37,7 @@ BOLD_FONT_PAIRS = [
 
 # ── Word ──────────────────────────────────────────────────────────────────────
 WORD_MODELS = [
+    "gemini-3.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
