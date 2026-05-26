@@ -1,6 +1,6 @@
 """
-Translator App — PDF + Word [Streamlit]
-Entry point: set page config, inject CSS, kiểm tra password, render 2 tab.
+Translator App — Word [Streamlit]
+Entry point: set page config, inject CSS, kiểm tra password, render tab Word.
 
 Mọi logic backend & UI chi tiết nằm trong các module riêng:
 - config.py        : hằng số (API key, model, ngôn ngữ, ...)
@@ -8,18 +8,22 @@ Mọi logic backend & UI chi tiết nằm trong các module riêng:
 - auth.py          : password gate + logout
 - gemini.py        : Gemini client + JSON parser + thread helper
 - ui_common.py     : timer box, log adder, stat box
-- pdf_backend.py   : extract / translate / render PDF
-- pdf_tab.py       : UI tab PDF
 - word_backend.py  : extract / translate / render DOCX
 - word_tab.py      : UI tab Word
+
+Các module đang ngủ (bật lại qua feature flag trong config.py):
+- pdf_backend.py / pdf_tab.py   : PDF_TAB_ENABLED
+- review_*.py                   : REVIEW_TAB_ENABLED
 """
 import streamlit as st
 
 import config
 import styles
 import auth
-import pdf_tab
 import word_tab
+
+if config.PDF_TAB_ENABLED:
+    import pdf_tab  # noqa: F401  (đang ngủ — bật qua config.PDF_TAB_ENABLED)
 
 if config.REVIEW_TAB_ENABLED:
     import review_tab  # noqa: F401  (đang ngủ — bật qua config.REVIEW_TAB_ENABLED)
@@ -39,7 +43,7 @@ if not auth.check_password():
 st.markdown("## ⬡ Translator")
 st.markdown(
     "<span style='color:#64748b;font-size:0.9rem'>"
-    "PDF & Word — Powered by Gemini — Vi Nguyen</span>",
+    "Word — Powered by Gemini — Vi Nguyen</span>",
     unsafe_allow_html=True,
 )
 _, col_lo = st.columns([6, 1])
@@ -48,19 +52,24 @@ with col_lo:
 st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
+tab_labels = []
+tab_renderers = []
+
+if config.PDF_TAB_ENABLED:
+    tab_labels.append("📄 Dịch PDF")
+    tab_renderers.append(pdf_tab.render)
+
+tab_labels.append("📝 Dịch Word")
+tab_renderers.append(word_tab.render)
+
 if config.REVIEW_TAB_ENABLED:
-    tab_pdf, tab_word, tab_review = st.tabs([
-        "📄 Dịch PDF", "📝 Dịch Word", "🔍 So sánh / Đánh giá"
-    ])
-    with tab_pdf:
-        pdf_tab.render()
-    with tab_word:
-        word_tab.render()
-    with tab_review:
-        review_tab.render()
+    tab_labels.append("🔍 So sánh / Đánh giá")
+    tab_renderers.append(review_tab.render)
+
+if len(tab_labels) == 1:
+    # Chỉ còn 1 tab → render trực tiếp, không cần st.tabs
+    tab_renderers[0]()
 else:
-    tab_pdf, tab_word = st.tabs(["📄 Dịch PDF", "📝 Dịch Word"])
-    with tab_pdf:
-        pdf_tab.render()
-    with tab_word:
-        word_tab.render()
+    for tab, render in zip(st.tabs(tab_labels), tab_renderers):
+        with tab:
+            render()

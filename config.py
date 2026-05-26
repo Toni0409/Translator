@@ -8,6 +8,8 @@ APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Tắt tab "So sánh / Đánh giá" — đang ngủ, chưa dùng. Bật lại bằng True.
 REVIEW_TAB_ENABLED = False
+# Tắt tab "Dịch PDF" — chỉ giữ Dịch Word. Bật lại bằng True.
+PDF_TAB_ENABLED = False
 
 # ── PDF ───────────────────────────────────────────────────────────────────────
 PDF_MODEL    = "gemini-3.5-flash"
