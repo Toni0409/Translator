@@ -1,11 +1,8 @@
 """
-Streamlit UI cho tab Word — 2-phase flow.
+Streamlit UI cho tab Word — one-click translation flow.
 
-Phase 1 (Phân tích):
-  extract → glossary build → show stats + glossary editor + TM preview
-
-Phase 2 (Dịch):
-  TM lookup → chunk còn lại → translate parallel → merge TM + new → apply
+Flow:
+  upload → direction → analyze → translate parallel → validate → download
 """
 import io
 import time
@@ -16,7 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from config import (
-    LANGUAGES, LANG_EN, TRANSLATION_DIRECTIONS,
+    LANG_EN, TRANSLATION_DIRECTIONS,
     MAX_WORD_WORKERS, NO_TRANSLATE_ROLES,
 )
 from gemini import get_client
@@ -221,8 +218,8 @@ def _run_translation(chunks, target_lang, doc_context,
 # ══════════════════════════════════════════════════════════════════════════════
 def _run_analysis(uploaded_docx, lang_word, source_lang: str, target_lang: str):
     """
-    Phase 1: extract + build glossary + TM preview.
-    Lưu kết quả vào session_state["word_analysis"], xong rerun để show editor.
+    Phase 1: extract + build glossary.
+    Lưu kết quả vào session_state["word_analysis"], xong rerun để dịch tự động.
     """
     st.markdown("### 🔬 Phân tích tài liệu")
     log_ph    = st.empty()
@@ -282,7 +279,7 @@ def _run_analysis(uploaded_docx, lang_word, source_lang: str, target_lang: str):
             if seed and new_from_ai > 0:
                 add_log(f"📖 Glossary: {len(seed)} seed + {new_from_ai} AI = {len(glossary)} term")
             else:
-                add_log(f"📖 Tìm thấy {len(glossary)} thuật ngữ — review/sửa ở dưới rồi dịch")
+                add_log(f"📖 Tìm thấy {len(glossary)} thuật ngữ — sẽ áp dụng khi dịch")
         else:
             add_log("📖 Không có thuật ngữ lặp đủ ngưỡng — bỏ qua glossary")
 
@@ -315,7 +312,7 @@ def _run_analysis(uploaded_docx, lang_word, source_lang: str, target_lang: str):
         for k in ("word_blocks", "word_translations", "word_summary"):
             st.session_state.pop(k, None)
         st.session_state.pop("word_translated_bytes_cache", None)
-        add_log("✅ Phân tích xong — kéo xuống review glossary + bấm **Dịch**")
+        add_log("✅ Phân tích xong — bắt đầu dịch")
         time.sleep(0.3)
         st.rerun()
 
@@ -885,7 +882,7 @@ def _clear_state():
               "word_validation", "word_role_toggles", "word_skip_roles",
               "word_glossary_editor_ver",
               "word_image_ocr", "word_ocr_state",
-              "word_batch_result"):
+              "word_batch_result", "word_auto_translate", "word_quick_mode"):
         st.session_state.pop(k, None)
     for k in list(st.session_state.keys()):
         if k.startswith("word_glossary_editor"):
@@ -1057,43 +1054,31 @@ def render():
     if uploaded_files and len(uploaded_files) <= 1 and "word_batch_result" in st.session_state:
         st.session_state.pop("word_batch_result", None)
 
-    # ── 2 NÚT: Dịch cơ bản / Dịch nâng cao ───────────────────────────────
-    col_basic, col_adv = st.columns(2)
-    with col_basic:
-        basic_clicked = st.button(
-            "🚀  Dịch cơ bản",
-            disabled=(uploaded_docx is None),
-            use_container_width=True, type="primary", key="word_basic",
-            help="Dịch nhanh với cài đặt mặc định — không cần chọn gì thêm",
-        )
-    with col_adv:
-        advanced_clicked = st.button(
-            "⚙️  Dịch nâng cao",
-            disabled=(uploaded_docx is None),
-            use_container_width=True, key="word_advanced",
-            help="Xem stats + chỉnh glossary, role, custom rules, TM... trước khi dịch",
-        )
+    translate_clicked = st.button(
+        "🚀  Dịch",
+        disabled=(uploaded_docx is None),
+        use_container_width=True,
+        type="primary",
+        key="word_translate",
+        help="Phân tích tài liệu rồi dịch ngay với glossary kỹ thuật tự động",
+    )
 
-    if basic_clicked:
+    if translate_clicked:
         _clear_state()
-        # Cơ bản = phân tích + dịch luôn. Set quick-mode TRƯỚC khi
-        # _run_analysis() trigger st.rerun() (nếu set sau, flag bị mất).
-        st.session_state["word_quick_mode"] = True
+        # Set before _run_analysis() because that function triggers st.rerun().
+        st.session_state["word_auto_translate"] = True
         _run_analysis(uploaded_docx, lang_word, source_lang, target_lang)
 
-    if advanced_clicked:
-        _clear_state()
-        _run_analysis(uploaded_docx, lang_word, source_lang, target_lang)
-
-    # ── PHASE 1 RESULT: stats + glossary editor + Dịch button ───────────
+    # ── PHASE 1 RESULT: auto-start translation ──────────────────────────
     if "word_analysis" in st.session_state:
         st.divider()
-        # Quick mode: trigger Phase 2 ngay
-        if st.session_state.pop("word_quick_mode", False):
+        if st.session_state.pop("word_auto_translate", False):
             _run_full_translation()
-            st.rerun()
+            if "word_translations" in st.session_state:
+                st.rerun()
         else:
-            _render_analysis_panel()
+            # Remove stale analysis from older advanced-flow sessions.
+            st.session_state.pop("word_analysis", None)
 
     # ── PHASE 2 RESULT: download + rescan + OCR ─────────────────────────
     if "word_translations" in st.session_state:

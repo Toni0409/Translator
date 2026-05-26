@@ -262,6 +262,9 @@ Goal: document future work and leave the repo easy to continue.
   - `tests/_helpers.py`: made smoke output safe for legacy Windows consoles via ASCII/backslashreplace, and replaced Pillow-generated images with static PNG bytes to remove hidden dependency.
   - `tests/run_smoke.py`: switched runner summary output to ASCII.
   - Verify: py_compile OK, pip check OK, smoke run all-green (5 scripts, 56 checks), git diff --check OK, no active PDF/Review imports, no real secrets found.
+- 2026-05-27, UI simplification on `dev`:
+  - Removed the user-facing `Dịch nâng cao` path. Single-file mode now has one primary `Dịch` button that analyzes, translates, validates, and shows download/OCR actions.
+  - README updated to document the one-click flow instead of basic/advanced translation.
 
 ## Current State
 
