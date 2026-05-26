@@ -248,6 +248,26 @@ Các nhóm hiện có:
 - `smoke_docx.py` — extract/apply/validate DOCX, media preservation
 - `smoke_domain.py` — detect domain, seed glossary, doc context domain rules
 - `smoke_checkpoint.py` — checkpoint path portable + save/load/clear
+- `smoke_ocr.py` — cost helpers (tile/token), prompt builder (source_lang + domain + glossary), occurrence extraction, caption selection + dedupe + edit override, overlay Pillow render, replace-by-occurrence với clone media khi shared
+
+---
+
+## 🖼 OCR ảnh trong DOCX
+
+Sau khi dịch xong, expander **OCR & dịch text trong ảnh** cho 3 bước:
+
+1. **Quét ảnh & ước tính chi phí** — liệt kê occurrence (mỗi `r:embed` trong `<w:p>` là 1 occurrence; cùng ảnh dùng nhiều nơi vẫn ra nhiều occurrence), hiển thị USD/VND ước tính theo kích thước ảnh × giá Gemini Vision.
+2. **Xác nhận chi phí + chạy OCR** — Gemini Vision OCR + dịch song song, lưu actual cost per-image từ `usage_metadata` + aggregate batch.
+3. **Review & xuất**:
+   - Mỗi ảnh: checkbox **Đưa vào file xuất**, checkbox **Giữ ảnh gốc** (caption mode), text_area chỉnh bản dịch.
+   - Nhóm "Không phát hiện chữ / lỗi" collapsed riêng, default không chọn.
+   - Chọn tất cả / bỏ chọn tất cả.
+   - Output mode (radio):
+     - **Đưa text dưới ảnh** (default): chèn caption `[OCR] <text>` ngay dưới mỗi ảnh được chọn, italic, căn giữa. Dedupe khi xuất lại nhiều lần. Có thể chọn xoá ảnh gốc (chỉ giữ caption).
+     - **Dịch trực tiếp trên ảnh**: che chữ gốc trong từng vùng OCR (Pillow `ImageDraw`, fill bằng avg color của vùng), vẽ bản dịch lên đúng bbox. Không làm song ngữ trên ảnh. Ảnh thiếu bbox → fallback caption per-image.
+   - Replace ảnh trong DOCX theo **occurrence** — khi ảnh dùng nhiều chỗ (cùng `rId`), clone media file mới + tạo rId mới cho occurrence sau lần đầu, đảm bảo không thay nhầm ảnh khác.
+
+File download riêng: `*_translated_<lang>_ocr_caption.docx` hoặc `*_translated_<lang>_ocr_overlay.docx`.
 
 ---
 
@@ -258,6 +278,7 @@ Các nhóm hiện có:
 - `python-docx` — DOCX parsing + writing
 - `pandas` — `data_editor` cho tab Word
 - `lxml` — DOCX XML manipulation
+- `Pillow` — image overlay rendering (OCR overlay mode) + đọc kích thước ảnh để estimate tokens
 
 ---
 
