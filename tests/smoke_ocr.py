@@ -154,6 +154,60 @@ try:
     report.check("edited_translations override base translation",
                  b"[OCR] EDITED TEXT" in doc_xml)
 
+    # ── T4b: font Unicode tiếng Việt (anti-square-glyph) ────────────────
+    try:
+        from PIL import ImageFont
+        from word_backend import (
+            _font_supports_vi, overlay_font_status, _resolve_font_path,
+            OverlayFontError,
+        )
+
+        # `_font_supports_vi` phải return True cho font có Vietnamese glyph
+        # (test với font Unicode đã resolve, không test load_default vì Pillow ≥10
+        # default font cũng support VN — version-dependent).
+        # Font ResolveAPI nên trả path hợp lệ (nếu env có font Unicode)
+        path = _resolve_font_path()
+        if path:
+            f = ImageFont.truetype(path, size=20)
+            report.check("resolved font supports Vietnamese",
+                         _font_supports_vi(f),
+                         f"font: {path}")
+        else:
+            report.check("env has Unicode-capable font installed",
+                         False,
+                         "no font found — render overlay sẽ raise OverlayFontError")
+
+        status = overlay_font_status()
+        report.check("overlay_font_status returns {ok, path, supports_vi}",
+                     "ok" in status and "path" in status and "supports_vi" in status,
+                     f"status={status}")
+
+        # render_translated_overlay raise OverlayFontError khi font thiếu —
+        # giả lập bằng monkeypatch _resolve_font_path
+        import word_backend as _wb
+        orig = _wb._resolve_font_path
+        try:
+            _wb._FONT_PATH_CACHE[0] = None
+            _wb._resolve_font_path = lambda: None
+            try:
+                from PIL import Image
+                buf = io.BytesIO()
+                Image.new("RGB", (200, 150), (255, 255, 255)).save(buf, "PNG")
+                _wb.render_translated_overlay(
+                    buf.getvalue(), "image/png",
+                    regions=[{"bbox": [0.1, 0.1, 0.8, 0.3], "translation": "Xin chào"}],
+                )
+                report.check("render_translated_overlay raises when no font", False,
+                             "expected OverlayFontError")
+            except OverlayFontError:
+                report.check("render_translated_overlay raises OverlayFontError "
+                             "when no Unicode font", True)
+        finally:
+            _wb._resolve_font_path = orig
+            _wb._FONT_PATH_CACHE[0] = None
+    except ImportError:
+        pass
+
     # ── T5: overlay rendering with Pillow ────────────────────────────────
     try:
         import PIL  # noqa: F401

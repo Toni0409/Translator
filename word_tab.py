@@ -1335,7 +1335,7 @@ def _render_ocr_review(state: dict):
     state["mode"] = "overlay" if mode.startswith("Dịch trực tiếp") else "caption"
 
     if state["mode"] == "overlay":
-        # Check Pillow availability + bbox confidence
+        # Check Pillow availability
         try:
             import PIL  # noqa: F401
             pillow_ok = True
@@ -1344,6 +1344,22 @@ def _render_ocr_review(state: dict):
         if not pillow_ok:
             st.warning("⚠️ Mode overlay cần Pillow — hãy cài `pip install Pillow`. "
                        "Tạm thời sẽ fallback caption.")
+        # Check font hỗ trợ tiếng Việt
+        from word_backend import overlay_font_status
+        fs = overlay_font_status()
+        if not fs["ok"]:
+            st.error(
+                "❌ Hệ thống KHÔNG có font Unicode hỗ trợ tiếng Việt → overlay "
+                "sẽ render chữ thành ô vuông (như screenshot user gửi). "
+                "Cài 1 trong các font sau rồi reload app:\n\n"
+                "- Linux/Streamlit Cloud: `sudo apt install fonts-dejavu fonts-noto` "
+                "(hoặc thêm vào `packages.txt`)\n"
+                "- macOS: thường có sẵn Arial/Helvetica — kiểm tra `/System/Library/Fonts/`\n"
+                "- Windows: cài Arial / Calibri\n\n"
+                "Nếu xuất bây giờ, các ảnh overlay sẽ tự fallback sang caption mode."
+            )
+        elif fs["path"]:
+            st.caption(f"🔤 Font overlay: `{fs['path']}`")
         bbox_missing = [o for o in with_text
                         if state["selection"].get(o["id"])
                         and not results.get(o["id"], {}).get("regions")]
@@ -1435,10 +1451,23 @@ def _render_ocr_review(state: dict):
 
             if mode == "overlay":
                 try:
-                    from word_backend import replace_docx_image_occurrences, render_translated_overlay
+                    from word_backend import (
+                        replace_docx_image_occurrences, render_translated_overlay,
+                        overlay_font_status, OverlayFontError,
+                    )
                     overlay_ok = True
                 except Exception:
                     overlay_ok = False
+                # Pre-check font tiếng Việt — nếu thiếu → ALL ảnh fallback caption
+                font_status = overlay_font_status() if overlay_ok else {"ok": False}
+                if overlay_ok and not font_status["ok"]:
+                    st.warning(
+                        "⚠️ Không tìm thấy font Unicode hỗ trợ tiếng Việt → "
+                        "toàn bộ ảnh sẽ fallback sang caption mode để không bị "
+                        "render ô vuông."
+                    )
+                    overlay_ok = False
+
                 # Build replacements: every selected occ with regions → overlay;
                 # những ảnh thiếu regions → fallback caption
                 if overlay_ok:
@@ -1458,6 +1487,11 @@ def _render_ocr_review(state: dict):
                                 edited_translation=edited.get(o["id"], ""),
                             )
                             replacements[o["id"]] = (new_bytes, new_ct)
+                        except OverlayFontError:
+                            # Font biến mất giữa preflight và export → fallback hết
+                            caption_fallback_ids.extend([s["id"] for s in selected])
+                            replacements.clear()
+                            break
                         except Exception as e:
                             st.warning(f"Overlay fail cho {o['filename']}: {e}; fallback caption.")
                             caption_fallback_ids.append(o["id"])
@@ -1465,16 +1499,16 @@ def _render_ocr_review(state: dict):
                     out_bytes = replace_docx_image_occurrences(
                         base_bytes, state["occurrences"], replacements,
                     )
-                    # Apply caption cho ảnh fallback
-                    if caption_fallback_ids:
+                    # Apply caption cho ảnh fallback (loại trùng selected_id)
+                    fallback_unique = list(dict.fromkeys(caption_fallback_ids))
+                    if fallback_unique:
                         out_bytes = insert_ocr_captions_into_docx(
                             out_bytes, state["occurrences"], state["results"],
-                            selected_ids=caption_fallback_ids,
+                            selected_ids=fallback_unique,
                             edited_translations=edited,
                         )
                     suffix = "_ocr_overlay"
                 else:
-                    st.warning("Pillow chưa cài — fallback caption mode.")
                     out_bytes = insert_ocr_captions_into_docx(
                         base_bytes, state["occurrences"], state["results"],
                         selected_ids=selected_ids,

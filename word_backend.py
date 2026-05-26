@@ -1963,21 +1963,146 @@ def extract_images_from_docx(docx_bytes: bytes) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 # OVERLAY RENDER (P4.2 — Pillow)
 # ══════════════════════════════════════════════════════════════════════════════
-def _pick_font(target_h: int):
-    """Tìm font TrueType có sẵn, cỡ ~target_h. Fallback default bitmap font."""
-    from PIL import ImageFont
-    candidates = [
+# Sample chars để verify font có hỗ trợ tiếng Việt không (ă, đ, ơ, ờ, ự, ỳ).
+_VI_CHECK = "ăđơờựỳ"
+
+
+def _font_supports_vi(font) -> bool:
+    """True nếu font render được toàn bộ ký tự tiếng Việt mẫu (có glyph)."""
+    try:
+        for ch in _VI_CHECK:
+            mask = font.getmask(ch)
+            bbox = mask.getbbox()
+            if bbox is None:   # mask rỗng → glyph thiếu (Pillow render ô vuông)
+                return False
+        return True
+    except Exception:
+        return False
+
+
+# Cache path font đã chọn xong (qua fc-match / scan) để khỏi tìm lại mỗi render.
+_FONT_PATH_CACHE: list[str | None] = [None]
+_FONT_WARN_CACHE: list[bool] = [False]
+
+
+def _candidate_font_paths() -> list[str]:
+    """Tập hợp đường dẫn font ứng viên — covers Linux/macOS/Windows + Pillow's
+    name-based search.
+    """
+    paths: list[str] = []
+    # 1. Pillow name-based search (Pillow ≥9 quét system font dirs)
+    paths.extend([
+        "DejaVuSans.ttf", "NotoSans-Regular.ttf", "FreeSans.ttf",
+        "LiberationSans-Regular.ttf", "Arial.ttf", "arial.ttf",
+        "Calibri.ttf", "Verdana.ttf",
+    ])
+    # 2. Linux absolute paths (Debian/Ubuntu, RHEL/Fedora, Arch)
+    paths.extend([
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    ])
+    # 3. macOS
+    paths.extend([
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/Library/Fonts/Arial.ttf",
-        "C:/Windows/Fonts/arial.ttf",
         "/System/Library/Fonts/Helvetica.ttc",
-    ]
-    for path in candidates:
+    ])
+    # 4. Windows
+    paths.extend([
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/calibri.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+    ])
+    return paths
+
+
+def _fc_match_paths() -> list[str]:
+    """Dùng `fc-match` (Linux/Mac) tìm font sans phù hợp tiếng Việt."""
+    out: list[str] = []
+    try:
+        import subprocess
+        for query in ("sans:lang=vi", "sans-serif", "Noto Sans", "DejaVu Sans"):
+            r = subprocess.run(["fc-match", "-f", "%{file}", query],
+                               capture_output=True, text=True, timeout=2)
+            if r.returncode == 0 and r.stdout.strip():
+                out.append(r.stdout.strip())
+    except Exception:
+        pass
+    return out
+
+
+def _matplotlib_dejavu_path() -> str | None:
+    """Nếu matplotlib (hoặc PIL bundle) có DejaVuSans, trả path. Optional."""
+    try:
+        import matplotlib  # type: ignore
+        p = os.path.join(os.path.dirname(matplotlib.__file__),
+                         "mpl-data/fonts/ttf/DejaVuSans.ttf")
+        if os.path.exists(p):
+            return p
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_font_path() -> str | None:
+    """Tìm font path đầu tiên render được tiếng Việt. None nếu KHÔNG có font hợp lệ."""
+    if _FONT_PATH_CACHE[0] is not None:
+        return _FONT_PATH_CACHE[0]
+    from PIL import ImageFont
+
+    for p in _candidate_font_paths() + _fc_match_paths():
         try:
-            return ImageFont.truetype(path, size=max(10, int(target_h)))
+            f = ImageFont.truetype(p, size=20)
+            if _font_supports_vi(f):
+                _FONT_PATH_CACHE[0] = p
+                return p
         except Exception:
             continue
+    mp = _matplotlib_dejavu_path()
+    if mp:
+        try:
+            f = ImageFont.truetype(mp, size=20)
+            if _font_supports_vi(f):
+                _FONT_PATH_CACHE[0] = mp
+                return mp
+        except Exception:
+            pass
+    return None
+
+
+def overlay_font_status() -> dict:
+    """Public helper cho UI: trạng thái font overlay hiện tại.
+
+    Returns {"ok": bool, "path": str|None, "supports_vi": bool}.
+    """
+    path = _resolve_font_path()
+    return {"ok": path is not None, "path": path, "supports_vi": path is not None}
+
+
+def _pick_font(target_h: int):
+    """Tìm font TrueType cỡ ~target_h, ƯU TIÊN font render được tiếng Việt.
+
+    Lần đầu chạy: scan candidate paths + fc-match. Cache path tìm được.
+    Nếu không có font Unicode hợp lệ → trả `load_default()` (bitmap, không
+    render được tiếng Việt — caller nên check `overlay_font_status()` trước).
+    """
+    from PIL import ImageFont
+    size = max(10, int(target_h))
+    path = _resolve_font_path()
+    if path:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except Exception:
+            pass
+    # Last-resort fallback — known to BREAK Vietnamese rendering.
+    if not _FONT_WARN_CACHE[0]:
+        _FONT_WARN_CACHE[0] = True
     return ImageFont.load_default()
 
 
@@ -2062,6 +2187,11 @@ def _fit_font_size(text: str, max_w: int, max_h: int,
     return font, lines, line_h
 
 
+class OverlayFontError(RuntimeError):
+    """Không tìm được font hỗ trợ tiếng Việt cho overlay render."""
+    pass
+
+
 def render_translated_overlay(
     image_bytes: bytes,
     content_type: str,
@@ -2076,6 +2206,9 @@ def render_translated_overlay(
     text region đó (user đã chỉnh text dịch). Với nhiều regions, edited text không
     áp được per-region nên giữ regions nguyên.
 
+    Raise `OverlayFontError` khi system KHÔNG có font Unicode (sẽ render ô vuông) —
+    caller phải fallback caption mode.
+
     Trả (new_bytes, new_content_type). Mode overlay luôn output PNG để giữ alpha.
     """
     from PIL import Image, ImageDraw
@@ -2084,6 +2217,14 @@ def render_translated_overlay(
     if not regions:
         # Nothing to overlay — return original
         return image_bytes, content_type
+
+    # Validate font có hỗ trợ tiếng Việt — nếu không thì raise để caller fallback
+    if _resolve_font_path() is None:
+        raise OverlayFontError(
+            "Không tìm thấy font Unicode hỗ trợ tiếng Việt trên hệ thống "
+            "(DejaVuSans / NotoSans / Arial / LiberationSans...). "
+            "Cài thêm font hoặc dùng mode caption."
+        )
 
     im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     W, H = im.size
