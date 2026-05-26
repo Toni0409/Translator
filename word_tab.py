@@ -12,6 +12,7 @@ import time
 import threading
 import zipfile
 
+import pandas as pd
 import streamlit as st
 
 from config import (
@@ -893,7 +894,8 @@ def _clear_state():
         st.session_state.pop(k, None)
     for k in ("word_translated_bytes_cache", "word_translations_version",
               "word_validation", "word_role_toggles", "word_skip_roles",
-              "word_glossary_editor_ver", "word_image_ocr",
+              "word_glossary_editor_ver",
+              "word_image_ocr", "word_ocr_state",
               "word_batch_result"):
         st.session_state.pop(k, None)
     for k in list(st.session_state.keys()):
@@ -1163,74 +1165,7 @@ def render():
             )
 
         # 4) OCR — section riêng, tách biệt (user dùng thường xuyên)
-        with st.expander("🖼  OCR & dịch text trong ảnh", expanded=False):
-            st.caption(
-                "Quét tất cả ảnh trong DOCX, OCR chữ và dịch sang ngôn ngữ đích. "
-                "Xử lý song song — có thể tốn thêm chi phí Gemini Vision."
-            )
-            if st.button("🔍 Quét và dịch ảnh", key="word_ocr_btn"):
-                from word_backend import extract_images_from_docx, ocr_and_translate_images
-                imgs = extract_images_from_docx(st.session_state["word_docx_bytes"])
-                if not imgs:
-                    st.info("Không có ảnh trong DOCX.")
-                else:
-                    progress_bar = st.progress(0, text=f"Đang OCR 0/{len(imgs)} ảnh...")
-                    _ocr_counter = [0]
-
-                    def _on_progress(done, total):
-                        _ocr_counter[0] = done
-                        progress_bar.progress(done / total,
-                                              text=f"Đang OCR {done}/{total} ảnh...")
-
-                    ocr_target = st.session_state.get("word_target_lang") \
-                                 or LANG_EN[st.session_state["word_lang"]]
-                    results = ocr_and_translate_images(
-                        get_client(), imgs,
-                        ocr_target,
-                        progress_callback=_on_progress,
-                    )
-                    progress_bar.empty()
-                    st.session_state["word_image_ocr"] = (imgs, results)
-
-            if "word_image_ocr" in st.session_state:
-                imgs, results = st.session_state["word_image_ocr"]
-                shown = 0
-                for img in imgs:
-                    r = results.get(img["id"], {})
-                    if not r.get("has_text"):
-                        continue
-                    shown += 1
-                    with st.container(border=True):
-                        c1, c2 = st.columns([1, 2])
-                        c1.image(img["data"], width=200, caption=img["filename"])
-                        c2.markdown(f"**OCR (gốc):**\n```\n{r['ocr']}\n```")
-                        c2.markdown(f"**Dịch:**\n```\n{r['translation']}\n```")
-                        if r.get("error"):
-                            c2.warning(f"⚠️ Lỗi: {r['error']}")
-
-                errors = [r for r in results.values() if r.get("error") and not r.get("has_text")]
-                if shown == 0 and not errors:
-                    st.info(f"Đã quét {len(imgs)} ảnh — không phát hiện text.")
-                if errors:
-                    st.warning(f"⚠️ {len(errors)} ảnh gặp lỗi khi OCR.")
-
-                if shown > 0:
-                    if st.checkbox("📎 Chèn bản dịch OCR vào file DOCX output", key="word_ocr_insert"):
-                        from word_backend import insert_ocr_captions_into_docx
-                        base_bytes = _get_cached_translated_bytes()
-                        ocr_docx = insert_ocr_captions_into_docx(base_bytes, imgs, results)
-                        out_name_ocr = st.session_state["word_filename"].replace(
-                            ".docx",
-                            f"_translated_{st.session_state['word_lang'][:2]}_ocr.docx",
-                        )
-                        st.download_button(
-                            label="⬇️  Tải Word đã dịch + OCR caption",
-                            data=ocr_docx,
-                            file_name=out_name_ocr,
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            use_container_width=True,
-                            key="word_ocr_download",
-                        )
+        _render_ocr_section()
 
         # 5) Tiny status — 1 dòng caption, không expander
         summary_line = st.session_state.get("word_summary", "")
@@ -1246,3 +1181,361 @@ def render():
 
     elif not uploaded_files:
         st.info("👆 Vui lòng upload file Word (.docx) để bắt đầu")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OCR SECTION (P2.1, P2.2, P3.1, U1-U4)
+# ══════════════════════════════════════════════════════════════════════════════
+def _ocr_state() -> dict:
+    """Lazy-init `word_ocr_state` (P0.2 — single source of truth)."""
+    if "word_ocr_state" not in st.session_state:
+        st.session_state["word_ocr_state"] = {
+            "occurrences":   [],
+            "results":       {},
+            "selection":     {},   # occ_id → bool (đưa vào output)
+            "keep_original": {},   # occ_id → bool (giữ ảnh gốc, caption mode)
+            "edited":        {},   # occ_id → str (bản dịch user sửa)
+            "estimate":      None,
+            "mode":          "caption",  # "caption" | "overlay"
+            "phase":         "idle",     # idle | preflight | done
+        }
+    return st.session_state["word_ocr_state"]
+
+
+def _reset_ocr_state():
+    st.session_state.pop("word_ocr_state", None)
+
+
+def _render_ocr_section():
+    from word_backend import (
+        extract_image_occurrences, estimate_ocr_cost,
+        ocr_and_translate_images,
+        insert_ocr_captions_into_docx,
+    )
+
+    state = _ocr_state()
+    phase = state["phase"]
+
+    with st.expander("🖼  OCR & dịch text trong ảnh", expanded=False):
+        # ── Phase: idle → run preflight ───────────────────────────────
+        if phase == "idle":
+            if st.button("📊 Quét ảnh & ước tính chi phí",
+                         key="word_ocr_preflight_btn",
+                         use_container_width=True):
+                occs = extract_image_occurrences(st.session_state["word_docx_bytes"])
+                state["occurrences"] = occs
+                state["estimate"]    = estimate_ocr_cost(occs)
+                state["phase"]       = "preflight"
+                # Default: tick mọi ảnh ≥ ngưỡng
+                state["selection"] = {
+                    o["id"]: (len(o["data"]) >= 5_000) for o in occs
+                }
+                state["keep_original"] = {o["id"]: True for o in occs}
+                st.rerun()
+            else:
+                st.caption(
+                    "Quét tất cả ảnh trong DOCX, OCR chữ và dịch sang ngôn ngữ đích. "
+                    "Bước 1: ước tính chi phí. Bước 2: chạy OCR. Bước 3: review + xuất."
+                )
+
+        # ── Phase: preflight → confirm + run OCR ──────────────────────
+        elif phase == "preflight":
+            est = state["estimate"]
+            occs = state["occurrences"]
+            if not occs:
+                st.info("Không có ảnh trong DOCX.")
+                if st.button("↩️ Đóng", key="word_ocr_close_empty"):
+                    _reset_ocr_state()
+                    st.rerun()
+            else:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Ảnh tổng", f"{est['n_total']:,}")
+                c2.metric("Sẽ OCR", f"{est['n_to_ocr']:,}",
+                          help=f"Skip {est['n_skipped']:,} ảnh nhỏ < 5KB (icon/decor)")
+                c3.metric("Ước tính", f"${est['usd']:.4f}",
+                          help=f"≈ {est['vnd']:,.0f} VND  ·  "
+                               f"{est['input_tokens']:,} in / {est['output_tokens']:,} out tokens")
+
+                st.caption(
+                    "Ước tính tính theo kích thước ảnh × giá Gemini Vision. "
+                    "Chi phí thực tế lấy từ `usage_metadata` sau khi chạy xong."
+                )
+
+                confirm = st.checkbox(
+                    "✅ Tôi đồng ý chạy OCR và phát sinh chi phí Gemini",
+                    key="word_ocr_confirm_cost",
+                )
+                cc1, cc2 = st.columns([3, 1])
+                if cc1.button("🚀 Chạy OCR", disabled=not confirm,
+                              type="primary", use_container_width=True,
+                              key="word_ocr_run_btn"):
+                    _run_ocr(state)
+                    st.rerun()
+                if cc2.button("↩️ Huỷ", use_container_width=True,
+                              key="word_ocr_cancel_btn"):
+                    _reset_ocr_state()
+                    st.rerun()
+
+        # ── Phase: done → review + export ─────────────────────────────
+        elif phase == "done":
+            _render_ocr_review(state)
+
+
+def _run_ocr(state: dict):
+    """Chạy OCR cho occurrences trong state, lưu results + actual cost."""
+    from word_backend import ocr_and_translate_images
+
+    occs = state["occurrences"]
+    if not occs:
+        state["phase"] = "done"
+        return
+
+    n_to_ocr = state["estimate"]["n_to_ocr"]
+    progress_bar = st.progress(0, text=f"Đang OCR 0/{n_to_ocr} ảnh...")
+
+    def _on_progress(done, total):
+        progress_bar.progress(min(done / max(total, 1), 1.0),
+                              text=f"Đang OCR {done}/{total} ảnh...")
+
+    source_lang = st.session_state.get("word_source_lang") or _resolve_langs()[1]
+    target_lang = (st.session_state.get("word_target_lang")
+                   or LANG_EN[st.session_state["word_lang"]])
+    glossary    = st.session_state.get("word_glossary")
+    subdomains  = st.session_state.get("word_subdomains") or set()
+
+    results = ocr_and_translate_images(
+        get_client(), occs,
+        target_lang=target_lang,
+        source_lang=source_lang,
+        glossary=glossary,
+        subdomains=subdomains,
+        progress_callback=_on_progress,
+    )
+    progress_bar.empty()
+
+    state["results"] = results
+    # Init `edited` từ translation; selection tick những ảnh có text.
+    state["edited"]    = {o["id"]: results.get(o["id"], {}).get("translation", "")
+                          for o in occs}
+    state["selection"] = {
+        o["id"]: bool(results.get(o["id"], {}).get("has_text"))
+        for o in occs
+    }
+    state["phase"] = "done"
+
+
+def _render_ocr_review(state: dict):
+    """P2.1+P2.2+U2+U3+U4: review từng occurrence + chọn mode + download."""
+    occs    = state["occurrences"]
+    results = state["results"]
+    total   = results.get("_total", {})
+
+    # Summary actual cost
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1.metric("Ảnh OCR", f"{total.get('n_called', 0):,}")
+    sc2.metric("Tokens", f"{total.get('tok_in', 0):,} in / {total.get('tok_out', 0):,} out")
+    sc3.metric("USD", f"${total.get('usd', 0):.4f}")
+    sc4.metric("VND", f"{total.get('vnd', 0):,.0f}")
+
+    # Group: có text / không text + lỗi
+    with_text = [o for o in occs if results.get(o["id"], {}).get("has_text")]
+    no_text   = [o for o in occs
+                 if not results.get(o["id"], {}).get("has_text")
+                 and not results.get(o["id"], {}).get("error")]
+    errors    = [o for o in occs if results.get(o["id"], {}).get("error")]
+
+    # Bulk select buttons
+    if with_text:
+        b1, b2, _ = st.columns([1, 1, 2])
+        if b1.button("✅ Chọn tất cả ảnh có chữ", key="word_ocr_select_all"):
+            for o in with_text:
+                state["selection"][o["id"]] = True
+            st.rerun()
+        if b2.button("⬜ Bỏ chọn tất cả", key="word_ocr_deselect_all"):
+            for o in with_text:
+                state["selection"][o["id"]] = False
+            st.rerun()
+
+    # Output mode (U3)
+    mode = st.radio(
+        "Cách đưa OCR vào DOCX",
+        ["Đưa text dưới ảnh", "Dịch trực tiếp trên ảnh"],
+        horizontal=True,
+        key="word_ocr_mode",
+        help="Caption: chèn dòng dịch dưới mỗi ảnh được chọn. "
+             "Overlay: che chữ gốc trong ảnh và vẽ bản dịch lên đúng vùng.",
+    )
+    state["mode"] = "overlay" if mode.startswith("Dịch trực tiếp") else "caption"
+
+    if state["mode"] == "overlay":
+        # Check Pillow availability + bbox confidence
+        try:
+            import PIL  # noqa: F401
+            pillow_ok = True
+        except Exception:
+            pillow_ok = False
+        if not pillow_ok:
+            st.warning("⚠️ Mode overlay cần Pillow — hãy cài `pip install Pillow`. "
+                       "Tạm thời sẽ fallback caption.")
+        bbox_missing = [o for o in with_text
+                        if state["selection"].get(o["id"])
+                        and not results.get(o["id"], {}).get("regions")]
+        if bbox_missing:
+            st.info(f"📌 {len(bbox_missing)} ảnh không có bbox đáng tin → sẽ fallback "
+                    f"sang caption mode cho riêng các ảnh đó.")
+        st.caption("Chữ gốc trong vùng OCR sẽ bị che và thay bằng bản dịch — "
+                   "không làm song ngữ trên ảnh.")
+
+    st.divider()
+
+    # Per-image review (P2.1)
+    if with_text:
+        st.markdown(f"##### 📷 Ảnh có chữ — {len(with_text)}")
+        for o in with_text:
+            r = results.get(o["id"], {})
+            with st.container(border=True):
+                col_img, col_info = st.columns([1, 2])
+                with col_img:
+                    st.image(o["data"], width=220,
+                             caption=f"{o['filename']}  ·  occ #{o['occurrence_index']}")
+                    st.caption(f"Part: `{o['doc_part'].rsplit('/', 1)[-1]}`  ·  "
+                               f"rId: `{o['rId']}`")
+                    st.caption(f"💵 ${r.get('usd', 0):.4f}  ·  "
+                               f"{r.get('tok_in', 0)}+{r.get('tok_out', 0)} tok"
+                               + (f"  ·  conf {r.get('confidence', 0):.2f}"
+                                  if r.get('confidence') else ""))
+                with col_info:
+                    state["selection"][o["id"]] = st.checkbox(
+                        "📎 Đưa ảnh này vào file xuất",
+                        value=state["selection"].get(o["id"], True),
+                        key=f"word_ocr_pick_{o['id']}",
+                    )
+                    if state["mode"] == "caption":
+                        state["keep_original"][o["id"]] = st.checkbox(
+                            "🖼 Giữ ảnh gốc (caption mode)",
+                            value=state["keep_original"].get(o["id"], True),
+                            key=f"word_ocr_keep_{o['id']}",
+                        )
+                    with st.expander("📜 OCR (gốc)", expanded=False):
+                        st.text(r.get("ocr", ""))
+                    state["edited"][o["id"]] = st.text_area(
+                        "✏️ Bản dịch — chỉnh trước khi xuất:",
+                        value=state["edited"].get(o["id"], r.get("translation", "")),
+                        height=120,
+                        key=f"word_ocr_edit_{o['id']}",
+                    )
+
+    # No-text group + errors (collapsed by default — P2.1: nhóm riêng, không chọn)
+    if no_text or errors:
+        with st.expander(
+            f"⚠️ Không phát hiện chữ / lỗi — {len(no_text)} không text · {len(errors)} lỗi",
+            expanded=False,
+        ):
+            for o in no_text[:30]:
+                r = results.get(o["id"], {})
+                with st.container(border=True):
+                    c1, c2 = st.columns([1, 3])
+                    c1.image(o["data"], width=120, caption=o["filename"])
+                    c2.caption(f"Không phát hiện chữ  ·  ${r.get('usd', 0):.4f}")
+            for o in errors[:30]:
+                r = results.get(o["id"], {})
+                with st.container(border=True):
+                    c1, c2 = st.columns([1, 3])
+                    c1.image(o["data"], width=120, caption=o["filename"])
+                    c2.warning(f"Lỗi OCR: {r.get('error', '?')[:150]}")
+
+    # Export (U4)
+    st.divider()
+    selected = [o for o in occs if state["selection"].get(o["id"])]
+    st.caption(
+        f"📤 Sẽ xuất: **{len(selected)} ảnh** vào DOCX dạng "
+        f"**{('overlay' if state['mode']=='overlay' else 'caption')}** "
+        f"· chi phí actual: **${total.get('usd', 0):.4f}** ≈ {total.get('vnd', 0):,.0f} VND"
+    )
+
+    if not selected:
+        st.info("Tick chọn ít nhất 1 ảnh để xuất.")
+    else:
+        if st.button("⬇️ Xuất DOCX với OCR", type="primary",
+                     use_container_width=True, key="word_ocr_export_btn"):
+            base_bytes = _get_cached_translated_bytes()
+            mode = state["mode"]
+            selected_ids = [o["id"] for o in selected]
+            edited       = {oid: state["edited"].get(oid, "") for oid in selected_ids}
+            remove_ids   = [o["id"] for o in selected
+                            if not state["keep_original"].get(o["id"], True)
+                            and mode == "caption"]
+
+            if mode == "overlay":
+                try:
+                    from word_backend import replace_docx_image_occurrences, render_translated_overlay
+                    overlay_ok = True
+                except Exception:
+                    overlay_ok = False
+                # Build replacements: every selected occ with regions → overlay;
+                # những ảnh thiếu regions → fallback caption
+                if overlay_ok:
+                    replacements: dict[str, tuple[bytes, str]] = {}
+                    caption_fallback_ids: list[str] = []
+                    for o in selected:
+                        r = state["results"].get(o["id"], {})
+                        regions = r.get("regions") or []
+                        if not regions:
+                            caption_fallback_ids.append(o["id"])
+                            continue
+                        # Override translation in regions với edited text khi user đã sửa toàn block
+                        try:
+                            new_bytes, new_ct = render_translated_overlay(
+                                o["data"], o["content_type"],
+                                regions=regions,
+                                edited_translation=edited.get(o["id"], ""),
+                            )
+                            replacements[o["id"]] = (new_bytes, new_ct)
+                        except Exception as e:
+                            st.warning(f"Overlay fail cho {o['filename']}: {e}; fallback caption.")
+                            caption_fallback_ids.append(o["id"])
+
+                    out_bytes = replace_docx_image_occurrences(
+                        base_bytes, state["occurrences"], replacements,
+                    )
+                    # Apply caption cho ảnh fallback
+                    if caption_fallback_ids:
+                        out_bytes = insert_ocr_captions_into_docx(
+                            out_bytes, state["occurrences"], state["results"],
+                            selected_ids=caption_fallback_ids,
+                            edited_translations=edited,
+                        )
+                    suffix = "_ocr_overlay"
+                else:
+                    st.warning("Pillow chưa cài — fallback caption mode.")
+                    out_bytes = insert_ocr_captions_into_docx(
+                        base_bytes, state["occurrences"], state["results"],
+                        selected_ids=selected_ids,
+                        edited_translations=edited,
+                    )
+                    suffix = "_ocr_caption"
+            else:  # caption
+                out_bytes = insert_ocr_captions_into_docx(
+                    base_bytes, state["occurrences"], state["results"],
+                    selected_ids=selected_ids,
+                    edited_translations=edited,
+                    remove_original_ids=remove_ids,
+                )
+                suffix = "_ocr_caption"
+
+            out_name = st.session_state["word_filename"].replace(
+                ".docx",
+                f"_translated_{st.session_state['word_lang'][:2]}{suffix}.docx",
+            )
+            st.download_button(
+                label=f"📥 Tải {out_name}",
+                data=out_bytes,
+                file_name=out_name,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                key="word_ocr_download_final",
+            )
+
+    if st.button("🔁 Quét lại OCR", key="word_ocr_restart"):
+        _reset_ocr_state()
+        st.rerun()

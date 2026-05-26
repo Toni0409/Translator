@@ -1360,60 +1360,295 @@ def find_missed(blocks: list[dict], translations: dict,
 # ══════════════════════════════════════════════════════════════════════════════
 # IMAGE OCR + TRANSLATE (Gemini Vision)
 # ══════════════════════════════════════════════════════════════════════════════
-def extract_images_from_docx(docx_bytes: bytes) -> list[dict]:
-    """
-    Returns list of {id, filename, content_type, data: bytes} for every image
-    in the DOCX (word/media/* parts).
+# Image occurrence model (OCR_DEV P0.1):
+#   {
+#     "id":               "OCC_0", ..., unique per occurrence
+#     "filename":         "image1.png" (basename in word/media/)
+#     "content_type":     "image/png"
+#     "data":             bytes
+#     "doc_part":         "word/document.xml" | "word/header1.xml" | ...
+#     "rels_path":        "word/_rels/document.xml.rels" | ...
+#     "rId":              "rId7" (relationship id pointing to media)
+#     "paragraph_index":  position of <w:p> ancestor in part (0-based)
+#     "occurrence_index": 0-based among same (doc_part, rId) usages
+#     "width_px":         int | None  (decoded from image header if Pillow available)
+#     "height_px":        int | None
+#   }
+#
+# Image dùng nhiều nơi (same rId trong cùng part hoặc cùng filename khác part)
+# vẫn cho ra nhiều occurrence — user chọn occurrence nào, replace chỉ occurrence đó.
+
+_R_NS  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_W_NS  = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_XML_NS = "http://www.w3.org/XML/1998/namespace"
+
+# Doc parts có thể chứa ảnh
+_IMAGE_PARTS = (
+    "word/document.xml",
+    # header/footer/footnotes/endnotes/comments được scan động bên dưới
+)
+
+_IMG_EXTS = ("png", "jpg", "jpeg", "gif", "bmp", "webp")
+
+
+def _img_dimensions(data: bytes) -> tuple[int | None, int | None]:
+    """Return (width, height) in pixels. None khi không decode được."""
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            return im.size  # (w, h)
+    except Exception:
+        return None, None
+
+
+def _list_doc_parts(docx_bytes: bytes) -> list[tuple[str, str]]:
+    """Liệt kê các DOCX XML part có thể chứa ảnh + .rels tương ứng.
+
+    Trả [(part_path, rels_path), ...].
     """
     import zipfile
-    images = []
+    parts = []
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+        names = set(zf.namelist())
+        if "word/document.xml" in names:
+            parts.append(("word/document.xml", "word/_rels/document.xml.rels"))
+        for n in sorted(names):
+            if not n.startswith("word/"):
+                continue
+            base = n.rsplit("/", 1)[-1]
+            if base.endswith(".xml") and (base.startswith("header") or base.startswith("footer")
+                                          or base in ("footnotes.xml", "endnotes.xml", "comments.xml")):
+                rels = f"word/_rels/{base}.rels"
+                if rels in names:
+                    parts.append((n, rels))
+    return parts
+
+
+def _read_media(docx_bytes: bytes) -> dict[str, tuple[str, bytes]]:
+    """Đọc tất cả file `word/media/*` → {basename: (content_type, bytes)}."""
+    import zipfile
+    media: dict[str, tuple[str, bytes]] = {}
     with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
         for name in zf.namelist():
             if not name.startswith("word/media/") or "." not in name:
                 continue
             ext = name.rsplit(".", 1)[-1].lower()
-            if ext in ("png", "jpg", "jpeg", "gif", "bmp", "webp"):
-                mime_ext = "jpeg" if ext == "jpg" else ext
-                images.append({
-                    "id":           f"IMG_{len(images)}",
-                    "filename":     name.rsplit("/", 1)[-1],
-                    "content_type": f"image/{mime_ext}",
-                    "data":         zf.read(name),
-                })
-    return images
+            if ext not in _IMG_EXTS:
+                continue
+            mime_ext = "jpeg" if ext == "jpg" else ext
+            media[name.rsplit("/", 1)[-1]] = (f"image/{mime_ext}", zf.read(name))
+    return media
 
 
-def _ocr_single_image(client, img: dict, target_lang: str, model: str,
-                      retries: int = CHUNK_RETRIES) -> dict:
+def extract_image_occurrences(docx_bytes: bytes) -> list[dict]:
+    """B2: liệt kê mọi lần ảnh xuất hiện theo vị trí paragraph.
+
+    Trả list ImageOccurrence (shape mô tả ở đầu module). Mỗi `r:embed` trong 1
+    `<w:p>` (qua w:drawing hoặc w:pict) là một occurrence.
     """
-    Call Gemini Vision for one image with retry + exponential backoff.
-    Returns {"ocr": str, "translation": str, "has_text": bool, "error"?: str}.
-    """
-    from google.genai import types as gtypes
+    import zipfile
+    from lxml import etree
 
-    prompt = (
-        f"You are a professional OCR and translation expert. Analyze this image carefully.\n\n"
+    media = _read_media(docx_bytes)
+    if not media:
+        return []
+
+    occurrences: list[dict] = []
+    rid_used_counter: dict[tuple[str, str], int] = {}
+
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+        for part_path, rels_path in _list_doc_parts(docx_bytes):
+            try:
+                part_xml = zf.read(part_path)
+                rels_xml = zf.read(rels_path)
+            except KeyError:
+                continue
+
+            # rId → media filename (chỉ relationship trỏ tới media/)
+            rid_to_fname: dict[str, str] = {}
+            for rel in etree.fromstring(rels_xml):
+                target = rel.get("Target", "")
+                rid    = rel.get("Id", "")
+                if "media/" in target:
+                    rid_to_fname[rid] = target.split("/")[-1]
+
+            if not rid_to_fname:
+                continue
+
+            root = etree.fromstring(part_xml)
+            para_qn = f"{{{_W_NS}}}p"
+            embed_attr = f"{{{_R_NS}}}embed"
+
+            for para_idx, para in enumerate(root.iter(para_qn)):
+                for elem in para.iter():
+                    rid = elem.get(embed_attr)
+                    if not rid or rid not in rid_to_fname:
+                        continue
+                    fname = rid_to_fname[rid]
+                    if fname not in media:
+                        continue
+                    content_type, data = media[fname]
+                    occ_key = (part_path, rid)
+                    occ_idx = rid_used_counter.get(occ_key, 0)
+                    rid_used_counter[occ_key] = occ_idx + 1
+                    w, h = _img_dimensions(data)
+                    occurrences.append({
+                        "id":               f"OCC_{len(occurrences)}",
+                        "filename":         fname,
+                        "content_type":     content_type,
+                        "data":             data,
+                        "doc_part":         part_path,
+                        "rels_path":        rels_path,
+                        "rId":              rid,
+                        "paragraph_index":  para_idx,
+                        "occurrence_index": occ_idx,
+                        "width_px":         w,
+                        "height_px":        h,
+                    })
+
+    return occurrences
+
+
+# ── Cost helpers ───────────────────────────────────────────────────────────
+# Gemini Vision token model (snapshot 2026-05-26 — xem OCR_DEV.md):
+#   ≤ 384px mỗi chiều: 258 tokens
+#   > 384px: chia tile 768×768, mỗi tile 258 tokens
+_TILE_PX     = 768
+_SMALL_PX    = 384
+_TOK_PER_IMG = 258
+
+
+def estimate_image_input_tokens(width_px: int | None, height_px: int | None) -> int:
+    """Estimate input tokens cho một ảnh theo Gemini Vision model."""
+    if not width_px or not height_px:
+        # Không biết kích thước → giả định 1 tile
+        return _TOK_PER_IMG
+    if width_px <= _SMALL_PX and height_px <= _SMALL_PX:
+        return _TOK_PER_IMG
+    tiles_w = (width_px + _TILE_PX - 1) // _TILE_PX
+    tiles_h = (height_px + _TILE_PX - 1) // _TILE_PX
+    return max(1, tiles_w * tiles_h) * _TOK_PER_IMG
+
+
+def estimate_ocr_cost(occurrences: list[dict],
+                      skip_under_bytes: int = 5_000,
+                      avg_output_tokens: int = 300,
+                      prompt_overhead_tokens: int = 250) -> dict:
+    """P1.1: preflight estimate. Trả dict:
+      {
+        "n_total": N, "n_skipped": N, "n_to_ocr": N,
+        "input_tokens": N, "output_tokens": N,
+        "usd": float, "vnd": float,
+      }
+    """
+    from ui_common import calc_cost
+
+    n_total = len(occurrences)
+    to_ocr = [o for o in occurrences if len(o.get("data", b"")) >= skip_under_bytes]
+    n_skipped = n_total - len(to_ocr)
+
+    img_tokens = sum(
+        estimate_image_input_tokens(o.get("width_px"), o.get("height_px"))
+        for o in to_ocr
+    )
+    in_tokens  = img_tokens + prompt_overhead_tokens * len(to_ocr)
+    out_tokens = avg_output_tokens * len(to_ocr)
+    usd, vnd = calc_cost(in_tokens, out_tokens)
+    return {
+        "n_total":       n_total,
+        "n_skipped":     n_skipped,
+        "n_to_ocr":      len(to_ocr),
+        "input_tokens":  in_tokens,
+        "output_tokens": out_tokens,
+        "usd":           usd,
+        "vnd":           vnd,
+    }
+
+
+# ── OCR call ───────────────────────────────────────────────────────────────
+_OCR_RESPONSE_KEYS = {"has_text", "ocr", "translation", "regions", "confidence"}
+
+
+def _build_ocr_prompt(source_lang: str | None, target_lang: str,
+                      glossary: dict | None,
+                      subdomains: set[str] | None) -> str:
+    """B3: prompt OCR có direction + domain technical style + regions[bbox]."""
+    src_clause = f"from {source_lang} " if source_lang else ""
+    glossary_section = ""
+    if glossary:
+        items = list(glossary.items())[:40]
+        glossary_str = "\n".join(f"  {k} → {v}" for k, v in items)
+        glossary_section = (
+            "\nGlossary (USE THESE EXACT translations for consistency):\n"
+            f"{glossary_str}\n"
+        )
+    domain_section = ""
+    if subdomains and (subdomains & {"elevator", "escalator"}):
+        domain_section = (
+            "\nDomain: elevator/escalator engineering. Use formal technical register. "
+            "Preserve units (mm, m, m/s, kg, kN, V, Hz, °C, dB), standards "
+            "(EN 81-20, EN 81-50, ISO 22201, ASME A17.1, GB 7588, TCVN 6395), "
+            "part/drawing/revision codes (e.g. 'Rev. A', 'DWG-1234').\n"
+        )
+
+    return (
+        f"You are an expert OCR + translator. Analyze this image carefully.\n\n"
         f"TASK:\n"
-        f"1. Determine if the image contains any readable text "
-        f"(printed, handwritten, tables, charts, or diagrams with labels).\n"
+        f"1. Detect if image contains readable text (labels, captions, table cells, "
+        f"diagram annotations, equations).\n"
         f"2. If text exists:\n"
-        f"   a. Extract ALL text verbatim — preserve structure using \\n for line breaks "
-        f"and | to separate table columns.\n"
-        f"   b. Keep numbers, units, punctuation, and special characters exactly as shown.\n"
-        f"   c. Translate the extracted text to {target_lang}, maintaining the same structure.\n"
-        f"   d. For mixed-language content, translate only the non-{target_lang} portions.\n\n"
-        f"Respond ONLY as JSON (no extra keys):\n"
-        f"  if text found : {{\"has_text\": true,  \"ocr\": \"...\", \"translation\": \"...\"}}\n"
-        f"  if no text    : {{\"has_text\": false, \"ocr\": \"\",    \"translation\": \"\"}}"
+        f"   a. Extract ALL text verbatim — use \\n for line breaks, '|' to separate "
+        f"table columns.\n"
+        f"   b. Keep numbers, units, punctuation, special characters EXACTLY.\n"
+        f"   c. Translate {src_clause}to {target_lang}, preserving structure and order.\n"
+        f"   d. For each text region (label, paragraph, cell), also return bounding box "
+        f"in normalized coords (x, y, w, h are floats in [0, 1] relative to image size, "
+        f"x/y is top-left corner).\n"
+        f"   e. confidence: float [0, 1] — your confidence that bboxes are accurate.\n"
+        f"{domain_section}{glossary_section}"
+        f"\nRespond ONLY as JSON (no extra keys, no markdown):\n"
+        f"  if text found : {{\"has_text\": true, \"ocr\": \"...\", \"translation\": \"...\", "
+        f"\"regions\": [{{\"bbox\": [x, y, w, h], \"ocr\": \"...\", \"translation\": \"...\"}}], "
+        f"\"confidence\": 0.0..1.0}}\n"
+        f"  if no text    : {{\"has_text\": false, \"ocr\": \"\", \"translation\": \"\", "
+        f"\"regions\": [], \"confidence\": 1.0}}"
     )
 
+
+def _ocr_single_image(client, occ: dict, source_lang: str | None,
+                      target_lang: str, model: str,
+                      glossary: dict | None = None,
+                      subdomains: set[str] | None = None,
+                      retries: int = CHUNK_RETRIES) -> dict:
+    """B3+B4: gọi Gemini Vision, retry, trả về result + cost.
+
+    Result shape (mọi field luôn có):
+      {
+        "ocr":         str,
+        "translation": str,
+        "has_text":    bool,
+        "regions":     [{"bbox": [x,y,w,h], "ocr": str, "translation": str}, ...],
+        "confidence":  float,
+        "tok_in":      int, "tok_out": int, "total_tokens": int,
+        "usd":         float, "vnd":    float,
+        "model":       str,
+        "attempts":    int,
+        "error":       str | None,
+      }
+    """
+    from google.genai import types as gtypes
+    from ui_common import calc_cost
+
+    prompt = _build_ocr_prompt(source_lang, target_lang, glossary, subdomains)
     last_err = None
+    attempts = 0
     for attempt in range(retries):
+        attempts = attempt + 1
         try:
             response = client.models.generate_content(
                 model=model,
                 contents=[
-                    gtypes.Part.from_bytes(data=img["data"], mime_type=img["content_type"]),
+                    gtypes.Part.from_bytes(data=occ["data"], mime_type=occ["content_type"]),
                     prompt,
                 ],
                 config=gtypes.GenerateContentConfig(
@@ -1421,159 +1656,675 @@ def _ocr_single_image(client, img: dict, target_lang: str, model: str,
                     temperature=0.1,
                 ),
             )
-            data = parse_json_loose(response.text) or {}
+            data = parse_json_loose(getattr(response, "text", "")) or {}
             if not isinstance(data, dict):
                 data = {}
+            tok_in, tok_out = usage_tokens(response)
+            usd, vnd = calc_cost(tok_in, tok_out)
+            # Filter regions: only well-formed bbox
+            regions_raw = data.get("regions") or []
+            regions: list[dict] = []
+            if isinstance(regions_raw, list):
+                for r in regions_raw:
+                    if not isinstance(r, dict):
+                        continue
+                    bbox = r.get("bbox")
+                    if not (isinstance(bbox, list) and len(bbox) == 4
+                            and all(isinstance(x, (int, float)) for x in bbox)):
+                        continue
+                    regions.append({
+                        "bbox":        [float(x) for x in bbox],
+                        "ocr":         str(r.get("ocr") or "").strip(),
+                        "translation": str(r.get("translation") or "").strip(),
+                    })
             return {
-                "ocr":         str(data.get("ocr", "") or "").strip(),
-                "translation": str(data.get("translation", "") or "").strip(),
-                "has_text":    bool(data.get("has_text", False)),
+                "ocr":          str(data.get("ocr", "") or "").strip(),
+                "translation":  str(data.get("translation", "") or "").strip(),
+                "has_text":     bool(data.get("has_text", False)),
+                "regions":      regions,
+                "confidence":   float(data.get("confidence", 0.0) or 0.0),
+                "tok_in":       tok_in,
+                "tok_out":      tok_out,
+                "total_tokens": tok_in + tok_out,
+                "usd":          usd,
+                "vnd":          vnd,
+                "model":        model,
+                "attempts":     attempts,
+                "error":        None,
             }
         except Exception as e:
             last_err = str(e)
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
 
-    return {"ocr": "", "translation": "", "has_text": False, "error": last_err}
+    return {
+        "ocr": "", "translation": "", "has_text": False,
+        "regions": [], "confidence": 0.0,
+        "tok_in": 0, "tok_out": 0, "total_tokens": 0,
+        "usd": 0.0, "vnd": 0.0, "model": model,
+        "attempts": attempts, "error": last_err,
+    }
 
 
 def ocr_and_translate_images(
     client,
-    images: list[dict],
+    occurrences: list[dict],
     target_lang: str,
+    source_lang: str | None = None,
+    glossary: dict | None = None,
+    subdomains: set[str] | None = None,
     progress_callback=None,
     max_workers: int = 4,
+    skip_under_bytes: int = 5_000,
 ) -> dict:
+    """OCR + translate parallel. Trả dict {occ_id: result_dict_per_image} + key
+    "_total" chứa aggregate cost.
     """
-    OCR + translate all images in parallel using ThreadPoolExecutor.
-    Skips images < 5 KB (icons/decorations).
-    progress_callback(done, total) called after each image completes.
-    Returns {image_id: {"ocr", "translation", "has_text", "error"?}}.
-    """
-    results = {}
+    from ui_common import calc_cost
+    results: dict = {}
     model = get_working_model() or WORD_MODELS[0]
 
     to_process = []
-    for img in images:
-        if len(img["data"]) < 5000:
-            results[img["id"]] = {"ocr": "", "translation": "", "has_text": False}
+    for occ in occurrences:
+        if len(occ["data"]) < skip_under_bytes:
+            results[occ["id"]] = {
+                "ocr": "", "translation": "", "has_text": False,
+                "regions": [], "confidence": 0.0,
+                "tok_in": 0, "tok_out": 0, "total_tokens": 0,
+                "usd": 0.0, "vnd": 0.0, "model": model,
+                "attempts": 0, "error": None, "skipped": True,
+            }
         else:
-            to_process.append(img)
+            to_process.append(occ)
 
-    if not to_process:
-        return results
+    total_for_progress = len(occurrences)
 
-    done_count = 0
-    total = len(images)
-    lock = threading.Lock()
+    if to_process:
+        done_count = 0
+        lock = threading.Lock()
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(_ocr_single_image, client, occ, source_lang,
+                          target_lang, model, glossary, subdomains): occ
+                for occ in to_process
+            }
+            for future in as_completed(futures):
+                occ = futures[future]
+                try:
+                    results[occ["id"]] = future.result()
+                except Exception as e:
+                    results[occ["id"]] = {
+                        "ocr": "", "translation": "", "has_text": False,
+                        "regions": [], "confidence": 0.0,
+                        "tok_in": 0, "tok_out": 0, "total_tokens": 0,
+                        "usd": 0.0, "vnd": 0.0, "model": model,
+                        "attempts": 0, "error": str(e),
+                    }
+                with lock:
+                    done_count += 1
+                    current = done_count
+                if progress_callback:
+                    progress_callback(current, len(to_process))
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {
-            ex.submit(_ocr_single_image, client, img, target_lang, model): img
-            for img in to_process
-        }
-        for future in as_completed(futures):
-            img = futures[future]
-            try:
-                results[img["id"]] = future.result()
-            except Exception as e:
-                results[img["id"]] = {
-                    "ocr": "", "translation": "", "has_text": False,
-                    "error": str(e),
-                }
-            with lock:
-                done_count += 1
-                current = done_count
-            if progress_callback:
-                progress_callback(current, total)
-
+    # Aggregate
+    tok_in  = sum(r.get("tok_in", 0)  for r in results.values() if isinstance(r, dict))
+    tok_out = sum(r.get("tok_out", 0) for r in results.values() if isinstance(r, dict))
+    usd, vnd = calc_cost(tok_in, tok_out)
+    results["_total"] = {
+        "tok_in": tok_in, "tok_out": tok_out,
+        "usd": usd, "vnd": vnd, "model": model,
+        "n_called": len(to_process),
+        "n_skipped": len(occurrences) - len(to_process),
+        "n_total":   len(occurrences),
+    }
     return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CAPTION INSERTION (selectable) — OCR mode "đưa text dưới ảnh"
+# ══════════════════════════════════════════════════════════════════════════════
+def _find_occurrence_paragraph(part_root, rid: str, occ_idx: int):
+    """Trả về phần tử <w:p> chứa occurrence thứ `occ_idx` của `rid` trong part root."""
+    embed_attr = f"{{{_R_NS}}}embed"
+    para_qn    = f"{{{_W_NS}}}p"
+    seen = 0
+    for para in part_root.iter(para_qn):
+        # Check first <w:p> ancestor — find any descendant with this rId
+        for elem in para.iter():
+            if elem.get(embed_attr) == rid:
+                if seen == occ_idx:
+                    return para
+                seen += 1
+                break   # mỗi <w:p> đếm 1 occurrence của rId này
+    return None
 
 
 def insert_ocr_captions_into_docx(
     docx_bytes: bytes,
-    images: list[dict],
+    occurrences: list[dict],
     ocr_results: dict,
+    selected_ids: list[str] | set[str] | None = None,
+    edited_translations: dict[str, str] | None = None,
+    remove_original_ids: list[str] | set[str] | None = None,
 ) -> bytes:
-    """
-    Insert OCR translation as a styled caption paragraph after each image paragraph.
-    Only inserts for images where has_text=True and translation is non-empty.
-    Returns modified DOCX bytes (unchanged if no captions to insert).
+    """B5: chèn caption (text dịch) DƯỚI mỗi occurrence ảnh được chọn.
+
+    - `selected_ids`: chỉ chèn cho occurrence id có trong set. None = tất cả ảnh có text.
+    - `edited_translations`: {occ_id: text} — override bản dịch trước khi chèn.
+    - `remove_original_ids`: occurrence sẽ bị xoá ảnh gốc, chỉ giữ caption.
+
+    Không chèn duplicate: nếu paragraph TIẾP SAU ảnh đã có dạng `[OCR] ...` thì update
+    thay vì insert mới.
     """
     import zipfile
     from lxml import etree
 
-    fname_to_translation: dict[str, str] = {}
-    for img in images:
-        r = ocr_results.get(img["id"], {})
-        if r.get("has_text") and r.get("translation"):
-            fname_to_translation[img["filename"]] = r["translation"]
+    if selected_ids is not None:
+        selected_set = set(selected_ids)
+    else:
+        selected_set = {occ["id"] for occ in occurrences
+                        if ocr_results.get(occ["id"], {}).get("has_text")
+                        and ocr_results.get(occ["id"], {}).get("translation")}
+    edited_translations = edited_translations or {}
+    remove_set = set(remove_original_ids or ())
 
-    if not fname_to_translation:
+    if not selected_set and not remove_set:
         return docx_bytes
 
-    # rId → filename from word/_rels/document.xml.rels
+    # Group occurrences by doc_part
+    by_part: dict[str, list[dict]] = {}
+    for occ in occurrences:
+        if occ["id"] not in selected_set and occ["id"] not in remove_set:
+            continue
+        by_part.setdefault(occ["doc_part"], []).append(occ)
+
+    # Read & modify each part XML, then write back
     with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
-        rels_xml = zf.read("word/_rels/document.xml.rels")
+        parts_data: dict[str, bytes] = {n: zf.read(n) for n in zf.namelist()}
 
-    rels_root = etree.fromstring(rels_xml)
-    rid_to_caption: dict[str, str] = {}
-    for rel in rels_root:
-        target = rel.get("Target", "")
-        rid = rel.get("Id", "")
-        if "media/" in target:
-            fname = target.split("/")[-1]
-            if fname in fname_to_translation:
-                rid_to_caption[rid] = fname_to_translation[fname]
+    for part_path, occs in by_part.items():
+        if part_path not in parts_data:
+            continue
+        root = etree.fromstring(parts_data[part_path])
 
-    if not rid_to_caption:
-        return docx_bytes
+        # Reverse-order so paragraph-index doesn't shift earlier occurrences.
+        # Sort by paragraph_index desc, then occurrence_index desc.
+        occs_sorted = sorted(occs,
+                             key=lambda o: (o["paragraph_index"], o["occurrence_index"]),
+                             reverse=True)
+        for occ in occs_sorted:
+            para = _find_occurrence_paragraph(root, occ["rId"], occ["occurrence_index"])
+            if para is None:
+                continue
 
-    doc = Document(io.BytesIO(docx_bytes))
-    R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-    W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-    XML_NS = "http://www.w3.org/XML/1998/namespace"
+            # 1) Insert/replace caption (nếu occ trong selected_set)
+            if occ["id"] in selected_set:
+                tr = (edited_translations.get(occ["id"])
+                      or ocr_results.get(occ["id"], {}).get("translation", ""))
+                tr = (tr or "").strip()
+                if tr:
+                    caption_xml = _make_caption_paragraph(tr)
+                    parent = para.getparent()
+                    idx = list(parent).index(para)
+                    # Nếu paragraph kế tiếp là caption cũ (text bắt đầu "[OCR] ") → replace
+                    next_para = parent[idx + 1] if idx + 1 < len(parent) else None
+                    if next_para is not None and _is_ocr_caption(next_para):
+                        parent.remove(next_para)
+                    parent.insert(idx + 1, caption_xml)
 
-    # Collect (paragraph_element, caption_text) pairs
-    hits: list[tuple] = []
-    for para in iter_all_paragraphs(doc):
-        for elem in para._element.iter():
-            embed = elem.get(f"{{{R_NS}}}embed")
-            if embed and embed in rid_to_caption:
-                hits.append((para._element, rid_to_caption[embed]))
+            # 2) Remove ảnh gốc (nếu occ trong remove_set) — xoá w:drawing/w:pict
+            #    chứa rId của occ. Nếu paragraph chỉ có ảnh → xoá luôn paragraph.
+            if occ["id"] in remove_set:
+                _strip_drawing_with_rid(para, occ["rId"])
+                # Nếu paragraph rỗng (no text + no remaining drawing) → xoá
+                has_text = any((t.text or "").strip()
+                               for t in para.iter(f"{{{_W_NS}}}t"))
+                has_media = (para.find(f".//{{{_W_NS}}}drawing") is not None
+                             or para.find(f".//{{{_W_NS}}}pict") is not None)
+                if not has_text and not has_media:
+                    parent = para.getparent()
+                    if parent is not None:
+                        parent.remove(para)
+
+        parts_data[part_path] = etree.tostring(root, xml_declaration=True,
+                                               encoding="UTF-8", standalone=True)
+
+    # Write back DOCX
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, data in parts_data.items():
+            zout.writestr(name, data)
+    return buf.getvalue()
+
+
+def _make_caption_paragraph(text: str):
+    """Trả <w:p> styled caption: căn giữa, italic, size 9, prefix `[OCR] `."""
+    from lxml import etree
+    p   = etree.Element(f"{{{_W_NS}}}p")
+    pPr = etree.SubElement(p, f"{{{_W_NS}}}pPr")
+    jc  = etree.SubElement(pPr, f"{{{_W_NS}}}jc")
+    jc.set(f"{{{_W_NS}}}val", "center")
+
+    run = etree.SubElement(p, f"{{{_W_NS}}}r")
+    rPr = etree.SubElement(run, f"{{{_W_NS}}}rPr")
+    etree.SubElement(rPr, f"{{{_W_NS}}}i")
+    etree.SubElement(rPr, f"{{{_W_NS}}}iCs")
+    color = etree.SubElement(rPr, f"{{{_W_NS}}}color")
+    color.set(f"{{{_W_NS}}}val", "808080")
+    sz = etree.SubElement(rPr, f"{{{_W_NS}}}sz")
+    sz.set(f"{{{_W_NS}}}val", "18")
+    szCs = etree.SubElement(rPr, f"{{{_W_NS}}}szCs")
+    szCs.set(f"{{{_W_NS}}}val", "18")
+
+    t = etree.SubElement(run, f"{{{_W_NS}}}t")
+    t.text = f"[OCR] {text}"
+    t.set(f"{{{_XML_NS}}}space", "preserve")
+    return p
+
+
+def _is_ocr_caption(para_elem) -> bool:
+    """True nếu paragraph là caption [OCR] do chính app sinh ra (dedupe insertion)."""
+    for t in para_elem.iter(f"{{{_W_NS}}}t"):
+        if (t.text or "").startswith("[OCR] "):
+            return True
+    return False
+
+
+def _strip_drawing_with_rid(para_elem, rid: str) -> int:
+    """Xoá mọi w:drawing / w:pict / w:object trong `para_elem` mà tham chiếu `rid`.
+    Trả số element bị xoá.
+    """
+    embed_attr = f"{{{_R_NS}}}embed"
+    removed = 0
+    for tag in ("drawing", "pict", "object"):
+        full = f"{{{_W_NS}}}{tag}"
+        for elem in list(para_elem.iter(full)):
+            # check if any descendant has this rId
+            hit = any(d.get(embed_attr) == rid for d in elem.iter())
+            if hit:
+                parent = elem.getparent()
+                if parent is not None:
+                    parent.remove(elem)
+                    removed += 1
+    return removed
+
+
+# ── Backward-compat thin wrapper (cũ dùng filename-based) ──────────────────
+def extract_images_from_docx(docx_bytes: bytes) -> list[dict]:
+    """DEPRECATED — giữ để code cũ không lỗi. Dùng `extract_image_occurrences`."""
+    occs = extract_image_occurrences(docx_bytes)
+    # Strip per-occurrence fields, dedupe by filename → giữ shape cũ
+    seen = set()
+    out: list[dict] = []
+    for o in occs:
+        if o["filename"] in seen:
+            continue
+        seen.add(o["filename"])
+        out.append({
+            "id":           f"IMG_{len(out)}",
+            "filename":     o["filename"],
+            "content_type": o["content_type"],
+            "data":         o["data"],
+        })
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OVERLAY RENDER (P4.2 — Pillow)
+# ══════════════════════════════════════════════════════════════════════════════
+def _pick_font(target_h: int):
+    """Tìm font TrueType có sẵn, cỡ ~target_h. Fallback default bitmap font."""
+    from PIL import ImageFont
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size=max(10, int(target_h)))
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _avg_color(im, box: tuple[int, int, int, int]) -> tuple[int, int, int]:
+    """Lấy màu trung bình của vùng box từ ảnh — dùng để fill nền che chữ gốc."""
+    from PIL import ImageStat
+    x0, y0, x1, y1 = box
+    if x1 <= x0 or y1 <= y0:
+        return (255, 255, 255)
+    try:
+        region = im.crop(box).convert("RGB")
+        stat   = ImageStat.Stat(region)
+        r, g, b = (int(v) for v in stat.mean[:3])
+        return (r, g, b)
+    except Exception:
+        return (255, 255, 255)
+
+
+def _contrast_text_color(bg: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Chọn màu chữ tương phản tốt với nền (đen/trắng theo luminance)."""
+    r, g, b = bg
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    return (0, 0, 0) if lum > 140 else (255, 255, 255)
+
+
+def _wrap_text_for_box(text: str, font, max_w: int) -> list[str]:
+    """Wrap text vào chiều rộng `max_w` px theo font cho trước.
+    Trả list dòng đã wrap.
+    """
+    from PIL import ImageDraw, Image as _Image
+
+    if not text:
+        return [""]
+
+    def _measure(s: str) -> int:
+        # ImageDraw textbbox cần draw object — dùng dummy
+        dummy = _Image.new("RGB", (1, 1))
+        d = ImageDraw.Draw(dummy)
+        bbox = d.textbbox((0, 0), s, font=font)
+        return bbox[2] - bbox[0]
+
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        words = paragraph.split(" ") if paragraph else [""]
+        cur = ""
+        for w in words:
+            cand = (cur + " " + w).strip() if cur else w
+            if _measure(cand) <= max_w or not cur:
+                cur = cand
+            else:
+                lines.append(cur)
+                cur = w
+        lines.append(cur)
+    return lines
+
+
+def _fit_font_size(text: str, max_w: int, max_h: int,
+                   max_size: int = 36, min_size: int = 8):
+    """Tìm font size lớn nhất sao cho text wrap fit (max_w x max_h)."""
+    from PIL import ImageDraw, Image as _Image
+
+    if not text.strip():
+        return _pick_font(min_size), [""], 0
+
+    for size in range(max_size, min_size - 1, -1):
+        font = _pick_font(size)
+        lines = _wrap_text_for_box(text, font, max_w)
+        dummy = _Image.new("RGB", (1, 1))
+        d = ImageDraw.Draw(dummy)
+        bbox = d.textbbox((0, 0), "Mg", font=font)
+        line_h = bbox[3] - bbox[1] + 2
+        total_h = line_h * len(lines)
+        if total_h <= max_h:
+            return font, lines, line_h
+    # Final fallback: min size, accept overflow
+    font  = _pick_font(min_size)
+    lines = _wrap_text_for_box(text, font, max_w)
+    dummy = _Image.new("RGB", (1, 1))
+    d = ImageDraw.Draw(dummy)
+    bbox = d.textbbox((0, 0), "Mg", font=font)
+    line_h = bbox[3] - bbox[1] + 2
+    return font, lines, line_h
+
+
+def render_translated_overlay(
+    image_bytes: bytes,
+    content_type: str,
+    regions: list[dict],
+    edited_translation: str = "",
+    options: dict | None = None,
+) -> tuple[bytes, str]:
+    """B6: vẽ bản dịch lên đúng bbox, che chữ gốc bằng nền opaque.
+
+    `regions`: list of {"bbox": [x, y, w, h] (normalized 0..1), "translation": str}.
+    `edited_translation`: nếu non-empty và regions có 1 phần tử duy nhất → override
+    text region đó (user đã chỉnh text dịch). Với nhiều regions, edited text không
+    áp được per-region nên giữ regions nguyên.
+
+    Trả (new_bytes, new_content_type). Mode overlay luôn output PNG để giữ alpha.
+    """
+    from PIL import Image, ImageDraw
+    opts = options or {}
+
+    if not regions:
+        # Nothing to overlay — return original
+        return image_bytes, content_type
+
+    im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    W, H = im.size
+    draw = ImageDraw.Draw(im)
+
+    # Override single-region translation từ edited text khi áp được
+    regs = [dict(r) for r in regions]
+    if edited_translation and len(regs) == 1:
+        regs[0]["translation"] = edited_translation
+
+    for r in regs:
+        bbox = r.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        x, y, w, h = bbox
+        x0 = max(0, int(x * W))
+        y0 = max(0, int(y * H))
+        x1 = min(W, int((x + w) * W))
+        y1 = min(H, int((y + h) * H))
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        # 1) Che nền — fill bằng màu trung bình của vùng
+        bg = _avg_color(im, (x0, y0, x1, y1))
+        draw.rectangle([x0, y0, x1, y1], fill=bg)
+
+        text = (r.get("translation") or "").strip()
+        if not text:
+            continue
+
+        # 2) Fit font + wrap
+        pad = 2
+        max_w = max(1, x1 - x0 - 2 * pad)
+        max_h = max(1, y1 - y0 - 2 * pad)
+        font, lines, line_h = _fit_font_size(text, max_w, max_h)
+        color = _contrast_text_color(bg)
+
+        # 3) Vẽ từng dòng căn trái-top trong bbox
+        cy = y0 + pad
+        for line in lines:
+            if cy + line_h > y1:
                 break
-
-    # Insert captions in document order (reverse to preserve indices)
-    for para_el, caption_text in reversed(hits):
-        parent = para_el.getparent()
-        idx = list(parent).index(para_el)
-
-        p = etree.Element(f"{{{W_NS}}}p")
-
-        pPr = etree.SubElement(p, f"{{{W_NS}}}pPr")
-        jc = etree.SubElement(pPr, f"{{{W_NS}}}jc")
-        jc.set(f"{{{W_NS}}}val", "center")
-
-        run = etree.SubElement(p, f"{{{W_NS}}}r")
-        rPr = etree.SubElement(run, f"{{{W_NS}}}rPr")
-        etree.SubElement(rPr, f"{{{W_NS}}}i")
-        etree.SubElement(rPr, f"{{{W_NS}}}iCs")
-        color = etree.SubElement(rPr, f"{{{W_NS}}}color")
-        color.set(f"{{{W_NS}}}val", "808080")
-        sz = etree.SubElement(rPr, f"{{{W_NS}}}sz")
-        sz.set(f"{{{W_NS}}}val", "18")
-        szCs = etree.SubElement(rPr, f"{{{W_NS}}}szCs")
-        szCs.set(f"{{{W_NS}}}val", "18")
-
-        t = etree.SubElement(run, f"{{{W_NS}}}t")
-        t.text = f"[OCR] {caption_text}"
-        t.set(f"{{{XML_NS}}}space", "preserve")
-
-        parent.insert(idx + 1, p)
+            draw.text((x0 + pad, cy), line, font=font, fill=color)
+            cy += line_h
 
     buf = io.BytesIO()
-    doc.save(buf)
+    im.save(buf, format="PNG")
+    return buf.getvalue(), "image/png"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REPLACE IMAGE BY OCCURRENCE (P4.3 — clone media part khi shared)
+# ══════════════════════════════════════════════════════════════════════════════
+def _next_media_name(existing: set[str], stem: str, ext: str) -> str:
+    """Sinh tên file media mới không trùng với `existing`."""
+    i = 1
+    while True:
+        name = f"word/media/{stem}_ocr{i}.{ext}"
+        if name not in existing:
+            return name
+        i += 1
+
+
+def _next_rid(existing: set[str]) -> str:
+    """Sinh rId mới không trùng (max suffix + 1)."""
+    max_n = 0
+    for r in existing:
+        if r.startswith("rId"):
+            try:
+                max_n = max(max_n, int(r[3:]))
+            except ValueError:
+                continue
+    return f"rId{max_n + 1}"
+
+
+def replace_docx_image_occurrences(
+    docx_bytes: bytes,
+    occurrences: list[dict],
+    replacements_by_occ_id: dict[str, tuple[bytes, str]],
+) -> bytes:
+    """B7: thay ảnh trong DOCX theo OCCURRENCE, không phải theo filename.
+
+    `replacements_by_occ_id`: {occ_id: (new_image_bytes, new_content_type)}.
+
+    Khi cùng (doc_part, rId) được tham chiếu nhiều occurrence:
+    - Occurrence ĐẦU TIÊN (cho cùng rId) sẽ overwrite media gốc → mọi occurrence
+      khác chia chung media bị thay nhầm. Để tránh, ta **clone media part + tạo
+      rId mới** cho mỗi occurrence trừ occurrence đầu tiên (occ_idx==0).
+    - Occurrence đầu tiên: overwrite media file gốc.
+    """
+    import zipfile
+    from lxml import etree
+
+    if not replacements_by_occ_id:
+        return docx_bytes
+
+    # Read all parts
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+        parts: dict[str, bytes] = {n: zf.read(n) for n in zf.namelist()}
+
+    existing_media_names = {n for n in parts if n.startswith("word/media/")}
+    # rId existing per rels_path
+    rels_rid_used: dict[str, set[str]] = {}
+    for rels_path, blob in parts.items():
+        if not rels_path.endswith(".rels"):
+            continue
+        try:
+            root = etree.fromstring(blob)
+            rels_rid_used[rels_path] = {r.get("Id", "") for r in root}
+        except Exception:
+            rels_rid_used[rels_path] = set()
+
+    # Index occurrences
+    by_id = {o["id"]: o for o in occurrences}
+
+    # Group replacements by (doc_part, rId), then ordered by occurrence_index
+    # to overwrite media gốc cho occ đầu tiên, clone cho occ sau.
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for occ_id, _payload in replacements_by_occ_id.items():
+        occ = by_id.get(occ_id)
+        if occ is None:
+            continue
+        groups.setdefault((occ["doc_part"], occ["rId"]), []).append(occ)
+    for occs in groups.values():
+        occs.sort(key=lambda o: o["occurrence_index"])
+
+    # Process replacements
+    for (doc_part, rid), occs in groups.items():
+        rels_path = occs[0]["rels_path"]
+        rels_blob = parts.get(rels_path)
+        if rels_blob is None:
+            continue
+        rels_root = etree.fromstring(rels_blob)
+        # Find current Target for this rId
+        cur_target = None
+        for r in rels_root:
+            if r.get("Id") == rid:
+                cur_target = r.get("Target", "")
+                break
+        if not cur_target:
+            continue
+
+        # Media path relative to word/ → absolute key in zip
+        if cur_target.startswith("media/"):
+            media_zip = "word/" + cur_target
+        elif cur_target.startswith("/word/media/"):
+            media_zip = cur_target.lstrip("/")
+        else:
+            media_zip = cur_target
+        if media_zip not in parts:
+            continue
+
+        # Occ đầu tiên → overwrite media gốc (vẫn an toàn vì occ này yêu cầu replace)
+        first = occs[0]
+        new_bytes, new_ct = replacements_by_occ_id[first["id"]]
+        parts[media_zip] = new_bytes
+        # Content type có thể đổi (e.g. jpg → png after overlay)
+        _update_content_types(parts, media_zip, new_ct)
+
+        # Occ sau (occurrence_index >= 1) → clone media + new rId + redirect embed
+        part_blob = parts.get(doc_part)
+        part_root = etree.fromstring(part_blob) if part_blob else None
+
+        for occ in occs[1:]:
+            new_b, new_c = replacements_by_occ_id[occ["id"]]
+            stem = first["filename"].rsplit(".", 1)[0]
+            ext  = "png" if new_c == "image/png" else first["filename"].rsplit(".", 1)[-1]
+            new_media = _next_media_name(existing_media_names, stem, ext)
+            existing_media_names.add(new_media)
+            parts[new_media] = new_b
+            _update_content_types(parts, new_media, new_c)
+            # Add relationship
+            new_rid = _next_rid(rels_rid_used[rels_path])
+            rels_rid_used[rels_path].add(new_rid)
+            rel = etree.SubElement(rels_root, "{http://schemas.openxmlformats.org/package/2006/relationships}Relationship")
+            rel.set("Id", new_rid)
+            rel.set("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image")
+            rel.set("Target", new_media.replace("word/", ""))
+            # Redirect occurrence's embed in document XML
+            if part_root is not None:
+                para = _find_occurrence_paragraph(part_root, rid, occ["occurrence_index"])
+                if para is not None:
+                    embed_attr = f"{{{_R_NS}}}embed"
+                    redirected = False
+                    for elem in para.iter():
+                        if elem.get(embed_attr) == rid and not redirected:
+                            elem.set(embed_attr, new_rid)
+                            redirected = True
+                            break
+
+        if part_root is not None:
+            parts[doc_part] = etree.tostring(part_root, xml_declaration=True,
+                                             encoding="UTF-8", standalone=True)
+        parts[rels_path] = etree.tostring(rels_root, xml_declaration=True,
+                                          encoding="UTF-8", standalone=True)
+
+    # Write back
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, data in parts.items():
+            zout.writestr(name, data)
     return buf.getvalue()
+
+
+def _update_content_types(parts: dict[str, bytes], media_path: str, new_ct: str):
+    """Cập nhật `[Content_Types].xml` để khai báo extension/content_type mới
+    nếu thay ảnh đổi định dạng (JPG → PNG sau overlay)."""
+    from lxml import etree
+    ct_name = "[Content_Types].xml"
+    if ct_name not in parts:
+        return
+    ext = media_path.rsplit(".", 1)[-1].lower()
+    if ext == "jpg":
+        ext = "jpeg"
+    try:
+        root = etree.fromstring(parts[ct_name])
+    except Exception:
+        return
+    CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+    # Check Default[Extension=ext]
+    have = False
+    for child in root:
+        tag = child.tag.split("}", 1)[-1]
+        if tag == "Default" and child.get("Extension") == ext:
+            have = True
+            break
+    if not have:
+        d = etree.SubElement(root, f"{{{CT_NS}}}Default")
+        d.set("Extension", ext)
+        d.set("ContentType", new_ct)
+        parts[ct_name] = etree.tostring(root, xml_declaration=True,
+                                        encoding="UTF-8", standalone=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
