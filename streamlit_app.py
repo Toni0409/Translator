@@ -2,7 +2,7 @@
 Translator App — Word [Streamlit]
 Entry point: set page config, inject CSS, kiểm tra password, render tab Word.
 
-Mọi logic backend & UI chi tiết nằm trong các module riêng:
+Module:
 - config.py        : hằng số (API key, model, ngôn ngữ, ...)
 - styles.py        : CSS dark theme
 - auth.py          : password gate + logout
@@ -11,22 +11,13 @@ Mọi logic backend & UI chi tiết nằm trong các module riêng:
 - word_backend.py  : extract / translate / render DOCX
 - word_tab.py      : UI tab Word
 
-Các module đang ngủ (bật lại qua feature flag trong config.py):
-- pdf_backend.py / pdf_tab.py   : PDF_TAB_ENABLED
-- review_*.py                   : REVIEW_TAB_ENABLED
+Tính năng cũ (PDF, So sánh / Đánh giá) đã chuyển vào `archive/` — không build.
 """
 import streamlit as st
 
-import config
 import styles
 import auth
 import word_tab
-
-if config.PDF_TAB_ENABLED:
-    import pdf_tab  # noqa: F401  (đang ngủ — bật qua config.PDF_TAB_ENABLED)
-
-if config.REVIEW_TAB_ENABLED:
-    import review_tab  # noqa: F401  (đang ngủ — bật qua config.REVIEW_TAB_ENABLED)
 
 
 st.set_page_config(
@@ -51,25 +42,5 @@ with col_lo:
     auth.logout_button()
 st.divider()
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_labels = []
-tab_renderers = []
-
-if config.PDF_TAB_ENABLED:
-    tab_labels.append("📄 Dịch PDF")
-    tab_renderers.append(pdf_tab.render)
-
-tab_labels.append("📝 Dịch Word")
-tab_renderers.append(word_tab.render)
-
-if config.REVIEW_TAB_ENABLED:
-    tab_labels.append("🔍 So sánh / Đánh giá")
-    tab_renderers.append(review_tab.render)
-
-if len(tab_labels) == 1:
-    # Chỉ còn 1 tab → render trực tiếp, không cần st.tabs
-    tab_renderers[0]()
-else:
-    for tab, render in zip(st.tabs(tab_labels), tab_renderers):
-        with tab:
-            render()
+# ── Word tab ──────────────────────────────────────────────────────────────────
+word_tab.render()

@@ -1,13 +1,14 @@
-# ⬡ Translator — PDF & Word
+# ⬡ Translator — Word
 
-App Streamlit dịch file **PDF** và **Microsoft Word (.docx)** sang nhiều ngôn ngữ
-bằng **Gemini**, giữ nguyên layout / format gốc.
+App Streamlit dịch file **Microsoft Word (.docx)** sang nhiều ngôn ngữ bằng
+**Gemini**, giữ nguyên layout / format gốc.
 
-- 📄 **PDF** — extract text spans → **phát hiện bảng** → dịch với context (T# R# C#)
-  → ghi lại đúng vị trí + font + màu + bold
 - 📝 **Word** — extract paragraph → **detect H/F + heuristic repeating** → dịch
   body song song (4 luồng) → preview + sửa inline → nút riêng dịch H/F
 - 🔐 Password protection · ⏱ Live timer · 🔁 Exponential backoff · 💵 Cost tracking
+
+> Các tính năng **PDF** và **So sánh / Đánh giá** đã chuyển sang `archive/` —
+> không build, không có trong active app. Giữ lại để tham khảo.
 
 ---
 
@@ -41,70 +42,42 @@ Lấy API key tại https://aistudio.google.com/apikey.
 ## 🧩 Cấu trúc module
 
 ```
-streamlit_app.py     # Entry — set config, inject CSS, render 2 tab
-config.py            # Hằng số: API key, model, prices, languages, fonts, thresholds
+streamlit_app.py     # Entry — set config, inject CSS, render tab Word
+config.py            # Hằng số: API key, model, prices, languages, thresholds
 styles.py            # CSS dark theme
 auth.py              # Password gate + logout
 gemini.py            # Shared Gemini client, JSON parser, threaded call helper
 ui_common.py         # timer_box / stat_box / log_adder / calc_cost
-pdf_backend.py       # PDF: extract_line_groups (+ table detection), translate_page
-pdf_tab.py           # PDF: Streamlit UI tab
 word_backend.py      # Word: extract_docx_blocks (+ H/F detection), translate_parallel
 word_tab.py          # Word: Streamlit UI tab
-```
 
-Mỗi file < 500 dòng, một trách nhiệm rõ ràng → AI / vibe code dễ đọc & sửa.
+archive/             # Tính năng đã bỏ — giữ lại để tham khảo
+  pdf_backend.py
+  pdf_tab.py
+  review_backend.py
+  review_tab.py
+  review_vision_backend.py
+```
 
 ### Sơ đồ phụ thuộc
 
 ```
 streamlit_app.py
   ├── styles
-  ├── auth ──────────────┐
-  ├── pdf_tab            │
-  │     ├── pdf_backend  │
-  │     │     └── gemini ┤
-  │     ├── gemini       │
-  │     ├── ui_common    │
-  │     └── config ──────┤
-  └── word_tab           │
-        ├── word_backend │
-        │     └── gemini │
-        ├── gemini       │
-        ├── ui_common    │
-        └── config ──────┘
-```
-
----
-
-## 📄 Tab PDF — chi tiết tính năng
-
-| Feature | Mô tả |
-|---|---|
-| **Layout-preserving** | Redact text gốc → in lại bản dịch vào đúng bbox cũ |
-| **Font + style** | Auto-detect font Unicode, bold flag, màu chữ giữ nguyên |
-| **Page range** | Nhập "1-5,8,10-12" để dịch page cụ thể |
-| **Table detection** | `page.find_tables()` → kèm `(T# R# C#)` vào prompt để AI dịch cell consistent |
-| **Smart prompt** | Khi có bảng → thêm rules: header row ngắn gọn, cùng cột dùng cùng thuật ngữ, giữ nguyên số/đơn vị |
-| **Live timer** | Đếm giây realtime trong lúc chờ Gemini API |
-| **Rate-limit retry** | Exponential backoff 5/10/20/40/80s khi gặp 429 |
-| **Cost tracking** | Token in/out → USD + VND realtime |
-
-### Logic table detection
-
-```
-1. page.find_tables() → list of tables (mỗi table có bbox + cells)
-2. Với mỗi line bbox, tìm cell chứa tâm dòng
-3. Group có cell info → format prompt: "[5] (T1 R2 C3) cell text"
-4. AI thấy context bảng → dịch consistent + giữ format số
-5. Bản dịch trả về vẫn theo index [0]...[N-1] — không có prefix (T# R# C#)
+  ├── auth
+  └── word_tab
+        ├── word_backend
+        │     └── gemini
+        ├── gemini
+        ├── ui_common
+        └── config
 ```
 
 ---
 
 ## 📝 Tab Word — chi tiết tính năng
 
-### Flow 2 phase (NEW)
+### Flow 2 phase
 
 ```
 [Upload + lang]
@@ -127,14 +100,14 @@ streamlit_app.py
 | **2-phase flow** | Phân tích (extract+glossary) → review glossary → Dịch. Có nút `⚡ Phân tích & dịch luôn` để skip review. |
 | **Glossary editor** | Hiển thị top-30 thuật ngữ AI suggest → user sửa/xóa/thêm trước khi dịch → bắt buộc terminology cụ thể. |
 | **Translation Memory** | Hash text + target_lang → cache. Dịch lại doc cũ = 100% TM hit, $0 API. Persist xuyên session, có nút clear. |
-| **Text-box / shapes** | NEW — extract paragraphs inside `w:txbxContent` (text-box, shape) → dịch và ghi lại đúng vị trí. |
+| **Text-box / shapes** | Extract paragraphs inside `w:txbxContent` (text-box, shape) → dịch và ghi lại đúng vị trí. |
 | **Table-aware translation** | Mỗi cell gắn prefix `(T# R# C#)` trong prompt → AI dịch consistent theo column, R1 = header ngắn gọn, giữ số/đơn vị. Auto-strip prefix ở output. |
 | **Inline format** | Bold/italic/underline encode `<b><i><u>` tags → AI preserve qua dịch → rebuild runs giữ font/size/color |
 | **Cross-chunk glossary** | 1 Gemini call build glossary → inject mọi chunk prompt → consistent terminology cross-chunk |
 | **Parallel chunks** | `ThreadPoolExecutor` dịch 4 chunk cùng lúc → giảm thời gian ~4× |
 | **Adaptive chunking** | Chia theo ký tự (~8k chars/chunk), min 8 / max 40 paragraph/chunk |
 | **Per-chunk retry** | Mỗi chunk fail sẽ retry tối đa 3 lần với backoff 1s/2s/4s |
-| **Thread-safe model fallback** | `gemini-2.5-flash-lite` → `flash` → `2.0-flash` → ... (lock-protected) |
+| **Thread-safe model fallback** | `gemini-3.5-flash` → `2.5-flash-lite` → `2.5-flash` → `2.0-flash` → ... (lock-protected) |
 | **Cached DOCX rebuild** | Version counter → `apply_translations` chỉ chạy khi translations thay đổi |
 | **H/F detection** | Detect cả H/F thật (docx structure) **và** text lặp lại ≥3 lần trong body (heuristic) |
 | **Skip H/F by default** | Lần dịch đầu chỉ làm body. Nút riêng để dịch H/F (cũng dùng TM auto) |
@@ -204,19 +177,17 @@ streamlit_app.py
 
 | Bạn muốn… | Sửa file |
 |---|---|
-| Đổi Gemini model | `config.py` → `PDF_MODEL`, `WORD_MODELS` |
+| Đổi Gemini model | `config.py` → `WORD_MODELS` (model đầu tiên = ưu tiên) |
 | Thêm ngôn ngữ | `config.py` → `LANGUAGES`, `LANG_EN` |
 | Đổi giá / tỉ giá | `config.py` → `PRICE_INPUT`, `PRICE_OUTPUT`, `USD_TO_VND` |
-| Đổi chunk size Word | `config.py` → `TARGET_CHUNK_CHARS`, `MIN_CHUNK_BLOCKS`, `MAX_CHUNK_BLOCKS` |
-| Đổi số luồng song song Word | `config.py` → `MAX_WORD_WORKERS` |
+| Đổi chunk size | `config.py` → `TARGET_CHUNK_CHARS`, `MIN_CHUNK_BLOCKS`, `MAX_CHUNK_BLOCKS` |
+| Đổi số luồng song song | `config.py` → `MAX_WORD_WORKERS` |
 | Đổi số lần retry mỗi chunk | `config.py` → `CHUNK_RETRIES` |
 | Đổi ngưỡng H/F repeating | `config.py` → `HF_REPEAT_THRESHOLD`, `HF_REPEAT_MIN_CHARS` |
 | Đổi role bị bỏ qua | `config.py` → `NO_TRANSLATE_ROLES` |
 | Đổi theme / màu | `styles.py` |
-| Tinh chỉnh prompt PDF | `pdf_backend.py` → `translate_page` |
-| Tinh chỉnh prompt Word | `word_backend.py` → `_build_chunk_prompt` |
+| Tinh chỉnh prompt | `word_backend.py` → `_build_chunk_prompt` |
 | Thay đổi heuristic H/F | `word_backend.py` → `_mark_repeating_as_hf` |
-| Thay đổi table detection | `pdf_backend.py` → `detect_tables_on_page` |
 
 ---
 
@@ -224,9 +195,9 @@ streamlit_app.py
 
 - `streamlit` — UI framework
 - `google-genai` — Gemini SDK
-- `pymupdf` (fitz) — PDF parsing + writing + table detection
 - `python-docx` — DOCX parsing + writing
 - `pandas` — `data_editor` cho tab Word
+- `lxml` — DOCX XML manipulation
 
 ---
 
@@ -235,6 +206,19 @@ streamlit_app.py
 - **Không commit** `.streamlit/secrets.toml` (đã có trong `.gitignore`).
 - App có password gate cơ bản — chỉ phù hợp dùng nội bộ. Không dùng cho production
   public mà chưa bổ sung HTTPS + rate limiting + audit log.
+
+---
+
+## 🗂 Archive
+
+Các tính năng đã ngừng dùng được giữ lại trong `archive/`:
+
+- `pdf_backend.py` + `pdf_tab.py` — dịch PDF (extract spans → translate → redact + rewrite)
+- `review_backend.py` + `review_tab.py` + `review_vision_backend.py` — so sánh/đánh giá bản dịch
+
+Để bật lại: di chuyển ra khỏi `archive/`, thêm lại import vào `streamlit_app.py`,
+restore deps trong `requirements.txt` (`pymupdf`) và `packages.txt`
+(`libreoffice-writer`, `libreoffice-core`, fonts).
 
 ---
 
