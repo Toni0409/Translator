@@ -15,9 +15,19 @@ import io
 import os
 import sys
 import types
+import base64
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe"
+    "AAAADUlEQVR4nGNgYGD4DwABBAEAghnFoQAAAABJRU5ErkJggg=="
+)
+
+
+def _ascii(s) -> str:
+    """Return text safe for legacy Windows consoles such as cp1252."""
+    return str(s).encode("ascii", "backslashreplace").decode("ascii")
 
 
 def setup_env():
@@ -55,11 +65,8 @@ def make_docx_with_image() -> bytes:
     """
     from docx import Document
     from docx.shared import Inches
-    import PIL.Image as Image
 
-    img_buf = io.BytesIO()
-    Image.new("RGB", (50, 50), (128, 200, 80)).save(img_buf, "PNG")
-    img_buf.seek(0)
+    img_buf = io.BytesIO(_PNG_1X1)
 
     doc = Document()
     doc.add_paragraph("Hello world")
@@ -76,11 +83,8 @@ def make_docx_with_inline_image() -> bytes:
     """DOCX paragraph có bold text + image inline + plain text."""
     from docx import Document
     from docx.shared import Inches
-    import PIL.Image as Image
 
-    img_buf = io.BytesIO()
-    Image.new("RGB", (40, 40), (255, 0, 0)).save(img_buf, "PNG")
-    img_buf.seek(0)
+    img_buf = io.BytesIO(_PNG_1X1)
 
     doc = Document()
     p = doc.add_paragraph()
@@ -113,14 +117,16 @@ class Report:
         self.failed = 0
 
     def check(self, label: str, ok: bool, detail: str = ""):
+        label = _ascii(label)
+        detail = _ascii(detail) if detail else ""
         if ok:
             self.passed += 1
-            print(f"  ✅ {label}")
+            print(f"  PASS {label}")
             if detail:
                 print(f"     {detail}")
         else:
             self.failed += 1
-            print(f"  ❌ {label}")
+            print(f"  FAIL {label}")
             if detail:
                 print(f"     {detail}")
 

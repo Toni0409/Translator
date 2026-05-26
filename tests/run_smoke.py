@@ -27,7 +27,7 @@ def main() -> int:
     for script in SCRIPTS:
         path = os.path.join(HERE, script)
         if not os.path.exists(path):
-            print(f"⚠️  Skip missing: {script}")
+            print(f"WARN Skip missing: {script}")
             continue
         print(f"\n=== {script} ===")
         r = subprocess.run([sys.executable, path], cwd=REPO)
@@ -36,9 +36,9 @@ def main() -> int:
 
     print()
     if failures:
-        print(f"❌ {len(failures)} smoke script(s) failed: {', '.join(failures)}")
+        print(f"FAIL {len(failures)} smoke script(s) failed: {', '.join(failures)}")
         return 1
-    print(f"✅ All {len(SCRIPTS)} smoke scripts passed")
+    print(f"PASS All {len(SCRIPTS)} smoke scripts passed")
     return 0
 
 

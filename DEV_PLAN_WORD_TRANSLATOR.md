@@ -224,24 +224,24 @@ Goal: reduce duplicate manual testing and catch future regressions.
 
 Goal: document future work and leave the repo easy to continue.
 
-- [ ] `P6.1` Add `Roadmap` section to `README.md`.
+- [x] `P6.1` Add `Roadmap` section to `README.md`.
   - Quality
   - Speed/cost
   - Format/layout
   - UX/editor
-  - Done:
-- [ ] `P6.2` Update README language/direction docs after Phase 1.
-  - Done:
-- [ ] `P6.3` Update README domain glossary docs after Phase 4.
-  - Done:
-- [ ] `P6.4` Run final verification checklist.
+  - Done: 2026-05-26, commit pending. Added Roadmap section covering quality, speed/cost, format/layout, and UX/editor.
+- [x] `P6.2` Update README language/direction docs after Phase 1.
+  - Done: 2026-05-26, commit pending. README now documents 2 directions (`Anh → Việt`, `Việt → Anh`), direction picker, quick/basic vs advanced flow, and source/target prompt behavior.
+- [x] `P6.3` Update README domain glossary docs after Phase 4.
+  - Done: 2026-05-26, commit pending. README now documents seed domain glossary files, elevator/escalator detection, merge precedence, restore seed action, and domain style rules.
+- [x] `P6.4` Run final verification checklist.
   - `py_compile`
   - `pip check`
   - `git diff --check`
   - no active PDF/Review imports
   - no real secrets
   - app smoke run if possible
-  - Done:
+  - Done: 2026-05-26, commit pending. `python -B -m py_compile ...` OK; `python -m pip check` OK; `python tests\run_smoke.py` OK (5 scripts, 56 checks); `git diff --check` OK (line-ending warnings only); active import scan for PDF/Review returned no matches; secret scan only found README placeholders + audit command in this plan.
 
 ## Completion Log
 
@@ -257,6 +257,11 @@ Goal: document future work and leave the repo easy to continue.
   - **P4 (domain glossary)**: thêm `data/glossary_elevator.json` (72/63 entries) + `data/glossary_escalator.json` (44/42); `domain_glossary.py` với `STANDARDS_KEEP_AS_IS` (17 chuẩn), `load_seed`, `detect_subdomain` (regex word-boundary, ngưỡng ≥2 hit), `seed_for_direction` (en_vi/vi_en, merge stable order); `build_glossary(seed=...)` precedence: seed → AI (AI không override seed key); `build_doc_context(subdomains=...)` inject `_DOMAIN_STYLE_BLOCK` (units, standards, part numbers); prompt cap 50 → 80, seed entries nằm đầu nhờ dict order; `word_tab.py` gọi `detect_subdomain`+`seed_for_direction` trong `_run_analysis`, lưu `subdomains`/`seed_glossary` vào analysis dict + session_state, log "🏗 Domain: ..."; thêm button "🏗 Khôi phục seed thuật ngữ ngành" merge seed mà giữ user edits.
   - **P5 (smoke tests)**: `tests/` với `_helpers.py` (stub gemini + tạo secrets tạm, build DOCX có ảnh), `smoke_config.py` (10), `smoke_docx.py` (10), `smoke_domain.py` (20), `smoke_checkpoint.py` (7), `smoke_direction.py` (9); runner `tests/run_smoke.py`. Tổng: **5 scripts, 56 checks**, tất cả pass. KHÔNG thêm pytest vào requirements.
   - Verify: py_compile pass, pip check pass, smoke run all-green.
+- 2026-05-26, P6 done on `dev`:
+  - `README.md`: updated current docs for 2-direction translation, basic/advanced flow, seed elevator/escalator glossary, media preservation, smoke tests, and Roadmap.
+  - `tests/_helpers.py`: made smoke output safe for legacy Windows consoles via ASCII/backslashreplace, and replaced Pillow-generated images with static PNG bytes to remove hidden dependency.
+  - `tests/run_smoke.py`: switched runner summary output to ASCII.
+  - Verify: py_compile OK, pip check OK, smoke run all-green (5 scripts, 56 checks), git diff --check OK, no active PDF/Review imports, no real secrets found.
 
 ## Current State
 
