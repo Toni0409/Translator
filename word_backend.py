@@ -1301,57 +1301,6 @@ def _is_untranslated(b: dict, translations: dict) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TRANSLATION MEMORY — hash-based cache (session-scoped)
-# ══════════════════════════════════════════════════════════════════════════════
-def tm_key(text: str, target_lang: str, role: str = "") -> str:
-    """
-    Hash key: language + (optional) role + text.
-    Role-aware để giữ style consistency — heading vs body cùng text vẫn dịch riêng.
-    Role rỗng = legacy key (backward compat khi caller không có role).
-    """
-    role_part = f"|{role}" if role else ""
-    return hashlib.md5(
-        f"{target_lang}{role_part}|{text}".encode("utf-8")
-    ).hexdigest()[:16]
-
-
-def tm_lookup(blocks: list[dict], tm: dict, target_lang: str
-              ) -> tuple[dict, list[dict]]:
-    """
-    Trả về (cached_translations, remaining_blocks).
-    Thử key role-specific trước; nếu miss thì fall back legacy key (no role)
-    để dùng entry cũ trong session.
-    """
-    cached, remaining = {}, []
-    for b in blocks:
-        role = b.get("role", "")
-        key_role   = tm_key(b["text"], target_lang, role)
-        key_legacy = tm_key(b["text"], target_lang)
-        if key_role in tm:
-            cached[b["id"]] = tm[key_role]
-        elif key_legacy in tm:
-            cached[b["id"]] = tm[key_legacy]
-        else:
-            remaining.append(b)
-    return cached, remaining
-
-
-def tm_store(blocks: list[dict], translations: dict, tm: dict,
-             target_lang: str) -> int:
-    """Ghi translations mới vào TM với role-specific key. Trả về số entry thêm vào."""
-    added = 0
-    for b in blocks:
-        tr = translations.get(b["id"])
-        if not tr or tr == b["text"]:
-            continue
-        key = tm_key(b["text"], target_lang, b.get("role", ""))
-        if key not in tm:
-            tm[key] = tr
-            added += 1
-    return added
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # CHECKPOINT — persist partial translations across browser refresh
 # ══════════════════════════════════════════════════════════════════════════════
 import os, pickle as _pickle, tempfile as _tempfile
@@ -1390,81 +1339,6 @@ def checkpoint_clear(docx_bytes: bytes, target_lang: str) -> None:
         os.unlink(_checkpoint_path(docx_bytes, target_lang))
     except Exception:
         pass
-
-
-def export_bilingual_docx(original_bytes: bytes, blocks: list[dict],
-                          translations: dict) -> bytes:
-    """
-    Tạo DOCX so sánh song ngữ: bảng 2 cột (gốc | dịch).
-    Chỉ bao gồm block có translation.
-    """
-    from docx.shared import Inches, Pt, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-    doc = Document()
-    # Narrow margins to fit 2 columns
-    for section in doc.sections:
-        section.left_margin  = Inches(0.6)
-        section.right_margin = Inches(0.6)
-
-    table = doc.add_table(rows=1, cols=2)
-    table.style = "Table Grid"
-    hdr = table.rows[0].cells
-    for cell, label in zip(hdr, ["Original", "Translation"]):
-        run = cell.paragraphs[0].add_run(label)
-        run.bold = True
-        run.font.size = Pt(10)
-
-    for b in blocks:
-        tr = translations.get(b["id"])
-        if not tr or tr == b["text"]:
-            continue
-        row = table.add_row().cells
-        row[0].text = b["text"]
-        row[1].text = tr
-        for cell in row:
-            cell.paragraphs[0].runs[0].font.size = Pt(9)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
-
-
-_NUM_PAT = _re.compile(r'\b\d[\d,\.]*\b')
-
-
-def quality_check(blocks: list[dict], translations: dict) -> list[dict]:
-    """
-    Returns list of {"id", "text", "translation", "issues"} for suspicious entries.
-    Checks:
-    - Numbers present in original but missing in translation
-    - Translation is more than 3.5x longer or less than 0.2x shorter than original
-    - Original ends with ? but translation does not
-    """
-    results = []
-    for b in blocks:
-        tr = translations.get(b["id"])
-        if not tr or not b["text"].strip():
-            continue
-        issues = []
-        orig_nums = set(_NUM_PAT.findall(b["text"]))
-        tr_nums   = set(_NUM_PAT.findall(tr))
-        missing   = orig_nums - tr_nums
-        if missing:
-            issues.append(f"Số bị mất: {', '.join(sorted(missing)[:4])}")
-        ratio = len(tr) / max(len(b["text"]), 1)
-        if ratio > 3.5:
-            issues.append(f"Bản dịch quá dài ({ratio:.1f}x)")
-        if ratio < 0.2 and len(b["text"]) > 20:
-            issues.append(f"Bản dịch quá ngắn ({ratio:.1f}x)")
-        orig_q = b["text"].rstrip().endswith("?")
-        tr_q   = tr.rstrip().endswith("?")
-        if orig_q and not tr_q:
-            issues.append("Mất dấu '?'")
-        if issues:
-            results.append({"id": b["id"], "text": b["text"],
-                            "translation": tr, "issues": issues})
-    return results
 
 
 def find_missed(blocks: list[dict], translations: dict,
