@@ -32,6 +32,7 @@ from word_backend import (
     checkpoint_save, checkpoint_load, checkpoint_clear,
     export_bilingual_docx, quality_check, validate_docx_output,
 )
+from domain_glossary import detect_subdomain, seed_for_direction
 
 
 # Keys session_state cho tab Word — tập trung 1 chỗ để dễ clear
@@ -53,6 +54,31 @@ def _ensure_tm() -> dict:
     return st.session_state["word_tm"]
 
 
+def _safe_zip_name(raw: str, lang_word: str, used: set[str]) -> str:
+    """Sanitize tên file cho batch ZIP (P3.7).
+
+    - basename only (loại path traversal `..` và separator `/` `\\`)
+    - giữ extension `.docx`; thêm suffix `_<2chars lang>` trước `.docx`
+    - đảm bảo unique trong `used` (thêm `_1`, `_2`... nếu trùng)
+    """
+    import os as _os, re as _re_local
+    base = _os.path.basename(raw or "file.docx")
+    base = _re_local.sub(r"[\\/]+", "_", base)
+    base = base.replace("..", "_")
+    if not base.lower().endswith(".docx"):
+        base += ".docx"
+    suffix = f"_{lang_word[:2]}"
+    stem, ext = base[:-5], base[-5:]   # ".docx"
+    candidate = f"{stem}{suffix}{ext}"
+    if candidate not in used:
+        return candidate
+    # Đụng tên → thêm counter
+    i = 1
+    while f"{stem}{suffix}_{i}{ext}" in used:
+        i += 1
+    return f"{stem}{suffix}_{i}{ext}"
+
+
 def _resolve_langs(direction_label: str | None = None) -> tuple[str, str, str]:
     """Resolve (label, source_lang, target_lang) từ direction label hoặc session_state.
 
@@ -66,11 +92,18 @@ def _resolve_langs(direction_label: str | None = None) -> tuple[str, str, str]:
     return d_label, src, tgt
 
 
-def _estimate_cost(tok_in: int, tok_out: int) -> tuple:
-    """Estimate cost in (vnd, usd). Gemini Flash pricing."""
-    usd = tok_in * 0.075 / 1_000_000 + tok_out * 0.30 / 1_000_000
-    vnd = usd * 25_000
-    return vnd, usd
+def _current_translatable(a: dict) -> list:
+    """Translatable blocks dựa trên `a["role_toggles"]` hiện tại (P3.3).
+
+    Nếu user chưa toggle gì, fallback về list ban đầu từ extract.
+    """
+    toggles = a.get("role_toggles")
+    if not toggles:
+        return a["translatable"]
+    skip = {r for r, on in toggles.items() if not on}
+    return [b for b in a["blocks"]
+            if b["role"] not in skip
+            and not b.get("_toc_mirror")]
 
 
 def _make_job_ui(heading: str, stat_col1_label: str,
@@ -264,12 +297,24 @@ def _run_analysis(uploaded_docx, lang_word, source_lang: str, target_lang: str):
         else:
             add_log(f"💾 TM: 0 hit (TM hiện có {len(tm):,} entry)")
 
-        # Glossary build
+        # Domain detection + seed glossary (P4.4 + P4.5)
+        subdomains = detect_subdomain(blocks)
+        seed = seed_for_direction(subdomains, source_lang, target_lang)
+        if subdomains:
+            add_log(f"🏗 Domain: {', '.join(sorted(subdomains))} "
+                    f"→ nạp {len(seed)} thuật ngữ chuyên ngành làm seed")
+
+        # Glossary build (seed → AI-extract; seed không bị override)
         add_log("📚 Build glossary từ thuật ngữ lặp lại...")
         client   = get_client()
-        glossary = build_glossary(client, blocks, target_lang, source_lang)
+        glossary = build_glossary(client, blocks, target_lang,
+                                  source_lang=source_lang, seed=seed)
+        new_from_ai = len(glossary) - len(seed)
         if glossary:
-            add_log(f"📖 Tìm thấy {len(glossary)} thuật ngữ — review/sửa ở dưới rồi dịch")
+            if seed and new_from_ai > 0:
+                add_log(f"📖 Glossary: {len(seed)} seed + {new_from_ai} AI = {len(glossary)} term")
+            else:
+                add_log(f"📖 Tìm thấy {len(glossary)} thuật ngữ — review/sửa ở dưới rồi dịch")
         else:
             add_log("📖 Không có thuật ngữ lặp đủ ngưỡng — bỏ qua glossary")
 
@@ -284,7 +329,8 @@ def _run_analysis(uploaded_docx, lang_word, source_lang: str, target_lang: str):
             "endnote_cnt":   endnote_cnt,
             "comment_cnt":   comment_cnt,
             "tm_hits":       len(tm_cached),
-            "doc_context":   build_doc_context(blocks),
+            "doc_context":   build_doc_context(blocks, source_lang=source_lang,
+                                               subdomains=subdomains),
             "glossary":      glossary,
             # Snapshot để restore khi user lỡ xoá entries trong editor
             "_glossary_initial": dict(glossary),
@@ -293,7 +339,11 @@ def _run_analysis(uploaded_docx, lang_word, source_lang: str, target_lang: str):
             "lang":          lang_word,
             "source_lang":   source_lang,
             "target_lang":   target_lang,
+            "subdomains":    subdomains,
+            "seed_glossary": seed,
         }
+        st.session_state["word_subdomains"]    = subdomains
+        st.session_state["word_seed_glossary"] = seed
         # Clear old kết quả từ lần dịch trước
         for k in ("word_blocks", "word_translations", "word_summary"):
             st.session_state.pop(k, None)
@@ -510,6 +560,31 @@ def _render_analysis_panel():
                 except Exception as e:
                     st.error(str(e))
 
+        # Seed restore (P4.8) — merge lại seed mà KHÔNG xoá user edits.
+        seed_gloss = a.get("seed_glossary") or {}
+        if seed_gloss:
+            sub_label = ", ".join(sorted(a.get("subdomains") or set())) or "—"
+            if st.button(
+                f"🏗 Khôi phục seed thuật ngữ ngành ({sub_label}: {len(seed_gloss)} term)",
+                key="word_glossary_seed_restore",
+                help="Merge seed glossary chuyên ngành thang máy/thang cuốn vào "
+                     "glossary hiện tại. User edits được giữ — chỉ seed bị thiếu sẽ thêm lại.",
+                use_container_width=True,
+            ):
+                cur = a.get("glossary") or {}
+                added_back = 0
+                for k, v in seed_gloss.items():
+                    if k not in cur:
+                        cur[k] = v
+                        added_back += 1
+                a["glossary"] = cur
+                st.session_state["word_analysis"] = a
+                gver_now = st.session_state.get("word_glossary_editor_ver", 0)
+                st.session_state["word_glossary_editor_ver"] = gver_now + 1
+                st.success(f"Đã merge lại {added_back} thuật ngữ seed "
+                           f"(tổng glossary hiện có: {len(cur)})")
+                st.rerun()
+
         st.divider()
 
         # ── 4. Translation Memory ────────────────────────────────────────
@@ -576,17 +651,18 @@ def _render_analysis_panel():
              if n_remain > 0
              else f"🚀 Dịch ngay — apply {a['tm_hits']:,} TM hit (không gọi API)")
 
-    # Estimate cost for remaining blocks
+    # Estimate cost for remaining blocks — dùng translatable CURRENT theo role
+    # toggles (P3.3), không dùng `a["translatable"]` stale từ lúc extract.
     if n_remain > 0:
-        translatable = a["translatable"]
+        translatable = _current_translatable(a)
         tm = _ensure_tm()
         target_lang = a["target_lang"]
         _, remaining_blocks = tm_lookup(translatable, tm, target_lang)
         est_chars = sum(len(b["text"]) for b in remaining_blocks)
         est_in_tok = int(est_chars * 0.4)
         est_out_tok = int(est_in_tok * 1.5)
-        _, est_usd = _estimate_cost(est_in_tok, est_out_tok)
-        st.caption(f"💰 Ước tính chi phí: ~${est_usd:.3f} USD cho {n_remain:,} đoạn")
+        est_usd, _ = calc_cost(est_in_tok, est_out_tok)
+        st.caption(f"💰 Ước tính chi phí: ~${est_usd:.3f} USD cho {len(remaining_blocks):,} đoạn còn cần API")
         if cost_cap > 0 and est_usd > cost_cap:
             st.warning(
                 f"⚠️ Ước tính ~${est_usd:.3f} USD vượt ngưỡng cảnh báo ${cost_cap:.2f} USD. "
@@ -745,10 +821,10 @@ def _run_full_translation():
         st.session_state["word_role_toggles"] = toggles
         st.session_state["word_skip_roles"]   = skip_roles
 
-        # Validate output DOCX
+        # Validate output DOCX (so sánh media với bản gốc — P2.7)
         try:
             out_bytes = apply_translations(docx_bytes, blocks, translations)
-            val = validate_docx_output(out_bytes)
+            val = validate_docx_output(out_bytes, original_bytes=docx_bytes)
             st.session_state["word_validation"] = val
             st.session_state["word_translated_bytes_cache"] = {
                 "version": 1, "bytes": out_bytes,
@@ -842,14 +918,17 @@ def _run_partial(missed: list, label: str, heading: str, log_heading: str,
         _finalize_job(timer_ph, prog, add_log, elapsed,
                       len(missed), label, tok_in, tok_out, tm_added=tm_added)
 
-        # Validate updated output
+        # Validate updated output (so sánh media với bản gốc — P2.7)
         try:
             out_bytes = apply_translations(
                 st.session_state["word_docx_bytes"],
                 st.session_state["word_blocks"],
                 translations,
             )
-            val = validate_docx_output(out_bytes)
+            val = validate_docx_output(
+                out_bytes,
+                original_bytes=st.session_state["word_docx_bytes"],
+            )
             st.session_state["word_validation"] = val
             new_version = st.session_state["word_translations_version"]
             st.session_state["word_translated_bytes_cache"] = {
@@ -1098,16 +1177,23 @@ def _run_batch(uploaded_files, lang_word, source_lang: str, target_lang: str):
             "Trạng thái": list(file_status.values()),
         })
 
-    # Lưu kết quả vào session_state để hiện summary + download persist qua rerun
+    # Lưu kết quả vào session_state để hiện summary + download persist qua rerun.
+    # Sanitize tên file (P3.7): basename only, không cho `..`/`/`/`\`, đảm bảo unique.
     if results:
         buf = io.BytesIO()
+        used: set[str] = set()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for fname, data in results.items():
-                zf.writestr(fname.replace(".docx", f"_{lang_word[:2]}.docx"), data)
+                safe = _safe_zip_name(fname, lang_word, used)
+                used.add(safe)
+                zf.writestr(safe, data)
         buf.seek(0)
+        # zip_name: chỉ chứa ascii an toàn, slug từ lang_word
+        import re as _re_slug
+        lang_slug = _re_slug.sub(r"[^A-Za-z0-9_-]+", "", lang_word)[:8] or "out"
         st.session_state["word_batch_result"] = {
             "zip_bytes": buf.getvalue(),
-            "zip_name":  f"translated_{lang_word[:8]}.zip",
+            "zip_name":  f"translated_{lang_slug}.zip",
             "status":    dict(file_status),
             "lang":      lang_word,
             "ok_count":  sum(1 for v in file_status.values() if v.startswith("✅")),
