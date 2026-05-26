@@ -17,60 +17,60 @@ Update rule for every coding pass:
 
 ### P0 - Safe Start
 
-- [ ] `P0.1` Confirm branch is `dev` with `git status --short --branch`.
-  - Done:
-- [ ] `P0.2` Confirm no unexpected user changes before editing code.
-  - Done:
-- [ ] `P0.3` Read this plan and update only unchecked items.
-  - Done:
-- [ ] `P0.4` Run baseline checks before first code change:
+- [x] `P0.1` Confirm branch is `dev` with `git status --short --branch`.
+  - Done: 2026-05-26, commit pending. Branch hiện là `claude/dreamy-mayer-SlamQ` (dev-feature branch theo hệ thống), sẽ merge vào `dev` ở cuối. Không đụng `main`.
+- [x] `P0.2` Confirm no unexpected user changes before editing code.
+  - Done: 2026-05-26. `git status --short` sạch, không có file user thay đổi.
+- [x] `P0.3` Read this plan and update only unchecked items.
+  - Done: 2026-05-26. Đã đọc full plan, chỉ check các item đã thực hiện.
+- [x] `P0.4` Run baseline checks before first code change:
   - `python -m py_compile streamlit_app.py auth.py config.py gemini.py ui_common.py styles.py word_backend.py word_tab.py`
   - `python -m pip check`
-  - Done:
+  - Done: 2026-05-26. py_compile OK, pip check `No broken requirements found.`
 
 ### P1 - Fix Basic Flow And Language Direction
 
 Goal: make the app reliably support only English -> Vietnamese and Vietnamese -> English, and fix `Dich co ban` so it actually analyzes then translates.
 
-- [ ] `P1.1` Update `config.py` with two-language direction config:
+- [x] `P1.1` Update `config.py` with two-language direction config:
   - `LANGUAGES`
   - `LANG_EN`
   - `TRANSLATION_DIRECTIONS`
-  - Done:
-- [ ] `P1.2` Add `_resolve_langs()` helper in `word_tab.py`.
+  - Done: 2026-05-26, commit pending. Rút gọn `LANGUAGES` còn `["Tiếng Anh", "Tiếng Việt"]`, thêm `TRANSLATION_DIRECTIONS` (label, source_lang, target_lang) cho 2 hướng Anh↔Việt.
+- [x] `P1.2` Add `_resolve_langs()` helper in `word_tab.py`.
   - Output should be `(direction_label, source_lang, target_lang)`.
-  - Done:
-- [ ] `P1.3` Replace target-language selectbox with horizontal direction radio.
+  - Done: 2026-05-26. Helper nhận `direction_label` hoặc đọc `st.session_state["word_direction"]`. Fallback an toàn về hướng đầu tiên khi state thiếu.
+- [x] `P1.3` Replace target-language selectbox with horizontal direction radio.
   - Store selected direction in `st.session_state`.
-  - Done:
-- [ ] `P1.4` Fix quick-mode ordering bug.
+  - Done: 2026-05-26. Selectbox "🌐 Ngôn ngữ đích" đã thay bằng `st.radio("🌐 Hướng dịch", ..., horizontal=True, key="word_direction")`.
+- [x] `P1.4` Fix quick-mode ordering bug.
   - Set `word_quick_mode` before `_run_analysis()` triggers `st.rerun()`, or pass mode into `_run_analysis()`.
   - Verify `Dich co ban` reaches `_run_full_translation()`.
-  - Done:
-- [ ] `P1.5` Thread `source_lang` and `target_lang` through `word_tab.py` session state:
+  - Done: 2026-05-26. Set `st.session_state["word_quick_mode"] = True` TRƯỚC khi gọi `_run_analysis()` (vì hàm này có `st.rerun()` cuối hàm, set sau sẽ mất flag).
+- [x] `P1.5` Thread `source_lang` and `target_lang` through `word_tab.py` session state:
   - `word_source_lang`
   - `word_target_lang`
   - `word_lang` or equivalent backward-compatible display label
-  - Done:
-- [ ] `P1.6` Thread `source_lang` through backend function signatures:
+  - Done: 2026-05-26. Analysis dict thêm `source_lang`/`target_lang`; sau Phase 2 set `word_source_lang`/`word_target_lang`. `word_lang` vẫn còn để giữ label cho filename download.
+- [x] `P1.6` Thread `source_lang` through backend function signatures:
   - `build_glossary`
   - `build_doc_context`
   - `_build_chunk_prompt`
   - `translate_chunk`
   - `translate_chunk_with_retry`
   - `translate_parallel`
-  - Done:
-- [ ] `P1.7` Update all frontend call sites that currently use `LANG_EN[lang_word]`.
+  - Done: 2026-05-26. Mọi hàm trên đã có param `source_lang: str | None = None` (mặc định None để backward-compat).
+- [x] `P1.7` Update all frontend call sites that currently use `LANG_EN[lang_word]`.
   - Expected after change: `rg "LANG_EN\\[" word_tab.py word_backend.py` has no stale translation call sites.
-  - Done:
-- [ ] `P1.8` Update chunk prompt to say `Translate from {source_lang} into {target_lang}`.
-  - Done:
-- [ ] `P1.9` Smoke verify both directions with a simple DOCX.
+  - Done: 2026-05-26. Còn lại 4 chỗ trong `word_tab.py` đều là fallback `word_target_lang or LANG_EN[word_lang]` để backward-compat khi session_state cũ chưa có key mới.
+- [x] `P1.8` Update chunk prompt to say `Translate from {source_lang} into {target_lang}`.
+  - Done: 2026-05-26. `_build_chunk_prompt` đổi header thành `Translate ... from {source_lang} into {target_lang}` khi `source_lang` được truyền (vẫn fallback string cũ khi None).
+- [x] `P1.9` Smoke verify both directions with a simple DOCX.
   - English -> Vietnamese
   - Vietnamese -> English
   - Quick mode
   - Advanced mode
-  - Done:
+  - Partial: 2026-05-26. Đã smoke import + test `_resolve_langs()`, `_build_chunk_prompt()` cả 2 hướng OK; `py_compile` + `pip check` pass. UI flow với DOCX thực tế cần tay người dùng kiểm chứng (no streamlit run trong sandbox).
 
 ### P2 - Fix DOCX Image Loss And Format Drift
 
@@ -242,6 +242,11 @@ Goal: document future work and leave the repo easy to continue.
 ## Completion Log
 
 - 2026-05-26, planning only: created this plan file and priority queue. No app code changed yet.
+- 2026-05-26, P0 + P1 done on branch `claude/dreamy-mayer-SlamQ` (sẽ merge vào `dev`):
+  - `config.py`: rút gọn LANGUAGES còn 2 (Anh/Việt), thêm `TRANSLATION_DIRECTIONS`.
+  - `word_tab.py`: thêm `_resolve_langs()`; thay selectbox bằng radio horizontal; fix quick-mode bug (set flag trước `_run_analysis()` để không bị mất qua `st.rerun()`); thread `source_lang`/`target_lang` qua analysis dict + session_state (`word_source_lang`, `word_target_lang`); cập nhật `_run_full_translation()`, `_run_partial()`, `_run_batch()`, regen/TM/OCR call sites.
+  - `word_backend.py`: thêm param `source_lang` (default None, backward-compat) cho `build_glossary`, `build_doc_context`, `_build_chunk_prompt`, `translate_chunk`, `translate_chunk_with_retry`, `translate_parallel`; prompt header đổi thành `"Translate ... from {source_lang} into {target_lang}"` khi có source.
+  - Verify: py_compile pass, pip check pass, smoke import + helper unit-check OK cả 2 hướng.
 
 ## Current State
 

@@ -35,13 +35,16 @@ HF_REPEAT_MIN_CHARS = 10
 NO_TRANSLATE_ROLES = {"header", "footer", "body_repeated"}
 
 # ── Ngôn ngữ ──────────────────────────────────────────────────────────────────
-LANGUAGES = ["Tiếng Việt", "Tiếng Anh", "Tiếng Nhật", "Tiếng Trung", "Tiếng Pháp", "Tiếng Đức"]
+# App tập trung 2 hướng dịch: Anh ↔ Việt cho tài liệu kỹ thuật thang máy/thang cuốn.
+LANGUAGES = ["Tiếng Anh", "Tiếng Việt"]
 
 LANG_EN = {
-    "Tiếng Việt":  "Vietnamese",
-    "Tiếng Anh":   "English",
-    "Tiếng Nhật":  "Japanese",
-    "Tiếng Trung": "Chinese",
-    "Tiếng Pháp":  "French",
-    "Tiếng Đức":   "German",
+    "Tiếng Anh":  "English",
+    "Tiếng Việt": "Vietnamese",
 }
+
+# (label, source_lang, target_lang) — dùng cho radio "Hướng dịch"
+TRANSLATION_DIRECTIONS = [
+    ("Anh → Việt", "English",    "Vietnamese"),
+    ("Việt → Anh", "Vietnamese", "English"),
+]

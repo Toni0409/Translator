@@ -645,6 +645,7 @@ _TECH_TERM_RE   = re.compile(r"\b[A-Z][a-zA-Z]{4,}\b")
 
 
 def build_glossary(client, blocks: list[dict], target_lang: str,
+                   source_lang: str | None = None,
                    top_n: int = 30, min_repeat: int = 3) -> dict:
     """
     One-shot AI call để dịch top-N thuật ngữ lặp lại trong doc.
@@ -667,7 +668,8 @@ def build_glossary(client, blocks: list[dict], target_lang: str,
     if not top_terms:
         return {}
 
-    prompt = f"""Translate these technical terms to {target_lang}.
+    src_clause = f"from {source_lang} " if source_lang else ""
+    prompt = f"""Translate these technical terms {src_clause}to {target_lang}.
 Return ONLY a JSON object: {{"term": "translation", ...}}
 
 Rules:
@@ -694,8 +696,12 @@ Terms ({len(top_terms)}):
     }
 
 
-def build_doc_context(blocks: list[dict]) -> str:
-    """Tóm tắt cấu trúc tài liệu (title + headings + TOC + domain hint)."""
+def build_doc_context(blocks: list[dict], source_lang: str | None = None) -> str:
+    """Tóm tắt cấu trúc tài liệu (title + headings + TOC + domain hint).
+
+    `source_lang` được nhận để inject vào context nếu cần (Phase 1: không thay đổi
+    output hiện tại, nhưng đảm bảo signature consistent).
+    """
     titles   = [b["text"] for b in blocks if b["role"] == "title"][:2]
     headings = [b["text"] for b in blocks if b["role"] == "section_heading"][:10]
     tocs     = [b["text"] for b in blocks if b["role"] == "toc"][:8]
@@ -796,7 +802,8 @@ def _format_block_text(b: dict) -> str:
 
 def _build_chunk_prompt(chunk: list[dict], target_lang: str, doc_context: str,
                         glossary: dict | None = None,
-                        custom_rules: dict | None = None) -> str:
+                        custom_rules: dict | None = None,
+                        source_lang: str | None = None) -> str:
     """Build prompt. Dùng `text_tagged` nếu có (preserve inline format)."""
     payload = json.dumps(
         [{
@@ -849,7 +856,13 @@ def _build_chunk_prompt(chunk: list[dict], target_lang: str, doc_context: str,
                 + "\n".join(lines) + "\n"
             )
 
-    return f"""Translate these Word document blocks into {target_lang}.
+    translate_header = (
+        f"Translate these Word document blocks from {source_lang} into {target_lang}."
+        if source_lang else
+        f"Translate these Word document blocks into {target_lang}."
+    )
+
+    return f"""{translate_header}
 
 Document context:
 {doc_context}{glossary_section}{custom_rules_section}
@@ -884,12 +897,17 @@ Blocks:
 def translate_chunk(client, chunk: list[dict], target_lang: str,
                     doc_context: str,
                     glossary: dict | None = None,
-                    custom_rules: dict | None = None) -> tuple[dict, int, int]:
+                    custom_rules: dict | None = None,
+                    source_lang: str | None = None) -> tuple[dict, int, int]:
     """
     Dịch 1 chunk → (translations_dict, in_tokens, out_tokens).
     RAISE exception nếu API fail. Block bị model bỏ sót → fallback giữ text gốc.
     """
-    prompt = _build_chunk_prompt(chunk, target_lang, doc_context, glossary, custom_rules)
+    prompt = _build_chunk_prompt(
+        chunk, target_lang, doc_context,
+        glossary=glossary, custom_rules=custom_rules,
+        source_lang=source_lang,
+    )
     raw, in_t, out_t = call_gemini(client, prompt)
     parsed = parse_json_loose(raw) or []
     if not isinstance(parsed, list):
@@ -912,6 +930,7 @@ def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
                                glossary: dict | None = None,
                                custom_rules: dict | None = None,
                                fallback_individually: bool = True,
+                               source_lang: str | None = None,
                                ) -> tuple[dict, int, int, str | None]:
     """
     Wrapper với exponential backoff. Trả về (translations, in_t, out_t, error).
@@ -923,7 +942,11 @@ def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
     tok_in_total = tok_out_total = 0
     for attempt in range(retries):
         try:
-            t, in_t, out_t = translate_chunk(client, chunk, target_lang, doc_context, glossary, custom_rules)
+            t, in_t, out_t = translate_chunk(
+                client, chunk, target_lang, doc_context,
+                glossary=glossary, custom_rules=custom_rules,
+                source_lang=source_lang,
+            )
             return t, in_t, out_t, None
         except Exception as e:
             last_err = str(e)
@@ -936,7 +959,9 @@ def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
         for block in chunk:
             try:
                 t_single, in_t, out_t = translate_chunk(
-                    client, [block], target_lang, doc_context, glossary, custom_rules
+                    client, [block], target_lang, doc_context,
+                    glossary=glossary, custom_rules=custom_rules,
+                    source_lang=source_lang,
                 )
                 result.update(t_single)
                 tok_in_total  += in_t
@@ -958,7 +983,8 @@ def translate_parallel(holder: dict, client,
                        target_lang: str, doc_context: str,
                        max_workers: int,
                        glossary: dict | None = None,
-                       custom_rules: dict | None = None):
+                       custom_rules: dict | None = None,
+                       source_lang: str | None = None):
     """
     Background worker: dịch nhiều chunk song song với ThreadPoolExecutor.
 
@@ -975,7 +1001,9 @@ def translate_parallel(holder: dict, client,
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
                 ex.submit(translate_chunk_with_retry,
-                          client, c, target_lang, doc_context, CHUNK_RETRIES, glossary, custom_rules): (i, c)
+                          client, c, target_lang, doc_context,
+                          CHUNK_RETRIES, glossary, custom_rules,
+                          True, source_lang): (i, c)
                 for i, c in enumerate(chunks)
             }
             for future in as_completed(futures):
