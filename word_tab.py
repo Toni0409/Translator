@@ -1340,27 +1340,166 @@ def render():
     # ── PHASE 2 RESULT: download + rescan + H/F + editor ────────────────
     if "word_translations" in st.session_state:
         st.divider()
-        st.success(st.session_state["word_summary"])
 
-        val = st.session_state.get("word_validation")
-        if val:
-            if val["valid"]:
-                st.success(f"✅ Output validated: {val['block_count']:,} paragraph, "
-                           f"{val['image_count']} ảnh")
-            else:
-                st.error("❌ Output có lỗi — KHÔNG nên download:")
-                for err in val["errors"]:
-                    st.code(err)
+        val          = st.session_state.get("word_validation")
+        blocks       = st.session_state["word_blocks"]
+        translations = st.session_state["word_translations"]
+        missed_body  = find_missed(blocks, translations, hf_only=False)
+        missed_hf    = find_missed(blocks, translations, hf_only=True)
+        total_hf     = sum(1 for b in blocks if b["role"] in NO_TRANSLATE_ROLES)
+
+        # 1) Validation errors (chỉ show khi LỖI — user không nên download)
+        if val and not val["valid"]:
+            st.error("❌ Output có lỗi — KHÔNG nên download:")
+            for err in val["errors"]:
+                st.code(err)
             for warn in val.get("warnings", []):
                 st.warning(warn)
 
-        blocks       = st.session_state["word_blocks"]
-        translations = st.session_state["word_translations"]
+        # 2) DOWNLOAD — top, tách biệt, primary
+        translated_bytes = _get_cached_translated_bytes()
+        out_name = st.session_state["word_filename"].replace(
+            ".docx", f"_translated_{st.session_state['word_lang'][:2]}.docx"
+        )
+        st.download_button(
+            label="⬇️  Tải Word đã dịch",
+            data=translated_bytes,
+            file_name=out_name,
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+            type="primary",
+        )
 
-        # ── Quality check report ──────────────────────────────────────────
+        bilingual_bytes = export_bilingual_docx(
+            st.session_state["word_docx_bytes"],
+            st.session_state["word_blocks"],
+            st.session_state["word_translations"],
+        )
+        bi_name = st.session_state["word_filename"].replace(
+            ".docx", f"_bilingual_{st.session_state['word_lang'][:2]}.docx"
+        )
+        st.download_button(
+            label="📊  Tải DOCX so sánh song ngữ",
+            data=bilingual_bytes,
+            file_name=bi_name,
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+            key="word_dl_bilingual",
+        )
+
+        # 3) ACTION buttons — combined label+count (bỏ st.warning/st.info trùng)
+        rescan_clicked = hf_clicked = False
+        if total_hf > 0:
+            col_rs, col_hf = st.columns(2)
+            with col_rs:
+                rescan_clicked = st.button(
+                    f"🔍  Quét bỏ sót ({len(missed_body)})",
+                    disabled=(len(missed_body) == 0),
+                    use_container_width=True, key="word_rescan_btn",
+                    help="Dịch lại các đoạn body API fail (TM auto)",
+                )
+            with col_hf:
+                hf_clicked = st.button(
+                    f"🌐  Dịch Header / Footer ({len(missed_hf)}/{total_hf})",
+                    disabled=(len(missed_hf) == 0),
+                    use_container_width=True, key="word_hf_btn",
+                    help="Dịch Header, Footer và đoạn lặp trong body (TM auto)",
+                )
+        else:
+            rescan_clicked = st.button(
+                f"🔍  Quét bỏ sót ({len(missed_body)})",
+                disabled=(len(missed_body) == 0),
+                use_container_width=True, key="word_rescan_btn",
+            )
+
+        # 4) OCR — section riêng, tách biệt (user dùng thường xuyên)
+        with st.expander("🖼  OCR & dịch text trong ảnh", expanded=False):
+            st.caption(
+                "Quét tất cả ảnh trong DOCX, OCR chữ và dịch sang ngôn ngữ đích. "
+                "Xử lý song song — có thể tốn thêm chi phí Gemini Vision."
+            )
+            if st.button("🔍 Quét và dịch ảnh", key="word_ocr_btn"):
+                from word_backend import extract_images_from_docx, ocr_and_translate_images
+                imgs = extract_images_from_docx(st.session_state["word_docx_bytes"])
+                if not imgs:
+                    st.info("Không có ảnh trong DOCX.")
+                else:
+                    progress_bar = st.progress(0, text=f"Đang OCR 0/{len(imgs)} ảnh...")
+                    _ocr_counter = [0]
+
+                    def _on_progress(done, total):
+                        _ocr_counter[0] = done
+                        progress_bar.progress(done / total,
+                                              text=f"Đang OCR {done}/{total} ảnh...")
+
+                    ocr_target = st.session_state.get("word_target_lang") \
+                                 or LANG_EN[st.session_state["word_lang"]]
+                    results = ocr_and_translate_images(
+                        get_client(), imgs,
+                        ocr_target,
+                        progress_callback=_on_progress,
+                    )
+                    progress_bar.empty()
+                    st.session_state["word_image_ocr"] = (imgs, results)
+
+            if "word_image_ocr" in st.session_state:
+                imgs, results = st.session_state["word_image_ocr"]
+                shown = 0
+                for img in imgs:
+                    r = results.get(img["id"], {})
+                    if not r.get("has_text"):
+                        continue
+                    shown += 1
+                    with st.container(border=True):
+                        c1, c2 = st.columns([1, 2])
+                        c1.image(img["data"], width=200, caption=img["filename"])
+                        c2.markdown(f"**OCR (gốc):**\n```\n{r['ocr']}\n```")
+                        c2.markdown(f"**Dịch:**\n```\n{r['translation']}\n```")
+                        if r.get("error"):
+                            c2.warning(f"⚠️ Lỗi: {r['error']}")
+
+                errors = [r for r in results.values() if r.get("error") and not r.get("has_text")]
+                if shown == 0 and not errors:
+                    st.info(f"Đã quét {len(imgs)} ảnh — không phát hiện text.")
+                if errors:
+                    st.warning(f"⚠️ {len(errors)} ảnh gặp lỗi khi OCR.")
+
+                if shown > 0:
+                    if st.checkbox("📎 Chèn bản dịch OCR vào file DOCX output", key="word_ocr_insert"):
+                        from word_backend import insert_ocr_captions_into_docx
+                        base_bytes = _get_cached_translated_bytes()
+                        ocr_docx = insert_ocr_captions_into_docx(base_bytes, imgs, results)
+                        out_name_ocr = st.session_state["word_filename"].replace(
+                            ".docx",
+                            f"_translated_{st.session_state['word_lang'][:2]}_ocr.docx",
+                        )
+                        st.download_button(
+                            label="⬇️  Tải Word đã dịch + OCR caption",
+                            data=ocr_docx,
+                            file_name=out_name_ocr,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True,
+                            key="word_ocr_download",
+                        )
+
+        # 5) Chi tiết & review — gom tất cả phần phụ vào 1 expander gập
         issues = quality_check(blocks, translations)
+        summary_line = st.session_state.get("word_summary", "")
+        details_label = "ℹ️  Chi tiết kết quả & sửa thủ công"
         if issues:
-            with st.expander(f"⚠️ Quality check: {len(issues)} đoạn nghi vấn", expanded=False):
+            details_label += f"  ·  ⚠️ {len(issues)} đoạn nghi vấn"
+        with st.expander(details_label, expanded=False):
+            if summary_line:
+                st.success(summary_line)
+            if val and val["valid"]:
+                st.caption(f"✅ Output validated: {val['block_count']:,} paragraph, "
+                           f"{val['image_count']} ảnh")
+                for warn in val.get("warnings", []):
+                    st.warning(warn)
+
+            # Quality check (sub-section)
+            if issues:
+                st.markdown(f"##### ⚠️ Quality check — {len(issues)} đoạn nghi vấn")
                 for item in issues[:30]:
                     st.markdown(f"**🔴 {', '.join(item['issues'])}**")
                     col1, col2 = st.columns(2)
@@ -1368,10 +1507,10 @@ def render():
                                    key=f"qc_orig_{item['id']}")
                     col2.text_area("Dịch", item["translation"], height=60, disabled=True,
                                    key=f"qc_tr_{item['id']}")
+                st.divider()
 
-        # ── Phase 2 review editor (auto-learn to TM) ─────────────────────
-        with st.expander("✏️ Review & lưu vào TM", expanded=False):
-            # Build or restore review DataFrame
+            # Review & lưu vào TM (sub-section)
+            st.markdown("##### ✏️ Review & lưu vào TM")
             review_version = st.session_state.get("word_translations_version", 0)
             stored_rv = st.session_state.get("word_review_df_version")
             if stored_rv != review_version or "word_review_df" not in st.session_state:
@@ -1404,7 +1543,6 @@ def render():
                 key="word_review_editor",
             )
 
-            st.markdown("---")
             st.markdown("**🔄 Dịch lại đoạn cụ thể** (tuỳ chọn — dùng prompt bổ sung):")
             skip_roles_v2 = st.session_state.get("word_skip_roles") or set(NO_TRANSLATE_ROLES)
             all_block_ids = [
@@ -1480,141 +1618,9 @@ def render():
                 else:
                     st.info("Không có thay đổi nào.")
 
-        with st.expander("🖼 OCR & dịch text trong ảnh (tuỳ chọn)", expanded=False):
-            st.caption(
-                "Quét tất cả ảnh trong DOCX, OCR chữ và dịch sang ngôn ngữ đích. "
-                "Xử lý song song — có thể tốn thêm chi phí Gemini Vision."
-            )
-            if st.button("🔍 Quét và dịch ảnh", key="word_ocr_btn"):
-                from word_backend import extract_images_from_docx, ocr_and_translate_images
-                imgs = extract_images_from_docx(st.session_state["word_docx_bytes"])
-                if not imgs:
-                    st.info("Không có ảnh trong DOCX.")
-                else:
-                    progress_bar = st.progress(0, text=f"Đang OCR 0/{len(imgs)} ảnh...")
-                    _ocr_counter = [0]
-
-                    def _on_progress(done, total):
-                        _ocr_counter[0] = done
-                        progress_bar.progress(done / total,
-                                              text=f"Đang OCR {done}/{total} ảnh...")
-
-                    ocr_target = st.session_state.get("word_target_lang") \
-                                 or LANG_EN[st.session_state["word_lang"]]
-                    results = ocr_and_translate_images(
-                        get_client(), imgs,
-                        ocr_target,
-                        progress_callback=_on_progress,
-                    )
-                    progress_bar.empty()
-                    st.session_state["word_image_ocr"] = (imgs, results)
-
-            if "word_image_ocr" in st.session_state:
-                imgs, results = st.session_state["word_image_ocr"]
-                shown = 0
-                for img in imgs:
-                    r = results.get(img["id"], {})
-                    if not r.get("has_text"):
-                        continue
-                    shown += 1
-                    with st.container(border=True):
-                        c1, c2 = st.columns([1, 2])
-                        c1.image(img["data"], width=200, caption=img["filename"])
-                        c2.markdown(f"**OCR (gốc):**\n```\n{r['ocr']}\n```")
-                        c2.markdown(f"**Dịch:**\n```\n{r['translation']}\n```")
-                        if r.get("error"):
-                            c2.warning(f"⚠️ Lỗi: {r['error']}")
-
-                errors = [r for r in results.values() if r.get("error") and not r.get("has_text")]
-                if shown == 0 and not errors:
-                    st.info(f"Đã quét {len(imgs)} ảnh — không phát hiện text.")
-                if errors:
-                    st.warning(f"⚠️ {len(errors)} ảnh gặp lỗi khi OCR.")
-
-                if shown > 0:
-                    if st.checkbox("📎 Chèn bản dịch OCR vào file DOCX output", key="word_ocr_insert"):
-                        from word_backend import insert_ocr_captions_into_docx
-                        base_bytes = _get_cached_translated_bytes()
-                        ocr_docx = insert_ocr_captions_into_docx(base_bytes, imgs, results)
-                        out_name = st.session_state["word_filename"].replace(
-                            ".docx",
-                            f"_translated_{st.session_state['word_lang'][:2]}_ocr.docx",
-                        )
-                        st.download_button(
-                            label="⬇️  Tải Word đã dịch + OCR caption",
-                            data=ocr_docx,
-                            file_name=out_name,
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            use_container_width=True,
-                            key="word_ocr_download",
-                        )
-
-        translated_bytes = _get_cached_translated_bytes()
-        out_name = st.session_state["word_filename"].replace(
-            ".docx", f"_translated_{st.session_state['word_lang'][:2]}.docx"
-        )
-
-        st.download_button(
-            label="⬇️  Tải Word đã dịch",
-            data=translated_bytes,
-            file_name=out_name,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-        )
-
-        bilingual_bytes = export_bilingual_docx(
-            st.session_state["word_docx_bytes"],
-            st.session_state["word_blocks"],
-            st.session_state["word_translations"],
-        )
-        bi_name = st.session_state["word_filename"].replace(
-            ".docx", f"_bilingual_{st.session_state['word_lang'][:2]}.docx"
-        )
-        st.download_button(
-            label="📊  Tải DOCX so sánh song ngữ",
-            data=bilingual_bytes,
-            file_name=bi_name,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-            key="word_dl_bilingual",
-        )
-
-        missed_body  = find_missed(blocks, translations, hf_only=False)
-        missed_hf    = find_missed(blocks, translations, hf_only=True)
-        total_hf     = sum(1 for b in blocks if b["role"] in NO_TRANSLATE_ROLES)
-
-        rescan_clicked = hf_clicked = False
-        if total_hf > 0:
-            col_rs, col_hf = st.columns(2)
-            with col_rs:
-                rescan_clicked = st.button(
-                    f"🔍  Quét bỏ sót ({len(missed_body)})",
-                    disabled=(len(missed_body) == 0),
-                    use_container_width=True, key="word_rescan_btn",
-                    help="Dịch lại các đoạn body API fail (TM auto)",
-                )
-            with col_hf:
-                hf_clicked = st.button(
-                    f"🌐  Dịch Header / Footer ({len(missed_hf)}/{total_hf})",
-                    disabled=(len(missed_hf) == 0),
-                    use_container_width=True, key="word_hf_btn",
-                    help="Dịch Header, Footer và đoạn lặp trong body (TM auto)",
-                )
-        else:
-            rescan_clicked = st.button(
-                f"🔍  Quét bỏ sót ({len(missed_body)})",
-                disabled=(len(missed_body) == 0),
-                use_container_width=True, key="word_rescan_btn",
-            )
-
-        if len(missed_body) > 0:
-            st.warning(f"⚠️ Còn {len(missed_body):,} đoạn body chưa dịch. "
-                       f"Bấm **Quét bỏ sót** để dịch lại.")
-        if total_hf > 0 and len(missed_hf) > 0:
-            st.info(f"📌 {len(missed_hf):,}/{total_hf:,} Header/Footer chưa dịch. "
-                    f"Bấm **Dịch Header/Footer** nếu muốn dịch.")
-
-        with st.expander("📋  Xem & sửa bản dịch inline", expanded=False):
+            # Inline editor (sub-section cuối)
+            st.divider()
+            st.markdown("##### 📋 Xem & sửa bản dịch inline")
             _render_editor()
 
         if rescan_clicked:
