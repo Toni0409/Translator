@@ -245,7 +245,9 @@ def _run_analysis(uploaded_docx, lang_word, source_lang: str, target_lang: str):
 
         add_log(f"✅ {stats['total']:,} đoạn ({total_chars:,} ký tự body)")
         add_log(f"   • Body cần dịch:       {stats['body']:,}")
-        add_log(f"   • Header/Footer (skip):{stats['hf_total']:,}")
+        hf_cnt = stats.get("header", 0) + stats.get("footer", 0) + stats.get("body_repeated", 0)
+        if hf_cnt > 0:
+            add_log(f"   • Header/Footer/lặp:   {hf_cnt:,} (đã gộp vào body để dịch)")
         if textbox_cnt > 0:
             add_log(f"   • Text-box / shape:    {textbox_cnt:,} (sẽ dịch)")
         if table_cnt > 0:
@@ -331,9 +333,11 @@ def _render_analysis_panel():
     # ── TIER 1 — Quick mode: stats + primary action ──────────────────────
     st.markdown("### 📊 Kết quả phân tích")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.markdown(stat_box_html(f"{a['stats']['body']:,}", "Body cần dịch"),
+    c1.markdown(stat_box_html(f"{a['stats']['body']:,}", "Tổng cần dịch"),
                 unsafe_allow_html=True)
-    c2.markdown(stat_box_html(f"{a['stats']['hf_total']:,}", "Header/Footer"),
+    hf_cnt = (a["stats"].get("header", 0) + a["stats"].get("footer", 0)
+              + a["stats"].get("body_repeated", 0))
+    c2.markdown(stat_box_html(f"{hf_cnt:,}", "Header/Footer"),
                 unsafe_allow_html=True)
     c3.markdown(stat_box_html(f"{a['textbox_cnt']:,}", "Text-box"),
                 unsafe_allow_html=True)
@@ -352,8 +356,7 @@ def _render_analysis_panel():
 
         # ── 1. Role toggles ──────────────────────────────────────────────
         st.markdown("##### 🎚 Chọn loại nội dung dịch")
-        st.caption("Mặc định bỏ qua header/footer (thường chứa page#, tên file...). "
-                   "Tick để dịch loại đó.")
+        st.caption("Mặc định dịch tất cả. Bỏ tick nếu muốn skip role đó.")
         role_options = [
             ("header",       "📄 Header (đầu trang)"),
             ("footer",       "📄 Footer (chân trang)"),
@@ -367,9 +370,9 @@ def _render_analysis_panel():
         enabled = {}
         rcols = st.columns(2)
         for i, (role, label) in enumerate(role_options):
-            default_on = role not in {"header", "footer", "body_repeated"}
+            # Tất cả role giờ default ON — header/footer/body_repeated dịch luôn.
             enabled[role] = rcols[i % 2].checkbox(
-                label, value=a.get("role_toggles", {}).get(role, default_on),
+                label, value=a.get("role_toggles", {}).get(role, True),
                 key=f"word_role_toggle_{role}",
             )
         a["role_toggles"] = enabled
@@ -855,20 +858,6 @@ def _run_rescan():
     )
 
 
-def _run_hf_translation():
-    blocks       = st.session_state["word_blocks"]
-    translations = st.session_state["word_translations"]
-    hf_missed    = find_missed(blocks, translations, hf_only=True)
-    _run_partial(
-        hf_missed,
-        label="Dịch H/F",
-        heading=f"### 🌐 Dịch Header & Footer — {len(hf_missed):,} đoạn",
-        log_heading="### 📋 Nhật ký dịch H/F",
-        stat_label="H/F đoạn",
-        success_msg="✅ Đã dịch {n:,} đoạn Header/Footer!",
-    )
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # CACHED TRANSLATED BYTES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1106,16 +1095,14 @@ def render():
         else:
             _render_analysis_panel()
 
-    # ── PHASE 2 RESULT: download + rescan + H/F + OCR ───────────────────
+    # ── PHASE 2 RESULT: download + rescan + OCR ─────────────────────────
     if "word_translations" in st.session_state:
         st.divider()
 
         val          = st.session_state.get("word_validation")
         blocks       = st.session_state["word_blocks"]
         translations = st.session_state["word_translations"]
-        missed_body  = find_missed(blocks, translations, hf_only=False)
-        missed_hf    = find_missed(blocks, translations, hf_only=True)
-        total_hf     = sum(1 for b in blocks if b["role"] in NO_TRANSLATE_ROLES)
+        missed       = find_missed(blocks, translations)
 
         # 1) Validation errors (chỉ show khi LỖI — user không nên download)
         if val and not val["valid"]:
@@ -1139,30 +1126,13 @@ def render():
             type="primary",
         )
 
-        # 3) ACTION buttons — combined label+count
-        rescan_clicked = hf_clicked = False
-        if total_hf > 0:
-            col_rs, col_hf = st.columns(2)
-            with col_rs:
-                rescan_clicked = st.button(
-                    f"🔍  Quét bỏ sót ({len(missed_body)})",
-                    disabled=(len(missed_body) == 0),
-                    use_container_width=True, key="word_rescan_btn",
-                    help="Dịch lại các đoạn body API fail",
-                )
-            with col_hf:
-                hf_clicked = st.button(
-                    f"🌐  Dịch Header / Footer ({len(missed_hf)}/{total_hf})",
-                    disabled=(len(missed_hf) == 0),
-                    use_container_width=True, key="word_hf_btn",
-                    help="Dịch Header, Footer và đoạn lặp trong body",
-                )
-        else:
-            rescan_clicked = st.button(
-                f"🔍  Quét bỏ sót ({len(missed_body)})",
-                disabled=(len(missed_body) == 0),
-                use_container_width=True, key="word_rescan_btn",
-            )
+        # 3) Rescan button — header/footer giờ dịch chung với body, không tách
+        rescan_clicked = st.button(
+            f"🔍  Quét bỏ sót ({len(missed)})",
+            disabled=(len(missed) == 0),
+            use_container_width=True, key="word_rescan_btn",
+            help="Dịch lại các đoạn bị API bỏ sót / fail",
+        )
 
         # 4) OCR — section riêng, tách biệt (user dùng thường xuyên)
         _render_ocr_section()
@@ -1174,9 +1144,6 @@ def render():
 
         if rescan_clicked:
             _run_rescan()
-            st.rerun()
-        if hf_clicked:
-            _run_hf_translation()
             st.rerun()
 
     elif not uploaded_files:

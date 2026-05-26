@@ -701,10 +701,10 @@ def count_by_role(blocks: list[dict]) -> dict:
         "header":        counter.get("header", 0),
         "footer":        counter.get("footer", 0),
         "body_repeated": counter.get("body_repeated", 0),
-        "hf_total":      sum(counter.get(r, 0) for r in NO_TRANSLATE_ROLES),
         "footnote":      counter.get("footnote", 0),
         "endnote":       counter.get("endnote", 0),
         "comment":       counter.get("comment", 0),
+        "media_only":    counter.get("media_only", 0),
         "by_role":       dict(counter),
     }
 
@@ -1341,20 +1341,11 @@ def checkpoint_clear(docx_bytes: bytes, target_lang: str) -> None:
         pass
 
 
-def find_missed(blocks: list[dict], translations: dict,
-                hf_only: bool = False) -> list[dict]:
-    """
-    Trả về list block chưa dịch (translation rỗng hoặc bằng text gốc).
-
-    - hf_only=False (default): chỉ body — bỏ qua H/F, body_repeated
-    - hf_only=True            : chỉ H/F + body_repeated, dùng cho nút "Dịch H/F"
-    """
-    if hf_only:
-        in_set = lambda r: r in NO_TRANSLATE_ROLES
-    else:
-        in_set = lambda r: r not in NO_TRANSLATE_ROLES
+def find_missed(blocks: list[dict], translations: dict) -> list[dict]:
+    """Trả list block translatable chưa dịch (translation rỗng hoặc bằng text gốc)."""
     return [b for b in blocks
-            if in_set(b["role"]) and _is_untranslated(b, translations)]
+            if b["role"] not in NO_TRANSLATE_ROLES
+            and _is_untranslated(b, translations)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
