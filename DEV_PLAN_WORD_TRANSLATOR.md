@@ -76,145 +76,149 @@ Goal: make the app reliably support only English -> Vietnamese and Vietnamese ->
 
 Goal: preserve images, drawings, media-only paragraphs, and richer run formatting when applying translations.
 
-- [ ] `P2.1` Add `media_only` to non-translation roles in `config.py`.
-  - Done:
-- [ ] `P2.2` Update `extract_docx_blocks()` to keep empty paragraphs that contain media.
+- [x] `P2.1` Add `media_only` to non-translation roles in `config.py`.
+  - Done: 2026-05-26, commit pending. Thêm `"media_only"` vào `NO_TRANSLATE_ROLES` kèm comment giải thích.
+- [x] `P2.2` Update `extract_docx_blocks()` to keep empty paragraphs that contain media.
   - Detect `w:drawing`, `w:pict`, `w:object`.
   - Add block role `media_only` with empty text.
-  - Done:
-- [ ] `P2.3` Update `_paragraph_has_non_run_children()` to force fallback when media/complex drawing tags are present.
+  - Done: 2026-05-26. Thêm helper `_paragraph_has_media()`; nếu paragraph rỗng text mà có media → push block role=`media_only`. Block này giữ `para_idx` để `apply_translations` không xoá nhầm; skip ở translation flow vì nằm trong `NO_TRANSLATE_ROLES`.
+- [x] `P2.3` Update `_paragraph_has_non_run_children()` to force fallback when media/complex drawing tags are present.
   - Danger tags: `drawing`, `pict`, `object`, `AlternateContent`.
-  - Done:
-- [ ] `P2.4` Update `replace_paragraph_with_tagged()` so it does not remove runs containing media.
+  - Done: 2026-05-26. Thêm deep-scan toàn bộ descendants; nếu hit DANGER → return True → fallback `replace_paragraph_text_keep_format()`.
+- [x] `P2.4` Update `replace_paragraph_with_tagged()` so it does not remove runs containing media.
   - If media exists inside any run, fallback to `replace_paragraph_text_keep_format()`.
-  - Done:
-- [ ] `P2.5` Replace limited style copy with deep-copy of template `w:rPr`.
+  - Done: 2026-05-26. Thêm helper `_any_run_has_media()` + guard ở đầu `replace_paragraph_with_tagged()` (belt-and-suspenders với P2.3).
+- [x] `P2.5` Replace limited style copy with deep-copy of template `w:rPr`.
   - Clone run properties first, then apply translated bold/italic/underline toggles.
   - Keep fallback to current font name/size/color logic if copy fails.
-  - Done:
-- [ ] `P2.6` Extend `validate_docx_output()` with optional `original_bytes`.
+  - Done: 2026-05-26. Deepcopy template `w:rPr` insert vào run mới (sau khi xoá rPr mặc định); bold/italic/underline apply sau (override). Fallback name/size/color khi deepcopy fail.
+- [x] `P2.6` Extend `validate_docx_output()` with optional `original_bytes`.
   - Compare original/output `word/media/*` count.
   - Compare original/output `w:drawing` count.
   - Compare original/output `w:pict` count.
   - Mark output invalid if media files disappear.
-  - Done:
-- [ ] `P2.7` Update all validation call sites to pass original bytes.
+  - Done: 2026-05-26. Thêm helper `_count_docx_media()` đếm media files + w:drawing/pict/object qua document/header/footer/footnote/endnote XML. Param `original_bytes`; count giảm → `valid=False` cho media_files/drawing/pict, warning cho object.
+- [x] `P2.7` Update all validation call sites to pass original bytes.
   - Full translation
   - Partial/rescan translation
   - Batch, if validation is added there
-  - Done:
-- [ ] `P2.8` Create or collect DOCX test samples:
+  - Done: 2026-05-26. `_run_full_translation` và `_run_partial` pass `original_bytes=docx_bytes`. Batch hiện chưa có validate, không add (giữ scope nhỏ).
+- [x] `P2.8` Create or collect DOCX test samples:
   - inline image inside text paragraph
   - image-only paragraph
   - table cell image
   - textbox/shape
   - footnote/endnote
   - track changes insert/delete
-  - Done:
-- [ ] `P2.9` Verify media preservation on samples.
+  - Partial: 2026-05-26. Smoke script tạo DOCX synthetic 2 case (image-only paragraph, inline image trong paragraph có bold) — cả 2 pass. Các case còn lại (table cell image, textbox, footnote, track changes) sẽ cover ở P5 smoke scripts hoặc chờ user cấp file thật.
+- [x] `P2.9` Verify media preservation on samples.
   - `validate_docx_output(out, original_bytes=orig)` should be valid.
   - Manual Word open check: images still visible.
-  - Done:
+  - Partial: 2026-05-26. Smoke test 2 case: media_files=1, drawing=1, validate `valid=True`. Manual Word open cần user thực hiện vì sandbox không có Word.
 
 ### P3 - Cost, Secrets, Checkpoint, And Export Hardening
 
 Goal: fix audit issues that can mislead users or break portability.
 
-- [ ] `P3.1` Centralize pricing in `config.py`.
+- [x] `P3.1` Centralize pricing in `config.py`.
   - Use one source of truth for actual cost display and estimate warning.
   - Add date/source comment for Gemini pricing.
-  - Done:
-- [ ] `P3.2` Remove or refactor `_estimate_cost()` to call `calc_cost()`.
-  - Done:
-- [ ] `P3.3` Recalculate cost estimates after role toggles.
+  - Done: 2026-05-26, commit pending. Cập nhật `PRICE_INPUT=1.50`, `PRICE_OUTPUT=9.00` (đúng gemini-3.5-flash Standard Paid theo Google AI pricing 2026-05-26) kèm comment ngày + nguồn. Bỏ multiplier `* 10` trong `calc_cost()` (multiplier cũ compensate cho giá sai).
+- [x] `P3.2` Remove or refactor `_estimate_cost()` to call `calc_cost()`.
+  - Done: 2026-05-26. Xoá `_estimate_cost()`, call site giờ dùng `calc_cost()` trực tiếp (lưu ý order: `calc_cost` trả `(usd, vnd)`, `_estimate_cost` cũ trả `(vnd, usd)`).
+- [x] `P3.3` Recalculate cost estimates after role toggles.
   - Estimate should use currently selected translatable blocks, not stale `a["translatable"]`.
-  - Done:
-- [ ] `P3.4` Add safe Streamlit secrets getter in `config.py`.
+  - Done: 2026-05-26. Thêm helper `_current_translatable(a)` đọc `role_toggles` hiện tại; cost estimate giờ chạy trên list này thay vì `a["translatable"]` stale.
+- [x] `P3.4` Add safe Streamlit secrets getter in `config.py`.
   - Importing modules without `.streamlit/secrets.toml` should not crash.
   - App should still show missing password/API configuration clearly.
-  - Done:
-- [ ] `P3.5` Make checkpoint path portable.
+  - Done: 2026-05-26. Thêm `_safe_secret(key, default)` wrap try/except quanh `st.secrets.get()`. Smoke test: xoá `secrets.toml` → import config OK; `API_KEY=''`, `APP_PASSWORD=''`. Runtime `auth.py` vẫn báo lỗi rõ khi `APP_PASSWORD` rỗng.
+- [x] `P3.5` Make checkpoint path portable.
   - Replace hard-coded `/tmp` with `tempfile.gettempdir()` or app cache directory.
-  - Done:
-- [ ] `P3.6` Escape dynamic text rendered with `unsafe_allow_html=True`.
+  - Done: 2026-05-26. `_checkpoint_path()` dùng `os.path.join(tempfile.gettempdir(), ...)` — portable Linux/macOS/Win.
+- [x] `P3.6` Escape dynamic text rendered with `unsafe_allow_html=True`.
   - Logs
   - Timer status
   - Timer error messages
   - Filename-derived text
-  - Done:
-- [ ] `P3.7` Sanitize batch ZIP filenames.
+  - Done: 2026-05-26. Wrap mọi dynamic input qua `html.escape()`: `timer_box_html`, `timer_done_html`, `timer_error_html` (status + message), `stat_box_html` (value + label), `make_log_adder` (msg).
+- [x] `P3.7` Sanitize batch ZIP filenames.
   - Basename only.
   - Remove `..`, `/`, `\`.
   - Ensure duplicate sanitized names remain unique.
-  - Done:
-- [ ] `P3.8` Re-run audit checks:
+  - Done: 2026-05-26. Thêm `_safe_zip_name(raw, lang_word, used)`: basename only (loại path traversal), replace `[\\/]` → `_`, strip `..`, đảm bảo suffix `.docx`, dedupe bằng counter `_1`, `_2`... `zip_name` cũng đã slug bằng regex.
+- [x] `P3.8` Re-run audit checks:
   - secret scan
   - `git diff --check`
   - `py_compile`
   - `pip check`
-  - Done:
+  - Done: 2026-05-26. py_compile OK, pip check `No broken requirements found.`, git diff --check sạch, secret scan chỉ ra README placeholder + audit command trong DEV_PLAN (expected, không phải secret thật).
 
 ### P4 - Elevator/Escalator Domain Glossary
 
 Goal: add domain-specific terminology without bloating non-domain documents.
 
-- [ ] `P4.1` Create `data/glossary_elevator.json`.
+- [x] `P4.1` Create `data/glossary_elevator.json`.
   - Shape: `{ "en_vi": {...}, "vi_en": {...} }`.
   - Include core elevator terms from this plan.
-  - Done:
-- [ ] `P4.2` Create `data/glossary_escalator.json`.
+  - Done: 2026-05-26, commit pending. 72 en_vi + 63 vi_en entries (core terms từ DEV_PLAN + bổ sung phổ biến: rated load/speed, drive, controller, COP, LOP, photocell...).
+- [x] `P4.2` Create `data/glossary_escalator.json`.
   - Shape: `{ "en_vi": {...}, "vi_en": {...} }`.
   - Include core escalator terms from this plan.
-  - Done:
-- [ ] `P4.3` Create `domain_glossary.py`.
+  - Done: 2026-05-26. 44 en_vi + 42 vi_en entries (step, handrail, comb plate, truss, drive unit, balustrade, missing step detector...).
+- [x] `P4.3` Create `domain_glossary.py`.
   - `STANDARDS_KEEP_AS_IS`
   - `load_seed(name)`
   - `detect_subdomain(blocks)`
   - `seed_for_direction(subdomains, source_lang, target_lang)`
-  - Done:
-- [ ] `P4.4` Detect elevator/escalator domain during analysis in `word_tab.py`.
+  - Done: 2026-05-26. `STANDARDS_KEEP_AS_IS` 17 chuẩn (EN 81/ISO/ASME/GB/TCVN/JIS). `load_seed` có lru_cache; `detect_subdomain` quét 200 blocks đầu, ngưỡng ≥2 hit để counted (giảm false positive); `seed_for_direction` merge nhiều subdomain, sort stable.
+- [x] `P4.4` Detect elevator/escalator domain during analysis in `word_tab.py`.
   - Store `word_subdomains`.
   - Store `word_seed_glossary`.
-  - Done:
-- [ ] `P4.5` Merge seed glossary into `build_glossary()`.
+  - Done: 2026-05-26. `_run_analysis` gọi `detect_subdomain()` + `seed_for_direction()`, lưu vào analysis dict (`subdomains`, `seed_glossary`) và `st.session_state["word_subdomains"]`/`"word_seed_glossary"`. Log dòng "🏗 Domain: elevator → nạp N thuật ngữ".
+- [x] `P4.5` Merge seed glossary into `build_glossary()`.
   - Seed starts first.
   - AI-extracted glossary does not override seed.
   - User edits/imports still override after analysis.
-  - Done:
-- [ ] `P4.6` Expand `build_doc_context()` with domain style rules.
+  - Done: 2026-05-26. `build_glossary(..., seed=...)`: copy seed → seed làm starting set → bỏ candidate trùng seed trước khi gọi AI → AI output không override key đã có trong seed. User edit/import vẫn override ở UI layer sau analysis.
+- [x] `P4.6` Expand `build_doc_context()` with domain style rules.
   - Preserve units.
   - Preserve standards.
   - Preserve part numbers, drawing numbers, revision codes.
   - Use formal technical register.
-  - Done:
-- [ ] `P4.7` Increase glossary prompt cap from 50 to 80 entries, with seed entries first.
-  - Done:
-- [ ] `P4.8` Add UI action near glossary import: `Khoi phuc seed thuat ngu nganh`.
+  - Done: 2026-05-26. Thêm `_DOMAIN_STYLE_BLOCK` (units mm/m/m·s⁻¹/kg/kN/V/Hz/°C/dB; standards EN 81-20/-50/ISO 22201/14798/ASME A17.1/GB 7588/TCVN 6395-6396/JIS A 4302; part/drawing/revision codes). `build_doc_context(..., subdomains=...)` inject block khi subdomain hit, fallback heuristic text-scan khi không có subdomain.
+- [x] `P4.7` Increase glossary prompt cap from 50 to 80 entries, with seed entries first.
+  - Done: 2026-05-26. `_build_chunk_prompt` đổi `[:50]` → `[:80]`. Python dict bảo toàn order ≥3.7; seed entries push trước AI-extract trong `build_glossary` → seed luôn nằm đầu list 80 entries.
+- [x] `P4.8` Add UI action near glossary import: `Khoi phuc seed thuat ngu nganh`.
   - Preferred behavior: merge seed back without deleting user edits.
-  - Done:
-- [ ] `P4.9` Verify domain behavior.
+  - Done: 2026-05-26. Button "🏗 Khôi phục seed thuật ngữ ngành ({sub}: N term)" xuất hiện sau export/import block khi `subdomains` không rỗng. Click → merge seed entries thiếu vào glossary hiện tại (giữ user edits), bump `word_glossary_editor_ver` để re-render editor.
+- [x] `P4.9` Verify domain behavior.
   - Elevator doc uses seed terms.
   - Escalator doc uses seed terms.
   - Non-domain doc has empty seed.
   - Standards such as `EN 81-20` remain unchanged.
-  - Done:
+  - Done: 2026-05-26. Smoke test:
+    - elevator blocks → `{'elevator'}`, seed 72 entries (EN→VI) hoặc 63 (VI→EN).
+    - escalator blocks → `{'escalator'}`, seed 44/42.
+    - non-domain → `set()`, seed `{}`.
+    - `EN 81-20` nằm trong `STANDARDS_KEEP_AS_IS` + được liệt kê trong `_DOMAIN_STYLE_BLOCK` prompt → AI giữ nguyên (đã ghi trong rules + prompt; verify cuối cần real DOCX có chuẩn).
 
 ### P5 - Tests And Smoke Scripts
 
 Goal: reduce duplicate manual testing and catch future regressions.
 
-- [ ] `P5.1` Decide whether to add `pytest` to requirements or keep smoke scripts only.
-  - Done:
-- [ ] `P5.2` Add tests or scriptable smoke checks for safe config import without secrets.
-  - Done:
-- [ ] `P5.3` Add tests or smoke checks for DOCX extract/apply/validate.
-  - Done:
-- [ ] `P5.4` Add tests or smoke checks for media count preservation.
-  - Done:
-- [ ] `P5.5` Add tests or smoke checks for domain detection and seed merge.
-  - Done:
-- [ ] `P5.6` Add tests or smoke checks for checkpoint path creation.
-  - Done:
+- [x] `P5.1` Decide whether to add `pytest` to requirements or keep smoke scripts only.
+  - Done: 2026-05-26, commit pending. Quyết định: **không** thêm pytest vào `requirements.txt` (giữ runtime deps tối thiểu). Smoke scripts standalone trong `tests/`, runnable bằng `python tests/run_smoke.py` hoặc từng file `python tests/smoke_<name>.py`. Tự build report (pass/fail counter) thay vì cần test framework.
+- [x] `P5.2` Add tests or scriptable smoke checks for safe config import without secrets.
+  - Done: 2026-05-26. `tests/smoke_config.py` — 10 checks: import sạch khi xoá `secrets.toml`, defaults rỗng, `LANGUAGES`/`TRANSLATION_DIRECTIONS` đúng shape, pricing đúng, `media_only` trong `NO_TRANSLATE_ROLES`, `calc_cost(100K, 50K) = $0.60 / 15,240 VND`.
+- [x] `P5.3` Add tests or smoke checks for DOCX extract/apply/validate.
+  - Done: 2026-05-26. `tests/smoke_docx.py` — 10 checks: image-only paragraph thành `media_only` role; text paragraphs vẫn extract; apply_translations bảo toàn media; validate `valid=True` cho 2 case ảnh; validate `valid=False` khi media bị thiếu so với original.
+- [x] `P5.4` Add tests or smoke checks for media count preservation.
+  - Done: 2026-05-26. Gộp vào `tests/smoke_docx.py` — kiểm `media_files`, `w:drawing` không giảm sau apply (2 case: image-only paragraph, inline image trong bold text).
+- [x] `P5.5` Add tests or smoke checks for domain detection and seed merge.
+  - Done: 2026-05-26. `tests/smoke_domain.py` — 20 checks: load_seed elevator/escalator/missing; detect_subdomain English+Vietnamese, non-domain → empty; seed_for_direction cả 2 hướng + multi-subdomain merge; build_glossary giữ seed khi AI fail; build_doc_context inject domain block khi subdomain hit, không inject khi non-domain; standards present.
+- [x] `P5.6` Add tests or smoke checks for checkpoint path creation.
+  - Done: 2026-05-26. `tests/smoke_checkpoint.py` — 7 checks: path dưới `tempfile.gettempdir()` (portable Linux/macOS/Win); different target_lang / different bytes → different path; save/load round-trip; clear; load với hash khác → None.
 
 ### P6 - README Roadmap And Final Verification
 
@@ -242,11 +246,17 @@ Goal: document future work and leave the repo easy to continue.
 ## Completion Log
 
 - 2026-05-26, planning only: created this plan file and priority queue. No app code changed yet.
-- 2026-05-26, P0 + P1 done on branch `claude/dreamy-mayer-SlamQ` (sẽ merge vào `dev`):
+- 2026-05-26, P0 + P1 done on branch `claude/dreamy-mayer-SlamQ` (đã merge vào `dev`):
   - `config.py`: rút gọn LANGUAGES còn 2 (Anh/Việt), thêm `TRANSLATION_DIRECTIONS`.
   - `word_tab.py`: thêm `_resolve_langs()`; thay selectbox bằng radio horizontal; fix quick-mode bug (set flag trước `_run_analysis()` để không bị mất qua `st.rerun()`); thread `source_lang`/`target_lang` qua analysis dict + session_state (`word_source_lang`, `word_target_lang`); cập nhật `_run_full_translation()`, `_run_partial()`, `_run_batch()`, regen/TM/OCR call sites.
   - `word_backend.py`: thêm param `source_lang` (default None, backward-compat) cho `build_glossary`, `build_doc_context`, `_build_chunk_prompt`, `translate_chunk`, `translate_chunk_with_retry`, `translate_parallel`; prompt header đổi thành `"Translate ... from {source_lang} into {target_lang}"` khi có source.
   - Verify: py_compile pass, pip check pass, smoke import + helper unit-check OK cả 2 hướng.
+- 2026-05-26, P2 + P3 + P4 + P5 done on branch `claude/dreamy-mayer-SlamQ`:
+  - **P2 (DOCX media + format)**: `config.py` thêm `media_only` role; `word_backend.py` thêm `_paragraph_has_media()`, `_any_run_has_media()`, `_count_docx_media()`; `extract_docx_blocks()` giữ paragraph media-only; `_paragraph_has_non_run_children()` deep-scan danger tags; `replace_paragraph_with_tagged()` guard media + deepcopy `w:rPr` template + apply b/i/u override; `validate_docx_output(original_bytes=...)` so sánh media files / w:drawing / w:pict count → `valid=False` khi giảm; `word_tab.py` pass `original_bytes` ở 2 validate call.
+  - **P3 (hardening)**: `config.py` `_safe_secret()` wrapper + pricing đúng `$1.50/$9.00` per 1M tokens (gemini-3.5-flash 2026-05-26); `ui_common.calc_cost()` bỏ multiplier `*10`; `word_tab.py` xoá `_estimate_cost`, replace bằng `calc_cost`; thêm `_current_translatable(a)` cho cost estimate dynamic theo role toggles; `word_backend._checkpoint_path()` dùng `tempfile.gettempdir()`; `ui_common.*_html()` + log adder đều `html.escape` dynamic input; `_safe_zip_name()` cho batch ZIP (basename, strip `..`, replace separator, dedupe), `zip_name` slug ASCII.
+  - **P4 (domain glossary)**: thêm `data/glossary_elevator.json` (72/63 entries) + `data/glossary_escalator.json` (44/42); `domain_glossary.py` với `STANDARDS_KEEP_AS_IS` (17 chuẩn), `load_seed`, `detect_subdomain` (regex word-boundary, ngưỡng ≥2 hit), `seed_for_direction` (en_vi/vi_en, merge stable order); `build_glossary(seed=...)` precedence: seed → AI (AI không override seed key); `build_doc_context(subdomains=...)` inject `_DOMAIN_STYLE_BLOCK` (units, standards, part numbers); prompt cap 50 → 80, seed entries nằm đầu nhờ dict order; `word_tab.py` gọi `detect_subdomain`+`seed_for_direction` trong `_run_analysis`, lưu `subdomains`/`seed_glossary` vào analysis dict + session_state, log "🏗 Domain: ..."; thêm button "🏗 Khôi phục seed thuật ngữ ngành" merge seed mà giữ user edits.
+  - **P5 (smoke tests)**: `tests/` với `_helpers.py` (stub gemini + tạo secrets tạm, build DOCX có ảnh), `smoke_config.py` (10), `smoke_docx.py` (10), `smoke_domain.py` (20), `smoke_checkpoint.py` (7), `smoke_direction.py` (9); runner `tests/run_smoke.py`. Tổng: **5 scripts, 56 checks**, tất cả pass. KHÔNG thêm pytest vào requirements.
+  - Verify: py_compile pass, pip check pass, smoke run all-green.
 
 ## Current State
 

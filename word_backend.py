@@ -306,13 +306,23 @@ def _parse_tagged(tagged: str) -> list[tuple[str, bool, bool, bool]]:
 
 
 def _paragraph_has_non_run_children(paragraph) -> bool:
-    """True nếu paragraph có hyperlink/field/... — không rebuild runs an toàn được."""
+    """True nếu paragraph có hyperlink/field/... — không rebuild runs an toàn được.
+
+    Cũng trả True nếu paragraph chứa drawing/pict/object/AlternateContent ở bất kỳ
+    cấp độ nào (kể cả trong run). Lý do: rebuild runs sẽ xoá những element này → mất ảnh.
+    """
     SAFE = {"pPr", "r", "hyperlink", "ins", "del",
             "bookmarkStart", "bookmarkEnd", "proofErr", "fldSimple",
             "rPr", "pPrChange", "oMath"}
+    DANGER_DESC = {"drawing", "pict", "object", "AlternateContent"}
     for child in paragraph._p.iterchildren():
         tag = child.tag.split("}", 1)[-1]
         if tag not in SAFE:
+            return True
+    # Quét sâu — drawing/pict thường nằm trong w:r, vẫn nguy hiểm khi rebuild
+    for descendant in paragraph._p.iter():
+        d_tag = descendant.tag.split("}", 1)[-1]
+        if d_tag in DANGER_DESC:
             return True
     return False
 
@@ -385,14 +395,26 @@ def replace_paragraph_text_keep_format(paragraph, new_text: str):
             t.text = ""
 
 
+def _any_run_has_media(paragraph) -> bool:
+    """True nếu bất kỳ <w:r> nào trong paragraph chứa drawing/pict/object."""
+    for r in paragraph._p.iter(qn("w:r")):
+        for tag in ("w:drawing", "w:pict", "w:object"):
+            if r.find(f".//{qn(tag)}") is not None:
+                return True
+    return False
+
+
 def replace_paragraph_with_tagged(paragraph, tagged_text: str):
     """
     Path 2 (new): parse <b><i><u> tags trong tagged_text và rebuild runs để
-    giữ inline format. Inherit font/size/color từ run đầu tiên có text.
+    giữ inline format. Inherit toàn bộ run-properties (rPr) qua deepcopy của
+    template's w:rPr — fallback name/size/color nếu deepcopy fail.
+
     Fallback về `replace_paragraph_text_keep_format` nếu paragraph có
-    hyperlink/field, hoặc không parse được tag.
+    hyperlink/field/drawing, hoặc không parse được tag.
     """
-    if _paragraph_has_non_run_children(paragraph):
+    # P2.3/P2.4: bất kỳ run nào chứa media → KHÔNG rebuild runs (mất ảnh)
+    if _paragraph_has_non_run_children(paragraph) or _any_run_has_media(paragraph):
         replace_paragraph_text_keep_format(paragraph, strip_tags(tagged_text))
         return
 
@@ -401,11 +423,19 @@ def replace_paragraph_with_tagged(paragraph, tagged_text: str):
         replace_paragraph_text_keep_format(paragraph, strip_tags(tagged_text))
         return
 
-    # Lấy template format từ run đầu có text
+    # Template format: ưu tiên deepcopy w:rPr; fallback name/size/color
+    from copy import deepcopy
     runs     = paragraph.runs
     template = next((r for r in runs if r.text), runs[0] if runs else None)
+    tpl_rpr = None
     tpl_name = tpl_size = tpl_color = None
     if template is not None:
+        try:
+            rpr_elem = template._r.find(qn("w:rPr"))
+            if rpr_elem is not None:
+                tpl_rpr = deepcopy(rpr_elem)
+        except Exception:
+            tpl_rpr = None
         try: tpl_name  = template.font.name
         except Exception: pass
         try: tpl_size  = template.font.size
@@ -413,7 +443,7 @@ def replace_paragraph_with_tagged(paragraph, tagged_text: str):
         try: tpl_color = template.font.color.rgb
         except Exception: pass
 
-    # Xóa hết runs cũ
+    # Xóa hết runs cũ (an toàn vì đã guard media ở trên)
     p_elem = paragraph._p
     for run in list(runs):
         try: p_elem.remove(run._r)
@@ -424,14 +454,31 @@ def replace_paragraph_with_tagged(paragraph, tagged_text: str):
         if not text:
             continue
         run = paragraph.add_run(text)
+        # Apply deepcopy rPr trước, sau đó override bold/italic/underline
+        if tpl_rpr is not None:
+            try:
+                # Xoá rPr mặc định run mới tạo nếu có, rồi insert template rPr
+                existing = run._r.find(qn("w:rPr"))
+                if existing is not None:
+                    run._r.remove(existing)
+                run._r.insert(0, deepcopy(tpl_rpr))
+            except Exception:
+                # Fallback: dùng font name/size/color
+                if tpl_name:  run.font.name = tpl_name
+                if tpl_size:  run.font.size = tpl_size
+                if tpl_color:
+                    try: run.font.color.rgb = tpl_color
+                    except Exception: pass
+        else:
+            if tpl_name:  run.font.name = tpl_name
+            if tpl_size:  run.font.size = tpl_size
+            if tpl_color:
+                try: run.font.color.rgb = tpl_color
+                except Exception: pass
+        # Toggle bold/italic/underline theo tagged text — set sau deepcopy để override
         if bold:      run.bold      = True
         if italic:    run.italic    = True
         if underline: run.underline = True
-        if tpl_name:  run.font.name = tpl_name
-        if tpl_size:  run.font.size = tpl_size
-        if tpl_color:
-            try: run.font.color.rgb = tpl_color
-            except Exception: pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -563,6 +610,14 @@ def _iter_image_alt_texts(doc):
             yield el, "alt", val
 
 
+def _paragraph_has_media(paragraph) -> bool:
+    """True nếu paragraph chứa drawing/picture/object (ảnh, shape, embed)."""
+    for tag in ("w:drawing", "w:pict", "w:object"):
+        if paragraph._p.find(f".//{qn(tag)}") is not None:
+            return True
+    return False
+
+
 def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
     """
     Đọc DOCX → list block {id, text, role, para_idx, table_cell, ...}.
@@ -571,6 +626,8 @@ def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
     Role:
     - header / footer / textbox : từ meta hint
     - body_repeated             : text lặp lại ≥ 3 lần trong body (heuristic H/F)
+    - media_only                : paragraph rỗng text nhưng có ảnh/drawing → giữ nguyên,
+                                  không dịch (P2: trước đây bị skip → mất ảnh)
     - section_heading / title / bullet / table_cell / note / toc / paragraph
     """
     doc = Document(io.BytesIO(docx_bytes))
@@ -578,6 +635,18 @@ def extract_docx_blocks(docx_bytes: bytes) -> list[dict]:
     for idx, (para, meta) in enumerate(_iter_blocks_with_meta(doc)):
         text = para.text.strip()
         if not text:
+            # Empty paragraph: nếu có media → vẫn track để apply_translations
+            # không xoá nhầm. Skip nếu hoàn toàn trống.
+            if _paragraph_has_media(para):
+                blocks.append({
+                    "id":          f"p{idx}",
+                    "text":        "",
+                    "text_tagged": "",
+                    "has_format":  False,
+                    "role":        "media_only",
+                    "para_idx":    idx,
+                    "table_cell":  meta["table_cell"],
+                })
             continue
         role = _detect_role(
             para,
@@ -646,27 +715,35 @@ _TECH_TERM_RE   = re.compile(r"\b[A-Z][a-zA-Z]{4,}\b")
 
 def build_glossary(client, blocks: list[dict], target_lang: str,
                    source_lang: str | None = None,
+                   seed: dict | None = None,
                    top_n: int = 30, min_repeat: int = 3) -> dict:
     """
     One-shot AI call để dịch top-N thuật ngữ lặp lại trong doc.
     Inject vào mọi chunk prompt để dịch consistent cross-chunk.
 
+    Precedence (P4.5): seed → AI-extract. AI KHÔNG override seed entry đã có.
+    Frontend layer sau đó merge user-imported terms với precedence cao nhất.
+
     Heuristic candidates:
     - Noun phrases (capitalized, 1-4 words) — "Hoistway Door", "Control Panel"
     - Single technical terms (CamelCase, ≥5 chars) — "Inverter", "Calibration"
 
-    Trả về {} nếu API fail hoặc không tìm thấy term.
+    Trả về (ít nhất) seed dict nếu AI fail.
     """
+    seed_dict = dict(seed or {})
+
     text_all = " ".join(b["text"] for b in blocks
                         if b["role"] not in NO_TRANSLATE_ROLES)
     if not text_all:
-        return {}
+        return seed_dict
 
     candidates = _NOUN_PHRASE_RE.findall(text_all) + _TECH_TERM_RE.findall(text_all)
     counter    = Counter(candidates)
     top_terms  = [w for w, c in counter.most_common(top_n * 2) if c >= min_repeat][:top_n]
+    # Bỏ những term đã có trong seed để không tốn token AI dịch lại
+    top_terms  = [t for t in top_terms if t not in seed_dict]
     if not top_terms:
-        return {}
+        return seed_dict
 
     src_clause = f"from {source_lang} " if source_lang else ""
     prompt = f"""Translate these technical terms {src_clause}to {target_lang}.
@@ -684,23 +761,44 @@ Terms ({len(top_terms)}):
     try:
         raw, _, _ = call_gemini(client, prompt)
     except Exception:
-        return {}
+        return seed_dict
     parsed = parse_json_loose(raw)
     if not isinstance(parsed, dict):
-        return {}
-    # Filter — chỉ giữ entry hợp lệ
-    return {
-        str(k).strip(): str(v).strip()
-        for k, v in parsed.items()
-        if k and v and isinstance(v, str) and v.strip() != str(k).strip()
-    }
+        return seed_dict
+    # Filter — chỉ giữ entry hợp lệ; seed NOT overridden
+    out = dict(seed_dict)
+    for k, v in parsed.items():
+        if not (k and v and isinstance(v, str)):
+            continue
+        ks = str(k).strip()
+        vs = str(v).strip()
+        if not ks or not vs or vs == ks:
+            continue
+        if ks in out:
+            continue   # seed có rồi → giữ
+        out[ks] = vs
+    return out
 
 
-def build_doc_context(blocks: list[dict], source_lang: str | None = None) -> str:
+_DOMAIN_STYLE_BLOCK = """\
+Domain: elevator/escalator engineering.
+Use formal technical register.
+Preserve units verbatim: mm, m, m/s, kg, kN, V, Hz, A, W, kW, deg C, °C, dB.
+Preserve standard references verbatim: EN 81-20, EN 81-50, ISO 22201, ISO 14798,
+ASME A17.1, GB 7588, TCVN 6395, TCVN 6396, JIS A 4302.
+Preserve part numbers, drawing numbers, revision codes (e.g. "Rev. A", "DWG-1234").
+Avoid colloquialisms.
+Translate terminology consistently across the document.
+"""
+
+
+def build_doc_context(blocks: list[dict], source_lang: str | None = None,
+                      subdomains: set[str] | None = None) -> str:
     """Tóm tắt cấu trúc tài liệu (title + headings + TOC + domain hint).
 
-    `source_lang` được nhận để inject vào context nếu cần (Phase 1: không thay đổi
-    output hiện tại, nhưng đảm bảo signature consistent).
+    `source_lang` được nhận để consistent signature; chưa inject vì AI đã có
+    `source_lang` ở header prompt (P1.8).
+    `subdomains`: nếu chứa `elevator`/`escalator` → thêm domain style guide (P4.6).
     """
     titles   = [b["text"] for b in blocks if b["role"] == "title"][:2]
     headings = [b["text"] for b in blocks if b["role"] == "section_heading"][:10]
@@ -712,13 +810,18 @@ def build_doc_context(blocks: list[dict], source_lang: str | None = None) -> str
     if tocs:     lines.append("TOC: "            + " | ".join(tocs[:5]))
     ctx = "\n".join(lines) if lines else "Technical document."
 
-    all_text = " ".join(b["text"] for b in blocks[:30]).lower()
-    if any(k in all_text for k in ("elevator", "lift", "hoistway", "schindler", "inventio")):
-        ctx += "\nDomain: elevator/lift engineering."
-    elif any(k in all_text for k in ("safety", "standard", "regulation", "iso", "en 81")):
-        ctx += "\nDomain: safety standards."
-    elif any(k in all_text for k in ("software", "api", "code", "function")):
-        ctx += "\nDomain: software/IT."
+    # Domain style — ưu tiên subdomains explicit từ caller (P4.4); fallback heuristic
+    # text-scan khi không có subdomain set.
+    if subdomains and (subdomains & {"elevator", "escalator"}):
+        ctx += "\n" + _DOMAIN_STYLE_BLOCK
+    else:
+        all_text = " ".join(b["text"] for b in blocks[:30]).lower()
+        if any(k in all_text for k in ("elevator", "lift", "hoistway", "schindler", "inventio")):
+            ctx += "\n" + _DOMAIN_STYLE_BLOCK
+        elif any(k in all_text for k in ("safety", "standard", "regulation", "iso", "en 81")):
+            ctx += "\nDomain: safety standards."
+        elif any(k in all_text for k in ("software", "api", "code", "function")):
+            ctx += "\nDomain: software/IT."
     return ctx
 
 
@@ -834,8 +937,10 @@ def _build_chunk_prompt(chunk: list[dict], target_lang: str, doc_context: str,
 
     glossary_section = ""
     if glossary:
-        # Limit glossary size để không bloat prompt
-        items = list(glossary.items())[:50]
+        # Limit glossary size để không bloat prompt — tăng 50 → 80 (P4.7).
+        # Python ≥3.7 dict bảo toàn insertion order: seed entries (push trước
+        # AI-extract trong build_glossary) sẽ xuất hiện đầu list → ưu tiên cao.
+        items = list(glossary.items())[:80]
         glossary_str = "\n".join(f"  {en} → {vi}" for en, vi in items)
         glossary_section = (
             f"\nGlossary (USE THESE EXACT translations for consistency across the document):\n"
@@ -1084,7 +1189,36 @@ def apply_translations(original_bytes: bytes, blocks: list[dict],
     return buf.getvalue()
 
 
-def validate_docx_output(docx_bytes: bytes) -> dict:
+def _count_docx_media(docx_bytes: bytes) -> dict:
+    """Đếm media trong DOCX → dict {media_files, drawing, pict, object}."""
+    import zipfile
+    counts = {"media_files": 0, "drawing": 0, "pict": 0, "object": 0}
+    try:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+            names = zf.namelist()
+            counts["media_files"] = sum(1 for n in names if n.startswith("word/media/"))
+            # XML count: drawing/pict/object trong document.xml + header/footer
+            from lxml import etree
+            for n in names:
+                if not n.endswith(".xml"):
+                    continue
+                if not (n.startswith("word/") and
+                        ("document" in n or "header" in n or "footer" in n
+                         or "footnote" in n or "endnote" in n)):
+                    continue
+                try:
+                    root = etree.fromstring(zf.read(n))
+                    for tag in ("drawing", "pict", "object"):
+                        counts[tag] += sum(1 for _ in root.iter(qn(f"w:{tag}")))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return counts
+
+
+def validate_docx_output(docx_bytes: bytes,
+                         original_bytes: bytes | None = None) -> dict:
     """
     Validate translated DOCX output. Returns:
     {
@@ -1094,6 +1228,9 @@ def validate_docx_output(docx_bytes: bytes) -> dict:
       "warnings": [str, ...],
       "errors": [str, ...],
     }
+
+    Khi `original_bytes` được cấp → so sánh số media file, drawing, pict với
+    bản gốc; nếu media bị mất → đánh `valid=False`.
     """
     import zipfile
     result = {"valid": True, "block_count": 0, "image_count": 0,
@@ -1128,6 +1265,30 @@ def validate_docx_output(docx_bytes: bytes) -> dict:
         # 4. Sanity checks
         if result["block_count"] == 0:
             result["warnings"].append("Document has 0 paragraphs (suspicious)")
+
+        # 5. Media preservation (chỉ chạy khi có original)
+        if original_bytes is not None:
+            orig = _count_docx_media(original_bytes)
+            out  = _count_docx_media(docx_bytes)
+            if out["media_files"] < orig["media_files"]:
+                result["errors"].append(
+                    f"Media file count giảm: {orig['media_files']} → {out['media_files']}"
+                )
+                result["valid"] = False
+            if out["drawing"] < orig["drawing"]:
+                result["errors"].append(
+                    f"<w:drawing> count giảm: {orig['drawing']} → {out['drawing']}"
+                )
+                result["valid"] = False
+            if out["pict"] < orig["pict"]:
+                result["errors"].append(
+                    f"<w:pict> count giảm: {orig['pict']} → {out['pict']}"
+                )
+                result["valid"] = False
+            if out["object"] < orig["object"]:
+                result["warnings"].append(
+                    f"<w:object> count giảm: {orig['object']} → {out['object']}"
+                )
     except Exception as e:
         result["valid"] = False
         result["errors"].append(f"Validation crashed: {str(e)[:200]}")
@@ -1193,14 +1354,16 @@ def tm_store(blocks: list[dict], translations: dict, tm: dict,
 # ══════════════════════════════════════════════════════════════════════════════
 # CHECKPOINT — persist partial translations across browser refresh
 # ══════════════════════════════════════════════════════════════════════════════
-import os, pickle as _pickle
+import os, pickle as _pickle, tempfile as _tempfile
 
 
 def _checkpoint_path(docx_bytes: bytes, target_lang: str) -> str:
     # Hash TOÀN BỘ file để tránh collision khi 2 docx khác nhau cùng prefix 8KB.
+    # Dùng `tempfile.gettempdir()` để portable: Linux=/tmp, macOS=/var/folders/...,
+    # Windows=%TEMP%\... (P3.5 — trước đây hard-code /tmp gây mất checkpoint trên Win).
     h = hashlib.md5(docx_bytes).hexdigest()[:16]
     slug = target_lang.replace(" ", "_")[:12]
-    return f"/tmp/tr_ckpt_{h}_{slug}.pkl"
+    return os.path.join(_tempfile.gettempdir(), f"tr_ckpt_{h}_{slug}.pkl")
 
 
 def checkpoint_save(docx_bytes: bytes, target_lang: str, translations: dict) -> None:
