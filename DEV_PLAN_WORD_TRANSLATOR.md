@@ -265,6 +265,8 @@ Goal: document future work and leave the repo easy to continue.
 - 2026-05-27, UI simplification on `dev`:
   - Removed the user-facing `Dịch nâng cao` path. Single-file mode now has one primary `Dịch` button that analyzes, translates, validates, and shows download/OCR actions.
   - README updated to document the one-click flow instead of basic/advanced translation.
+- 2026-05-27, cleanup on `dev`:
+  - Removed dead advanced-analysis UI code from `word_tab.py` (`_render_analysis_panel`, `_current_translatable`, stale glossary editor/role toggle state cleanup). Core translation/OCR paths unchanged.
 
 ## Current State
 
