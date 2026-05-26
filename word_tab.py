@@ -16,7 +16,8 @@ import pandas as pd
 import streamlit as st
 
 from config import (
-    LANGUAGES, LANG_EN, MAX_WORD_WORKERS, NO_TRANSLATE_ROLES,
+    LANGUAGES, LANG_EN, TRANSLATION_DIRECTIONS,
+    MAX_WORD_WORKERS, NO_TRANSLATE_ROLES,
 )
 from gemini import get_client
 from ui_common import (
@@ -50,6 +51,19 @@ def _ensure_tm() -> dict:
     if "word_tm" not in st.session_state:
         st.session_state["word_tm"] = {}
     return st.session_state["word_tm"]
+
+
+def _resolve_langs(direction_label: str | None = None) -> tuple[str, str, str]:
+    """Resolve (label, source_lang, target_lang) từ direction label hoặc session_state.
+
+    Fallback hợp lệ khi state thiếu: dùng hướng đầu tiên trong TRANSLATION_DIRECTIONS.
+    """
+    label = direction_label or st.session_state.get("word_direction")
+    for d_label, src, tgt in TRANSLATION_DIRECTIONS:
+        if d_label == label:
+            return d_label, src, tgt
+    d_label, src, tgt = TRANSLATION_DIRECTIONS[0]
+    return d_label, src, tgt
 
 
 def _estimate_cost(tok_in: int, tok_out: int) -> tuple:
@@ -107,7 +121,8 @@ def _run_translation(chunks, target_lang, doc_context,
                      total_blocks, prefix_label="Dịch",
                      glossary: dict | None = None,
                      custom_rules: dict | None = None,
-                     on_chunk_done=None):
+                     on_chunk_done=None,
+                     source_lang: str | None = None):
     """
     Chạy `translate_parallel` trong thread, main loop poll & render UI.
     Trả về (translations, tok_in, tok_out, elapsed).
@@ -128,7 +143,7 @@ def _run_translation(chunks, target_lang, doc_context,
     threading.Thread(
         target=translate_parallel,
         args=(holder, client, chunks, target_lang, doc_context,
-              MAX_WORD_WORKERS, glossary, custom_rules),
+              MAX_WORD_WORKERS, glossary, custom_rules, source_lang),
         daemon=True,
     ).start()
 
@@ -181,7 +196,7 @@ def _run_translation(chunks, target_lang, doc_context,
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 1 — PHÂN TÍCH (extract + glossary build)
 # ══════════════════════════════════════════════════════════════════════════════
-def _run_analysis(uploaded_docx, lang_word):
+def _run_analysis(uploaded_docx, lang_word, source_lang: str, target_lang: str):
     """
     Phase 1: extract + build glossary + TM preview.
     Lưu kết quả vào session_state["word_analysis"], xong rerun để show editor.
@@ -223,8 +238,7 @@ def _run_analysis(uploaded_docx, lang_word):
         if image_alt_cnt > 0:
             add_log(f"   • Image alt-texts:      {image_alt_cnt:,} (sẽ dịch)")
 
-        target_lang = LANG_EN[lang_word]
-
+        # target_lang/source_lang nhận từ caller (xem _resolve_langs).
         # TM preview — kèm breakdown per role
         tm           = _ensure_tm()
         tm_cached, _ = tm_lookup(translatable, tm, target_lang)
@@ -253,7 +267,7 @@ def _run_analysis(uploaded_docx, lang_word):
         # Glossary build
         add_log("📚 Build glossary từ thuật ngữ lặp lại...")
         client   = get_client()
-        glossary = build_glossary(client, blocks, target_lang)
+        glossary = build_glossary(client, blocks, target_lang, source_lang)
         if glossary:
             add_log(f"📖 Tìm thấy {len(glossary)} thuật ngữ — review/sửa ở dưới rồi dịch")
         else:
@@ -277,6 +291,7 @@ def _run_analysis(uploaded_docx, lang_word):
             "docx_bytes":    docx_bytes,
             "filename":      uploaded_docx.name,
             "lang":          lang_word,
+            "source_lang":   source_lang,
             "target_lang":   target_lang,
         }
         # Clear old kết quả từ lần dịch trước
@@ -610,6 +625,7 @@ def _run_full_translation():
     a = st.session_state["word_analysis"]
     blocks       = a["blocks"]
     target_lang  = a["target_lang"]
+    source_lang  = a.get("source_lang") or _resolve_langs()[1]
     doc_context  = a["doc_context"]
     glossary     = a["glossary"]
     custom_rules = a.get("custom_rules") or {}
@@ -676,6 +692,7 @@ def _run_full_translation():
                 glossary=glossary,
                 custom_rules=custom_rules or None,
                 on_chunk_done=_save_ckpt,
+                source_lang=source_lang,
             )
             translations.update(new_translations)
             tm_added = tm_store(remaining, new_translations, tm, target_lang)
@@ -709,6 +726,8 @@ def _run_full_translation():
         st.session_state["word_docx_bytes"]   = docx_bytes
         st.session_state["word_filename"]     = a["filename"]
         st.session_state["word_lang"]         = a["lang"]
+        st.session_state["word_source_lang"]  = source_lang
+        st.session_state["word_target_lang"]  = target_lang
         st.session_state["word_doc_context"]  = doc_context
         st.session_state["word_tok_in"]       = tok_in
         st.session_state["word_tok_out"]      = tok_out
@@ -765,7 +784,8 @@ def _run_partial(missed: list, label: str, heading: str, log_heading: str,
         return
 
     doc_context  = st.session_state["word_doc_context"]
-    target_lang  = LANG_EN[st.session_state["word_lang"]]
+    target_lang  = st.session_state.get("word_target_lang") or LANG_EN[st.session_state["word_lang"]]
+    source_lang  = st.session_state.get("word_source_lang") or _resolve_langs()[1]
     glossary     = st.session_state.get("word_glossary")
     custom_rules = st.session_state.get("word_custom_rules")
     tm           = _ensure_tm()
@@ -809,6 +829,7 @@ def _run_partial(missed: list, label: str, heading: str, log_heading: str,
             len(remaining), prefix_label=label,
             glossary=glossary,
             custom_rules=custom_rules or None,
+            source_lang=source_lang,
         )
         translations.update(new_translations)
         tm_added = tm_store(remaining, new_translations, tm, target_lang)
@@ -1021,11 +1042,10 @@ def _clear_state():
     # KHÔNG xóa "word_tm" — TM persist xuyên suốt session
 
 
-def _run_batch(uploaded_files, lang_word):
+def _run_batch(uploaded_files, lang_word, source_lang: str, target_lang: str):
     """Batch-translate multiple DOCX files, sharing TM across all files."""
     st.markdown("### 📚 Dịch theo lô")
 
-    target_lang = LANG_EN[lang_word]
     file_status = {f.name: "⏳ Chờ" for f in uploaded_files}
     status_ph   = st.empty()
     results     = {}  # name → bytes
@@ -1041,7 +1061,7 @@ def _run_batch(uploaded_files, lang_word):
             blocks      = extract_docx_blocks(docx_bytes)
             doc_context = build_doc_context(blocks)
             client      = get_client()
-            glossary    = build_glossary(client, blocks, target_lang)
+            glossary    = build_glossary(client, blocks, target_lang, source_lang)
             tm          = _ensure_tm()
             translatable = [b for b in blocks if b["role"] not in NO_TRANSLATE_ROLES]
             cached, remaining = tm_lookup(translatable, tm, target_lang)
@@ -1060,6 +1080,7 @@ def _run_batch(uploaded_files, lang_word):
                     timer_ph, prog_ph, _noop_stats, _noop_log,
                     len(remaining), prefix_label=uploaded.name[:20],
                     glossary=glossary,
+                    source_lang=source_lang,
                 )
                 translations.update(new_tr)
                 tm_store(remaining, new_tr, tm, target_lang)
@@ -1150,7 +1171,17 @@ def render():
     )
     # Backward compat: treat single file the same as before
     uploaded_docx = uploaded_files[0] if uploaded_files and len(uploaded_files) == 1 else None
-    lang_word = st.selectbox("🌐 Ngôn ngữ đích", LANGUAGES, key="word_lang_select")
+
+    direction_label = st.radio(
+        "🌐 Hướng dịch",
+        [d[0] for d in TRANSLATION_DIRECTIONS],
+        horizontal=True,
+        key="word_direction",
+    )
+    _, source_lang, target_lang = _resolve_langs(direction_label)
+    # Backward-compat label cho session_state["word_lang"]:
+    # giữ "Tiếng Anh"/"Tiếng Việt" để code download/filename không phải đổi nhiều.
+    lang_word = "Tiếng Anh" if target_lang == "English" else "Tiếng Việt"
 
     # TM status sidebar info
     tm_size = len(st.session_state.get("word_tm", {}))
@@ -1169,7 +1200,7 @@ def render():
         if st.button("📚  Dịch tất cả file (batch)", use_container_width=True,
                      type="primary", key="word_batch_btn"):
             st.session_state.pop("word_batch_result", None)
-            _run_batch(uploaded_files, lang_word)
+            _run_batch(uploaded_files, lang_word, source_lang, target_lang)
             st.rerun()
         elif "word_batch_result" not in st.session_state:
             st.info(f"📁 Đã chọn {len(uploaded_files)} file — bấm **Dịch tất cả file (batch)** để dịch.")
@@ -1201,13 +1232,14 @@ def render():
 
     if basic_clicked:
         _clear_state()
-        _run_analysis(uploaded_docx, lang_word)
-        # Cơ bản = phân tích + dịch luôn, không show option
+        # Cơ bản = phân tích + dịch luôn. Set quick-mode TRƯỚC khi
+        # _run_analysis() trigger st.rerun() (nếu set sau, flag bị mất).
         st.session_state["word_quick_mode"] = True
+        _run_analysis(uploaded_docx, lang_word, source_lang, target_lang)
 
     if advanced_clicked:
         _clear_state()
-        _run_analysis(uploaded_docx, lang_word)
+        _run_analysis(uploaded_docx, lang_word, source_lang, target_lang)
 
     # ── PHASE 1 RESULT: stats + glossary editor + Dịch button ───────────
     if "word_analysis" in st.session_state:
@@ -1313,14 +1345,19 @@ def render():
                 from word_backend import translate_chunk
                 chunk = [blocks_by_id_lookup[bid] for bid in selected_ids]
                 rules = {"_extra": extra_inst} if extra_inst.strip() else None
+                regen_tgt = st.session_state.get("word_target_lang") \
+                            or LANG_EN[st.session_state["word_lang"]]
+                regen_src = st.session_state.get("word_source_lang") \
+                            or _resolve_langs()[1]
                 with st.spinner(f"Dịch lại {len(chunk)} đoạn..."):
                     try:
                         new_tr, _, _ = translate_chunk(
                             get_client(), chunk,
-                            LANG_EN[st.session_state["word_lang"]],
+                            regen_tgt,
                             st.session_state["word_doc_context"],
                             glossary=st.session_state.get("word_glossary"),
                             custom_rules=rules,
+                            source_lang=regen_src,
                         )
                         st.session_state["word_translations"].update(new_tr)
                         st.session_state["word_translations_version"] = (
@@ -1335,7 +1372,8 @@ def render():
             if st.button("✅ Xác nhận & lưu vào TM", key="word_review_confirm_btn",
                          use_container_width=True):
                 tm = _ensure_tm()
-                target_lang = LANG_EN[st.session_state["word_lang"]]
+                target_lang = st.session_state.get("word_target_lang") \
+                              or LANG_EN[st.session_state["word_lang"]]
                 changed = 0
                 for _, row in edited_review.iterrows():
                     orig_tr = translations.get(row["id"], "")
@@ -1375,9 +1413,11 @@ def render():
                         progress_bar.progress(done / total,
                                               text=f"Đang OCR {done}/{total} ảnh...")
 
+                    ocr_target = st.session_state.get("word_target_lang") \
+                                 or LANG_EN[st.session_state["word_lang"]]
                     results = ocr_and_translate_images(
                         get_client(), imgs,
-                        LANG_EN[st.session_state["word_lang"]],
+                        ocr_target,
                         progress_callback=_on_progress,
                     )
                     progress_bar.empty()
