@@ -43,14 +43,15 @@ MIN_CHUNK_BLOCKS   = 8         # tối thiểu paragraph / chunk
 MAX_CHUNK_BLOCKS   = 40        # tối đa paragraph / chunk
 
 # H/F detection: text lặp lại ≥ HF_REPEAT_THRESHOLD lần (và dài ≥ HF_REPEAT_MIN_CHARS)
-# → đánh dấu là body_repeated (mặc định không dịch — bấm nút mới dịch)
+# → đánh dấu là body_repeated. Vẫn dịch (xem `NO_TRANSLATE_ROLES`).
 HF_REPEAT_THRESHOLD = 3
 HF_REPEAT_MIN_CHARS = 10
 
-# Roles KHÔNG dịch mặc định ở lần đầu — user phải bấm nút riêng để dịch.
+# Roles KHÔNG dịch mặc định.
 # `media_only` = paragraph chỉ chứa ảnh/drawing/object, không có text →
-# giữ nguyên XML, không gửi AI, không thay runs (P2).
-NO_TRANSLATE_ROLES = {"header", "footer", "body_repeated", "media_only"}
+# giữ nguyên XML, không gửi AI, không thay runs.
+# (Header / footer / body_repeated giờ dịch mặc định — không tách nút riêng nữa.)
+NO_TRANSLATE_ROLES = {"media_only"}
 
 # ── Ngôn ngữ ──────────────────────────────────────────────────────────────────
 # App tập trung 2 hướng dịch: Anh ↔ Việt cho tài liệu kỹ thuật thang máy/thang cuốn.
