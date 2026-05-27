@@ -1164,7 +1164,9 @@ def _ocr_state() -> dict:
             "edited":        {},   # occ_id → str (bản dịch user sửa)
             "estimate":      None,
             "mode":          "caption",  # "caption" | "overlay"
-            "phase":         "idle",     # idle | preflight | done
+            "phase":         "idle",     # idle | done
+            "export":        None,       # {"bytes": ..., "name": ...} sau khi xuất
+            "export_error":  None,       # lỗi xuất (nếu có) — show ở UI
         }
     return st.session_state["word_ocr_state"]
 
@@ -1174,74 +1176,33 @@ def _reset_ocr_state():
 
 
 def _render_ocr_section():
-    from word_backend import (
-        extract_image_occurrences, estimate_ocr_cost,
-        ocr_and_translate_images,
-        insert_ocr_captions_into_docx,
-    )
+    from word_backend import extract_image_occurrences, estimate_ocr_cost
 
     state = _ocr_state()
     phase = state["phase"]
 
     with st.expander("🖼  OCR & dịch text trong ảnh", expanded=False):
-        # ── Phase: idle → run preflight ───────────────────────────────
+        # ── Phase: idle → quét + OCR luôn (1 click, không confirm) ───
         if phase == "idle":
-            if st.button("📊 Quét ảnh & ước tính chi phí",
-                         key="word_ocr_preflight_btn",
+            st.caption(
+                "Quét tất cả ảnh trong DOCX, OCR chữ và dịch sang ngôn ngữ đích. "
+                "Bấm nút bên dưới để chạy ngay — chi phí thực tế hiển thị sau khi xong."
+            )
+            if st.button("🚀 Dịch OCR ảnh trong file",
+                         key="word_ocr_run_btn",
+                         type="primary",
                          use_container_width=True):
                 occs = extract_image_occurrences(st.session_state["word_docx_bytes"])
-                state["occurrences"] = occs
-                state["estimate"]    = estimate_ocr_cost(occs)
-                state["phase"]       = "preflight"
-                # Default: tick mọi ảnh ≥ ngưỡng
-                state["selection"] = {
-                    o["id"]: (len(o["data"]) >= 5_000) for o in occs
-                }
+                state["occurrences"]   = occs
+                state["estimate"]      = estimate_ocr_cost(occs)
+                state["selection"]     = {o["id"]: (len(o["data"]) >= 5_000) for o in occs}
                 state["keep_original"] = {o["id"]: True for o in occs}
-                st.rerun()
-            else:
-                st.caption(
-                    "Quét tất cả ảnh trong DOCX, OCR chữ và dịch sang ngôn ngữ đích. "
-                    "Bước 1: ước tính chi phí. Bước 2: chạy OCR. Bước 3: review + xuất."
-                )
-
-        # ── Phase: preflight → confirm + run OCR ──────────────────────
-        elif phase == "preflight":
-            est = state["estimate"]
-            occs = state["occurrences"]
-            if not occs:
-                st.info("Không có ảnh trong DOCX.")
-                if st.button("↩️ Đóng", key="word_ocr_close_empty"):
-                    _reset_ocr_state()
-                    st.rerun()
-            else:
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Ảnh tổng", f"{est['n_total']:,}")
-                c2.metric("Sẽ OCR", f"{est['n_to_ocr']:,}",
-                          help=f"Skip {est['n_skipped']:,} ảnh nhỏ < 5KB (icon/decor)")
-                c3.metric("Ước tính", f"${est['usd']:.4f}",
-                          help=f"≈ {est['vnd']:,.0f} VND  ·  "
-                               f"{est['input_tokens']:,} in / {est['output_tokens']:,} out tokens")
-
-                st.caption(
-                    "Ước tính tính theo kích thước ảnh × giá Gemini Vision. "
-                    "Chi phí thực tế lấy từ `usage_metadata` sau khi chạy xong."
-                )
-
-                confirm = st.checkbox(
-                    "✅ Tôi đồng ý chạy OCR và phát sinh chi phí Gemini",
-                    key="word_ocr_confirm_cost",
-                )
-                cc1, cc2 = st.columns([3, 1])
-                if cc1.button("🚀 Chạy OCR", disabled=not confirm,
-                              type="primary", use_container_width=True,
-                              key="word_ocr_run_btn"):
+                if not occs:
+                    st.info("Không có ảnh trong DOCX.")
+                    state["phase"] = "done"
+                else:
                     _run_ocr(state)
-                    st.rerun()
-                if cc2.button("↩️ Huỷ", use_container_width=True,
-                              key="word_ocr_cancel_btn"):
-                    _reset_ocr_state()
-                    st.rerun()
+                st.rerun()
 
         # ── Phase: done → review + export ─────────────────────────────
         elif phase == "done":
@@ -1441,102 +1402,121 @@ def _render_ocr_review(state: dict):
     else:
         if st.button("⬇️ Xuất DOCX với OCR", type="primary",
                      use_container_width=True, key="word_ocr_export_btn"):
-            base_bytes = _get_cached_translated_bytes()
-            mode = state["mode"]
-            selected_ids = [o["id"] for o in selected]
-            edited       = {oid: state["edited"].get(oid, "") for oid in selected_ids}
-            remove_ids   = [o["id"] for o in selected
-                            if not state["keep_original"].get(o["id"], True)
-                            and mode == "caption"]
-
-            if mode == "overlay":
-                try:
-                    from word_backend import (
-                        replace_docx_image_occurrences, render_translated_overlay,
-                        overlay_font_status, OverlayFontError,
-                    )
-                    overlay_ok = True
-                except Exception:
-                    overlay_ok = False
-                # Pre-check font tiếng Việt — nếu thiếu → ALL ảnh fallback caption
-                font_status = overlay_font_status() if overlay_ok else {"ok": False}
-                if overlay_ok and not font_status["ok"]:
-                    st.warning(
-                        "⚠️ Không tìm thấy font Unicode hỗ trợ tiếng Việt → "
-                        "toàn bộ ảnh sẽ fallback sang caption mode để không bị "
-                        "render ô vuông."
-                    )
-                    overlay_ok = False
-
-                # Build replacements: every selected occ with regions → overlay;
-                # những ảnh thiếu regions → fallback caption
-                if overlay_ok:
-                    replacements: dict[str, tuple[bytes, str]] = {}
-                    caption_fallback_ids: list[str] = []
-                    for o in selected:
-                        r = state["results"].get(o["id"], {})
-                        regions = r.get("regions") or []
-                        if not regions:
-                            caption_fallback_ids.append(o["id"])
-                            continue
-                        # Override translation in regions với edited text khi user đã sửa toàn block
-                        try:
-                            new_bytes, new_ct = render_translated_overlay(
-                                o["data"], o["content_type"],
-                                regions=regions,
-                                edited_translation=edited.get(o["id"], ""),
-                            )
-                            replacements[o["id"]] = (new_bytes, new_ct)
-                        except OverlayFontError:
-                            # Font biến mất giữa preflight và export → fallback hết
-                            caption_fallback_ids.extend([s["id"] for s in selected])
-                            replacements.clear()
-                            break
-                        except Exception as e:
-                            st.warning(f"Overlay fail cho {o['filename']}: {e}; fallback caption.")
-                            caption_fallback_ids.append(o["id"])
-
-                    out_bytes = replace_docx_image_occurrences(
-                        base_bytes, state["occurrences"], replacements,
-                    )
-                    # Apply caption cho ảnh fallback (loại trùng selected_id)
-                    fallback_unique = list(dict.fromkeys(caption_fallback_ids))
-                    if fallback_unique:
-                        out_bytes = insert_ocr_captions_into_docx(
-                            out_bytes, state["occurrences"], state["results"],
-                            selected_ids=fallback_unique,
-                            edited_translations=edited,
-                        )
-                    suffix = "_ocr_overlay"
-                else:
-                    out_bytes = insert_ocr_captions_into_docx(
-                        base_bytes, state["occurrences"], state["results"],
-                        selected_ids=selected_ids,
-                        edited_translations=edited,
-                    )
-                    suffix = "_ocr_caption"
-            else:  # caption
-                out_bytes = insert_ocr_captions_into_docx(
-                    base_bytes, state["occurrences"], state["results"],
-                    selected_ids=selected_ids,
-                    edited_translations=edited,
-                    remove_original_ids=remove_ids,
+            state["export"]       = None
+            state["export_error"] = None
+            try:
+                out_bytes, suffix = _build_ocr_export_bytes(state, selected)
+                out_name = st.session_state["word_filename"].replace(
+                    ".docx",
+                    f"_translated_{st.session_state['word_lang'][:2]}{suffix}.docx",
                 )
-                suffix = "_ocr_caption"
+                state["export"] = {"bytes": out_bytes, "name": out_name}
+            except Exception as e:
+                import traceback
+                state["export_error"] = f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
+            st.rerun()
 
-            out_name = st.session_state["word_filename"].replace(
-                ".docx",
-                f"_translated_{st.session_state['word_lang'][:2]}{suffix}.docx",
-            )
-            st.download_button(
-                label=f"📥 Tải {out_name}",
-                data=out_bytes,
-                file_name=out_name,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-                key="word_ocr_download_final",
-            )
+    # Persist download / error qua rerun
+    if state.get("export_error"):
+        st.error("❌ Xuất DOCX thất bại:")
+        st.code(state["export_error"])
+    elif state.get("export"):
+        exp = state["export"]
+        st.success(f"✅ Đã tạo file `{exp['name']}` — bấm để tải.")
+        st.download_button(
+            label=f"📥 Tải {exp['name']}",
+            data=exp["bytes"],
+            file_name=exp["name"],
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+            key="word_ocr_download_final",
+        )
 
     if st.button("🔁 Quét lại OCR", key="word_ocr_restart"):
         _reset_ocr_state()
         st.rerun()
+
+
+def _build_ocr_export_bytes(state: dict, selected: list[dict]) -> tuple[bytes, str]:
+    """Build DOCX bytes cho OCR export — caption hoặc overlay mode.
+    Trả (bytes, suffix). Raise Exception nếu fail — caller hiển thị lỗi.
+    """
+    from word_backend import insert_ocr_captions_into_docx
+
+    base_bytes   = _get_cached_translated_bytes()
+    mode         = state["mode"]
+    selected_ids = [o["id"] for o in selected]
+    edited       = {oid: state["edited"].get(oid, "") for oid in selected_ids}
+    remove_ids   = [o["id"] for o in selected
+                    if not state["keep_original"].get(o["id"], True)
+                    and mode == "caption"]
+
+    if mode == "overlay":
+        try:
+            from word_backend import (
+                replace_docx_image_occurrences, render_translated_overlay,
+                overlay_font_status, OverlayFontError,
+            )
+            overlay_ok = True
+        except Exception:
+            overlay_ok = False
+
+        font_status = overlay_font_status() if overlay_ok else {"ok": False}
+        if overlay_ok and not font_status["ok"]:
+            st.warning(
+                "⚠️ Không tìm thấy font Unicode hỗ trợ tiếng Việt → "
+                "toàn bộ ảnh sẽ fallback sang caption mode để không bị "
+                "render ô vuông."
+            )
+            overlay_ok = False
+
+        if overlay_ok:
+            replacements: dict[str, tuple[bytes, str]] = {}
+            caption_fallback_ids: list[str] = []
+            for o in selected:
+                r = state["results"].get(o["id"], {})
+                regions = r.get("regions") or []
+                if not regions:
+                    caption_fallback_ids.append(o["id"])
+                    continue
+                try:
+                    new_bytes, new_ct = render_translated_overlay(
+                        o["data"], o["content_type"],
+                        regions=regions,
+                        edited_translation=edited.get(o["id"], ""),
+                    )
+                    replacements[o["id"]] = (new_bytes, new_ct)
+                except OverlayFontError:
+                    caption_fallback_ids.extend([s["id"] for s in selected])
+                    replacements.clear()
+                    break
+                except Exception as e:
+                    st.warning(f"Overlay fail cho {o['filename']}: {e}; fallback caption.")
+                    caption_fallback_ids.append(o["id"])
+
+            out_bytes = replace_docx_image_occurrences(
+                base_bytes, state["occurrences"], replacements,
+            )
+            fallback_unique = list(dict.fromkeys(caption_fallback_ids))
+            if fallback_unique:
+                out_bytes = insert_ocr_captions_into_docx(
+                    out_bytes, state["occurrences"], state["results"],
+                    selected_ids=fallback_unique,
+                    edited_translations=edited,
+                )
+            return out_bytes, "_ocr_overlay"
+
+        out_bytes = insert_ocr_captions_into_docx(
+            base_bytes, state["occurrences"], state["results"],
+            selected_ids=selected_ids,
+            edited_translations=edited,
+        )
+        return out_bytes, "_ocr_caption"
+
+    out_bytes = insert_ocr_captions_into_docx(
+        base_bytes, state["occurrences"], state["results"],
+        selected_ids=selected_ids,
+        edited_translations=edited,
+        remove_original_ids=remove_ids,
+    )
+    return out_bytes, "_ocr_caption"
