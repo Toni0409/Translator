@@ -1,38 +1,34 @@
-"""Hằng số dùng chung cho toàn app."""
+"""Hằng số dùng chung cho toàn app (Word)."""
 import streamlit as st
 
-# ── Secrets ───────────────────────────────────────────────────────────────────
-API_KEY      = st.secrets.get("GEMINI_API_KEY", "")
-APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 
-# ── PDF ───────────────────────────────────────────────────────────────────────
-PDF_MODEL    = "gemini-2.5-flash"
-PRICE_INPUT  = 0.10       # USD / 1M input tokens (sẽ ×10 vì model tier)
-PRICE_OUTPUT = 0.40       # USD / 1M output tokens
+# ── Secrets (safe getter — P3.4) ──────────────────────────────────────────────
+def _safe_secret(key: str, default: str = "") -> str:
+    """Đọc Streamlit secret an toàn khi `.streamlit/secrets.toml` không tồn tại
+    (CLI smoke test, unit test). App vẫn báo lỗi rõ khi password/API thiếu lúc
+    runtime — chỉ tránh crash ở import time.
+    """
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+API_KEY      = _safe_secret("GEMINI_API_KEY", "")
+APP_PASSWORD = _safe_secret("APP_PASSWORD", "")
+
+# ── Pricing (Gemini 3.5 Flash tier) ───────────────────────────────────────────
+# Nguồn: Google AI pricing page, kiểm tra 2026-05-26.
+# `gemini-3.5-flash` Standard Paid: $1.50 input / $9.00 output per 1M tokens.
+# Đây là cost source-of-truth duy nhất — `calc_cost()` trong ui_common dùng giá này.
+# Nếu Google đổi giá → cập nhật cả comment ngày + 2 giá trị bên dưới.
+PRICE_INPUT  = 1.50       # USD / 1M input tokens (gemini-3.5-flash)
+PRICE_OUTPUT = 9.00       # USD / 1M output tokens (gemini-3.5-flash)
 USD_TO_VND   = 25_400
-PDF_DELAY    = 0.3        # delay giữa các page để né rate limit
-
-MAX_RETRIES  = 5
-RETRY_CODES  = ("429", "resource_exhausted", "quota", "rate")
-
-UNICODE_FONTS = [
-    "Carlito-Regular.ttf",
-    "/usr/share/fonts/truetype/crosextra/Carlito-Regular.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "C:/Windows/Fonts/Arial.ttf",
-    "C:/Windows/Fonts/calibri.ttf",
-]
-
-BOLD_FONT_PAIRS = [
-    ("Carlito-Regular.ttf", "Carlito-Bold.ttf"),
-    ("Arial.ttf",           "Arialbd.ttf"),
-    ("calibri.ttf",         "calibrib.ttf"),
-    ("times.ttf",           "timesbd.ttf"),
-    ("DejaVuSans.ttf",      "DejaVuSans-Bold.ttf"),
-]
 
 # ── Word ──────────────────────────────────────────────────────────────────────
 WORD_MODELS = [
+    "gemini-3.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
@@ -47,21 +43,27 @@ MIN_CHUNK_BLOCKS   = 8         # tối thiểu paragraph / chunk
 MAX_CHUNK_BLOCKS   = 40        # tối đa paragraph / chunk
 
 # H/F detection: text lặp lại ≥ HF_REPEAT_THRESHOLD lần (và dài ≥ HF_REPEAT_MIN_CHARS)
-# → đánh dấu là body_repeated (mặc định không dịch — bấm nút mới dịch)
+# → đánh dấu là body_repeated. Vẫn dịch (xem `NO_TRANSLATE_ROLES`).
 HF_REPEAT_THRESHOLD = 3
 HF_REPEAT_MIN_CHARS = 10
 
-# Roles KHÔNG dịch mặc định ở lần đầu — user phải bấm nút riêng để dịch
-NO_TRANSLATE_ROLES = {"header", "footer", "body_repeated"}
+# Roles KHÔNG dịch mặc định.
+# `media_only` = paragraph chỉ chứa ảnh/drawing/object, không có text →
+# giữ nguyên XML, không gửi AI, không thay runs.
+# (Header / footer / body_repeated giờ dịch mặc định — không tách nút riêng nữa.)
+NO_TRANSLATE_ROLES = {"media_only"}
 
 # ── Ngôn ngữ ──────────────────────────────────────────────────────────────────
-LANGUAGES = ["Tiếng Việt", "Tiếng Anh", "Tiếng Nhật", "Tiếng Trung", "Tiếng Pháp", "Tiếng Đức"]
+# App tập trung 2 hướng dịch: Anh ↔ Việt cho tài liệu kỹ thuật thang máy/thang cuốn.
+LANGUAGES = ["Tiếng Anh", "Tiếng Việt"]
 
 LANG_EN = {
-    "Tiếng Việt":  "Vietnamese",
-    "Tiếng Anh":   "English",
-    "Tiếng Nhật":  "Japanese",
-    "Tiếng Trung": "Chinese",
-    "Tiếng Pháp":  "French",
-    "Tiếng Đức":   "German",
+    "Tiếng Anh":  "English",
+    "Tiếng Việt": "Vietnamese",
 }
+
+# (label, source_lang, target_lang) — dùng cho radio "Hướng dịch"
+TRANSLATION_DIRECTIONS = [
+    ("Anh → Việt", "English",    "Vietnamese"),
+    ("Việt → Anh", "Vietnamese", "English"),
+]

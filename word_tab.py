@@ -16,7 +16,8 @@ import pandas as pd
 import streamlit as st
 
 from config import (
-    LANGUAGES, LANG_EN, MAX_WORD_WORKERS, NO_TRANSLATE_ROLES,
+    LANGUAGES, LANG_EN, TRANSLATION_DIRECTIONS,
+    MAX_WORD_WORKERS, NO_TRANSLATE_ROLES,
 )
 from gemini import get_client
 from ui_common import (
@@ -27,10 +28,10 @@ from word_backend import (
     extract_docx_blocks, build_doc_context, build_glossary, chunk_blocks,
     translate_parallel, apply_translations, find_missed,
     get_working_model, count_by_role,
-    tm_lookup, tm_store, tm_key,
     checkpoint_save, checkpoint_load, checkpoint_clear,
-    export_bilingual_docx, quality_check, validate_docx_output,
+    validate_docx_output,
 )
+from domain_glossary import detect_subdomain, seed_for_direction
 
 
 # Keys session_state cho tab Word — tập trung 1 chỗ để dễ clear
@@ -40,23 +41,61 @@ SS_KEYS = (
     "word_tok_in", "word_tok_out", "word_elapsed", "word_num_chunks",
     "word_summary", "word_glossary", "word_analysis",
 )
-# Note: "word_tm" intentionally KHÔNG ở đây — persist xuyên suốt nhiều docs/session
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UI HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
-def _ensure_tm() -> dict:
-    if "word_tm" not in st.session_state:
-        st.session_state["word_tm"] = {}
-    return st.session_state["word_tm"]
+def _safe_zip_name(raw: str, lang_word: str, used: set[str]) -> str:
+    """Sanitize tên file cho batch ZIP (P3.7).
+
+    - basename only (loại path traversal `..` và separator `/` `\\`)
+    - giữ extension `.docx`; thêm suffix `_<2chars lang>` trước `.docx`
+    - đảm bảo unique trong `used` (thêm `_1`, `_2`... nếu trùng)
+    """
+    import os as _os, re as _re_local
+    base = _os.path.basename(raw or "file.docx")
+    base = _re_local.sub(r"[\\/]+", "_", base)
+    base = base.replace("..", "_")
+    if not base.lower().endswith(".docx"):
+        base += ".docx"
+    suffix = f"_{lang_word[:2]}"
+    stem, ext = base[:-5], base[-5:]   # ".docx"
+    candidate = f"{stem}{suffix}{ext}"
+    if candidate not in used:
+        return candidate
+    # Đụng tên → thêm counter
+    i = 1
+    while f"{stem}{suffix}_{i}{ext}" in used:
+        i += 1
+    return f"{stem}{suffix}_{i}{ext}"
 
 
-def _estimate_cost(tok_in: int, tok_out: int) -> tuple:
-    """Estimate cost in (vnd, usd). Gemini Flash pricing."""
-    usd = tok_in * 0.075 / 1_000_000 + tok_out * 0.30 / 1_000_000
-    vnd = usd * 25_000
-    return vnd, usd
+def _resolve_langs(direction_label: str | None = None) -> tuple[str, str, str]:
+    """Resolve (label, source_lang, target_lang) từ direction label hoặc session_state.
+
+    Fallback hợp lệ khi state thiếu: dùng hướng đầu tiên trong TRANSLATION_DIRECTIONS.
+    """
+    label = direction_label or st.session_state.get("word_direction")
+    for d_label, src, tgt in TRANSLATION_DIRECTIONS:
+        if d_label == label:
+            return d_label, src, tgt
+    d_label, src, tgt = TRANSLATION_DIRECTIONS[0]
+    return d_label, src, tgt
+
+
+def _current_translatable(a: dict) -> list:
+    """Translatable blocks dựa trên `a["role_toggles"]` hiện tại (P3.3).
+
+    Nếu user chưa toggle gì, fallback về list ban đầu từ extract.
+    """
+    toggles = a.get("role_toggles")
+    if not toggles:
+        return a["translatable"]
+    skip = {r for r, on in toggles.items() if not on}
+    return [b for b in a["blocks"]
+            if b["role"] not in skip
+            and not b.get("_toc_mirror")]
 
 
 def _make_job_ui(heading: str, stat_col1_label: str,
@@ -85,7 +124,7 @@ def _make_job_ui(heading: str, stat_col1_label: str,
 
 def _finalize_job(timer_ph, prog, add_log,
                   elapsed: float, count: int, label: str,
-                  tok_in: int, tok_out: int, tm_added: int = 0):
+                  tok_in: int, tok_out: int):
     usd, vnd = calc_cost(tok_in, tok_out)
     prog.progress(100, text=f"✅ {label} xong!")
     timer_ph.markdown(
@@ -94,8 +133,6 @@ def _finalize_job(timer_ph, prog, add_log,
     )
     add_log("─" * 44)
     add_log(f"🎉 Xong {count:,} đoạn trong {elapsed:.1f}s")
-    if tm_added:
-        add_log(f"💾 TM: lưu thêm {tm_added} entry")
     add_log(f"💵 Chi phí: ${usd:.4f} USD ≈ {vnd:,.0f} VND")
 
 
@@ -107,7 +144,8 @@ def _run_translation(chunks, target_lang, doc_context,
                      total_blocks, prefix_label="Dịch",
                      glossary: dict | None = None,
                      custom_rules: dict | None = None,
-                     on_chunk_done=None):
+                     on_chunk_done=None,
+                     source_lang: str | None = None):
     """
     Chạy `translate_parallel` trong thread, main loop poll & render UI.
     Trả về (translations, tok_in, tok_out, elapsed).
@@ -128,7 +166,7 @@ def _run_translation(chunks, target_lang, doc_context,
     threading.Thread(
         target=translate_parallel,
         args=(holder, client, chunks, target_lang, doc_context,
-              MAX_WORD_WORKERS, glossary, custom_rules),
+              MAX_WORD_WORKERS, glossary, custom_rules, source_lang),
         daemon=True,
     ).start()
 
@@ -181,7 +219,7 @@ def _run_translation(chunks, target_lang, doc_context,
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 1 — PHÂN TÍCH (extract + glossary build)
 # ══════════════════════════════════════════════════════════════════════════════
-def _run_analysis(uploaded_docx, lang_word):
+def _run_analysis(uploaded_docx, lang_word, source_lang: str, target_lang: str):
     """
     Phase 1: extract + build glossary + TM preview.
     Lưu kết quả vào session_state["word_analysis"], xong rerun để show editor.
@@ -207,7 +245,9 @@ def _run_analysis(uploaded_docx, lang_word):
 
         add_log(f"✅ {stats['total']:,} đoạn ({total_chars:,} ký tự body)")
         add_log(f"   • Body cần dịch:       {stats['body']:,}")
-        add_log(f"   • Header/Footer (skip):{stats['hf_total']:,}")
+        hf_cnt = stats.get("header", 0) + stats.get("footer", 0) + stats.get("body_repeated", 0)
+        if hf_cnt > 0:
+            add_log(f"   • Header/Footer/lặp:   {hf_cnt:,} (đã gộp vào body để dịch)")
         if textbox_cnt > 0:
             add_log(f"   • Text-box / shape:    {textbox_cnt:,} (sẽ dịch)")
         if table_cnt > 0:
@@ -223,22 +263,26 @@ def _run_analysis(uploaded_docx, lang_word):
         if image_alt_cnt > 0:
             add_log(f"   • Image alt-texts:      {image_alt_cnt:,} (sẽ dịch)")
 
-        target_lang = LANG_EN[lang_word]
+        # target_lang/source_lang nhận từ caller (xem _resolve_langs).
 
-        # TM preview
-        tm           = _ensure_tm()
-        tm_cached, _ = tm_lookup(translatable, tm, target_lang)
-        if tm_cached:
-            add_log(f"💾 TM: {len(tm_cached):,}/{len(translatable):,} đoạn dùng cache (skip API)")
-        else:
-            add_log(f"💾 TM: 0 hit (TM hiện có {len(tm):,} entry)")
+        # Domain detection + seed glossary (P4.4 + P4.5)
+        subdomains = detect_subdomain(blocks)
+        seed = seed_for_direction(subdomains, source_lang, target_lang)
+        if subdomains:
+            add_log(f"🏗 Domain: {', '.join(sorted(subdomains))} "
+                    f"→ nạp {len(seed)} thuật ngữ chuyên ngành làm seed")
 
-        # Glossary build
+        # Glossary build (seed → AI-extract; seed không bị override)
         add_log("📚 Build glossary từ thuật ngữ lặp lại...")
         client   = get_client()
-        glossary = build_glossary(client, blocks, target_lang)
+        glossary = build_glossary(client, blocks, target_lang,
+                                  source_lang=source_lang, seed=seed)
+        new_from_ai = len(glossary) - len(seed)
         if glossary:
-            add_log(f"📖 Tìm thấy {len(glossary)} thuật ngữ — review/sửa ở dưới rồi dịch")
+            if seed and new_from_ai > 0:
+                add_log(f"📖 Glossary: {len(seed)} seed + {new_from_ai} AI = {len(glossary)} term")
+            else:
+                add_log(f"📖 Tìm thấy {len(glossary)} thuật ngữ — review/sửa ở dưới rồi dịch")
         else:
             add_log("📖 Không có thuật ngữ lặp đủ ngưỡng — bỏ qua glossary")
 
@@ -252,14 +296,21 @@ def _run_analysis(uploaded_docx, lang_word):
             "footnote_cnt":  footnote_cnt,
             "endnote_cnt":   endnote_cnt,
             "comment_cnt":   comment_cnt,
-            "tm_hits":       len(tm_cached),
-            "doc_context":   build_doc_context(blocks),
+            "doc_context":   build_doc_context(blocks, source_lang=source_lang,
+                                               subdomains=subdomains),
             "glossary":      glossary,
+            # Snapshot để restore khi user lỡ xoá entries trong editor
+            "_glossary_initial": dict(glossary),
             "docx_bytes":    docx_bytes,
             "filename":      uploaded_docx.name,
             "lang":          lang_word,
+            "source_lang":   source_lang,
             "target_lang":   target_lang,
+            "subdomains":    subdomains,
+            "seed_glossary": seed,
         }
+        st.session_state["word_subdomains"]    = subdomains
+        st.session_state["word_seed_glossary"] = seed
         # Clear old kết quả từ lần dịch trước
         for k in ("word_blocks", "word_translations", "word_summary"):
             st.session_state.pop(k, None)
@@ -282,9 +333,11 @@ def _render_analysis_panel():
     # ── TIER 1 — Quick mode: stats + primary action ──────────────────────
     st.markdown("### 📊 Kết quả phân tích")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.markdown(stat_box_html(f"{a['stats']['body']:,}", "Body cần dịch"),
+    c1.markdown(stat_box_html(f"{a['stats']['body']:,}", "Tổng cần dịch"),
                 unsafe_allow_html=True)
-    c2.markdown(stat_box_html(f"{a['stats']['hf_total']:,}", "Header/Footer"),
+    hf_cnt = (a["stats"].get("header", 0) + a["stats"].get("footer", 0)
+              + a["stats"].get("body_repeated", 0))
+    c2.markdown(stat_box_html(f"{hf_cnt:,}", "Header/Footer"),
                 unsafe_allow_html=True)
     c3.markdown(stat_box_html(f"{a['textbox_cnt']:,}", "Text-box"),
                 unsafe_allow_html=True)
@@ -298,20 +351,12 @@ def _render_analysis_panel():
     if comment_cnt > 0:
         st.info(f"💬 **{comment_cnt:,} comment** trong tài liệu — sẽ được dịch.")
 
-    if a["tm_hits"] > 0:
-        pct = 100 * a["tm_hits"] / max(len(a["translatable"]), 1)
-        st.success(
-            f"💾 **Translation Memory**: {a['tm_hits']:,}/{len(a['translatable']):,} đoạn "
-            f"({pct:.1f}%) sẽ dùng cache cũ — không gọi API."
-        )
-
     # ── TIER 2 — Single advanced expander (no nested expanders!) ─────────
     with st.expander("⚙️ Tuỳ chỉnh nâng cao", expanded=False):
 
         # ── 1. Role toggles ──────────────────────────────────────────────
         st.markdown("##### 🎚 Chọn loại nội dung dịch")
-        st.caption("Mặc định bỏ qua header/footer (thường chứa page#, tên file...). "
-                   "Tick để dịch loại đó.")
+        st.caption("Mặc định dịch tất cả. Bỏ tick nếu muốn skip role đó.")
         role_options = [
             ("header",       "📄 Header (đầu trang)"),
             ("footer",       "📄 Footer (chân trang)"),
@@ -325,9 +370,9 @@ def _render_analysis_panel():
         enabled = {}
         rcols = st.columns(2)
         for i, (role, label) in enumerate(role_options):
-            default_on = role not in {"header", "footer", "body_repeated"}
+            # Tất cả role giờ default ON — header/footer/body_repeated dịch luôn.
             enabled[role] = rcols[i % 2].checkbox(
-                label, value=a.get("role_toggles", {}).get(role, default_on),
+                label, value=a.get("role_toggles", {}).get(role, True),
                 key=f"word_role_toggle_{role}",
             )
         a["role_toggles"] = enabled
@@ -402,6 +447,8 @@ def _render_analysis_panel():
                 "Xóa cell **Bản dịch** (để trống) để loại entry khỏi glossary. "
                 "Có thể thêm dòng mới."
             )
+            # Versioned key — đổi khi restore để force re-render editor
+            gver = st.session_state.get("word_glossary_editor_ver", 0)
             df = pd.DataFrame([
                 {"Thuật ngữ gốc": k, "Bản dịch": v}
                 for k, v in a["glossary"].items()
@@ -414,7 +461,7 @@ def _render_analysis_panel():
                 },
                 use_container_width=True, hide_index=True,
                 num_rows="dynamic",
-                key="word_glossary_editor",
+                key=f"word_glossary_editor_v{gver}",
             )
             # Sync edits back
             new_gloss = {}
@@ -425,6 +472,26 @@ def _render_analysis_panel():
                     new_gloss[en] = vi
             a["glossary"] = new_gloss
             st.session_state["word_analysis"] = a
+
+            # Diff so với glossary ban đầu — cảnh báo nếu user lỡ xoá entries
+            initial = a.get("_glossary_initial") or {}
+            removed = set(initial) - set(new_gloss)
+            added   = set(new_gloss) - set(initial)
+            if removed or added:
+                cols = st.columns([4, 1])
+                msg = f"📊 Glossary: {len(initial)} → {len(new_gloss)}"
+                if removed:
+                    msg += f"  •  ⚠️ Đã loại **{len(removed)}** entry"
+                if added:
+                    msg += f"  •  ➕ Thêm **{len(added)}**"
+                cols[0].caption(msg)
+                if removed:
+                    if cols[1].button("↩️ Khôi phục", key="word_glossary_restore",
+                                      help="Reset glossary về kết quả phân tích ban đầu"):
+                        a["glossary"] = dict(initial)
+                        st.session_state["word_analysis"] = a
+                        st.session_state["word_glossary_editor_ver"] = gver + 1
+                        st.rerun()
 
         # Glossary export/import — always shown so user can import even when empty
         gcolA, gcolB = st.columns(2)
@@ -454,40 +521,34 @@ def _render_analysis_panel():
                 except Exception as e:
                     st.error(str(e))
 
-        st.divider()
-
-        # ── 4. Translation Memory ────────────────────────────────────────
-        tm = _ensure_tm()
-        st.markdown(f"##### 💾 Translation Memory")
-        st.caption(f"Hiện có **{len(tm):,} entry** trong TM.")
-        tcolA, tcolB = st.columns(2)
-        with tcolA:
-            if tm:
-                import json as _json
-                st.download_button(
-                    "⬇️ Export TM (.json)",
-                    data=_json.dumps(tm, ensure_ascii=False, indent=2),
-                    file_name="word_tm.json", mime="application/json",
-                    use_container_width=True, key="word_tm_export",
-                )
-            else:
-                st.caption("(TM hiện tại rỗng)")
-        with tcolB:
-            up = st.file_uploader("⬆️ Import TM (.json)", type=["json"], key="word_tm_import",
-                                  label_visibility="collapsed")
-            if up:
-                try:
-                    import json as _json
-                    loaded = _json.loads(up.read())
-                    if isinstance(loaded, dict):
-                        _ensure_tm().update(loaded)
-                        st.success(f"Đã import {len(loaded)} TM entries")
-                except Exception as e:
-                    st.error(str(e))
+        # Seed restore (P4.8) — merge lại seed mà KHÔNG xoá user edits.
+        seed_gloss = a.get("seed_glossary") or {}
+        if seed_gloss:
+            sub_label = ", ".join(sorted(a.get("subdomains") or set())) or "—"
+            if st.button(
+                f"🏗 Khôi phục seed thuật ngữ ngành ({sub_label}: {len(seed_gloss)} term)",
+                key="word_glossary_seed_restore",
+                help="Merge seed glossary chuyên ngành thang máy/thang cuốn vào "
+                     "glossary hiện tại. User edits được giữ — chỉ seed bị thiếu sẽ thêm lại.",
+                use_container_width=True,
+            ):
+                cur = a.get("glossary") or {}
+                added_back = 0
+                for k, v in seed_gloss.items():
+                    if k not in cur:
+                        cur[k] = v
+                        added_back += 1
+                a["glossary"] = cur
+                st.session_state["word_analysis"] = a
+                gver_now = st.session_state.get("word_glossary_editor_ver", 0)
+                st.session_state["word_glossary_editor_ver"] = gver_now + 1
+                st.success(f"Đã merge lại {added_back} thuật ngữ seed "
+                           f"(tổng glossary hiện có: {len(cur)})")
+                st.rerun()
 
         st.divider()
 
-        # ── 5. Custom rules per role ─────────────────────────────────────
+        # ── 4. Custom rules per role ─────────────────────────────────────
         st.markdown("##### ⚙️ Custom rules per role")
         st.caption(
             "Định nghĩa rule riêng cho từng role — sẽ được inject vào mọi chunk prompt. "
@@ -514,22 +575,17 @@ def _render_analysis_panel():
     # the (possibly collapsed) advanced expander.
     cost_cap = st.session_state.get("word_cost_cap", 0.5)
 
-    # Dịch button — nói rõ còn bao nhiêu sau TM
-    n_remain = len(a["translatable"]) - a["tm_hits"]
-    label = (f"🚀 Dịch ngay ({n_remain:,} đoạn)"
-             if n_remain > 0
-             else f"🚀 Dịch ngay — apply {a['tm_hits']:,} TM hit (không gọi API)")
+    # Dịch button — số đoạn translatable hiện tại (theo role toggles)
+    translatable_now = _current_translatable(a)
+    n_remain = len(translatable_now)
+    label = f"🚀 Dịch ngay ({n_remain:,} đoạn)"
 
-    # Estimate cost for remaining blocks
+    # Estimate cost cho currently-selected blocks (P3.3 — theo role toggles)
     if n_remain > 0:
-        translatable = a["translatable"]
-        tm = _ensure_tm()
-        target_lang = a["target_lang"]
-        _, remaining_blocks = tm_lookup(translatable, tm, target_lang)
-        est_chars = sum(len(b["text"]) for b in remaining_blocks)
+        est_chars = sum(len(b["text"]) for b in translatable_now)
         est_in_tok = int(est_chars * 0.4)
         est_out_tok = int(est_in_tok * 1.5)
-        _, est_usd = _estimate_cost(est_in_tok, est_out_tok)
+        est_usd, _ = calc_cost(est_in_tok, est_out_tok)
         st.caption(f"💰 Ước tính chi phí: ~${est_usd:.3f} USD cho {n_remain:,} đoạn")
         if cost_cap > 0 and est_usd > cost_cap:
             st.warning(
@@ -569,11 +625,11 @@ def _run_full_translation():
     a = st.session_state["word_analysis"]
     blocks       = a["blocks"]
     target_lang  = a["target_lang"]
+    source_lang  = a.get("source_lang") or _resolve_langs()[1]
     doc_context  = a["doc_context"]
     glossary     = a["glossary"]
     custom_rules = a.get("custom_rules") or {}
     docx_bytes   = a["docx_bytes"]
-    tm           = _ensure_tm()
 
     # Dynamic skip_roles from per-role toggles
     toggles = a.get("role_toggles", {})
@@ -595,14 +651,12 @@ def _run_full_translation():
         if toc_mirror_cnt:
             add_log(f"🔗 TOC: {toc_mirror_cnt} entries sẽ dùng lại translation từ heading")
 
-        cached, remaining = tm_lookup(translatable, tm, target_lang)
-        if cached:
-            add_log(f"💾 TM hit: {len(cached):,}/{len(translatable):,} đoạn — skip API")
-        add_log(f"📝 Sẽ gọi API cho {len(remaining):,} đoạn")
+        add_log(f"📝 Sẽ gọi API cho {len(translatable):,} đoạn")
 
-        translations = dict(cached)   # khởi đầu với TM hits
+        translations: dict = {}
 
         # Checkpoint recovery: restore partial translations from previous run
+        remaining = list(translatable)
         ckpt = checkpoint_load(docx_bytes, target_lang)
         if ckpt:
             ckpt_hits = sum(1 for b in remaining if b["id"] in ckpt)
@@ -614,7 +668,6 @@ def _run_full_translation():
         tok_in = tok_out = 0
         elapsed = 0.0
         num_chunks = 0
-        tm_added = 0
 
         if remaining:
             chunks     = chunk_blocks(remaining)
@@ -626,7 +679,7 @@ def _run_full_translation():
             add_log(f"⚡ Dịch song song {MAX_WORD_WORKERS} luồng")
 
             def _save_ckpt(tr_so_far):
-                checkpoint_save(docx_bytes, target_lang, {**cached, **tr_so_far})
+                checkpoint_save(docx_bytes, target_lang, dict(tr_so_far))
 
             new_translations, tok_in, tok_out, elapsed = _run_translation(
                 chunks, target_lang, doc_context,
@@ -635,17 +688,17 @@ def _run_full_translation():
                 glossary=glossary,
                 custom_rules=custom_rules or None,
                 on_chunk_done=_save_ckpt,
+                source_lang=source_lang,
             )
             translations.update(new_translations)
-            tm_added = tm_store(remaining, new_translations, tm, target_lang)
             checkpoint_clear(docx_bytes, target_lang)
             add_log(f"🤖 Model: {get_working_model()}")
         else:
             timer_ph.markdown(
-                timer_done_html(0, f"Apply {len(cached):,} TM hit — không gọi API!"),
+                timer_done_html(0, "Khôi phục từ checkpoint — không gọi API!"),
                 unsafe_allow_html=True,
             )
-            prog.progress(100, text="✅ Full TM hit!")
+            prog.progress(100, text="✅ Done!")
 
         usd, vnd = calc_cost(tok_in, tok_out)
         render_stats(len(translatable), num_chunks, num_chunks, tok_in, tok_out)
@@ -655,10 +708,7 @@ def _run_full_translation():
             unsafe_allow_html=True,
         )
         add_log("─" * 44)
-        add_log(f"🎉 Xong {len(translatable):,} đoạn "
-                f"(💾 {len(cached):,} TM + 🔄 {len(remaining):,} API) — {elapsed:.1f}s")
-        if tm_added:
-            add_log(f"💾 TM: lưu thêm {tm_added} entry — tổng {len(tm):,}")
+        add_log(f"🎉 Xong {len(translatable):,} đoạn — {elapsed:.1f}s")
         if tok_in or tok_out:
             add_log(f"💰 Token: {tok_in:,} in + {tok_out:,} out")
         add_log(f"💵 Chi phí: ${usd:.4f} USD ≈ {vnd:,.0f} VND")
@@ -668,6 +718,8 @@ def _run_full_translation():
         st.session_state["word_docx_bytes"]   = docx_bytes
         st.session_state["word_filename"]     = a["filename"]
         st.session_state["word_lang"]         = a["lang"]
+        st.session_state["word_source_lang"]  = source_lang
+        st.session_state["word_target_lang"]  = target_lang
         st.session_state["word_doc_context"]  = doc_context
         st.session_state["word_tok_in"]       = tok_in
         st.session_state["word_tok_out"]      = tok_out
@@ -677,7 +729,6 @@ def _run_full_translation():
         st.session_state["word_custom_rules"] = custom_rules
         st.session_state["word_summary"]      = (
             f"✅ Dịch xong {len(translatable):,} đoạn  "
-            f"(💾 {len(cached):,} TM + 🔄 {len(remaining):,} API)  "
             f"|  {elapsed:.1f}s  |  ${usd:.4f} USD ≈ {vnd:,.0f} VND"
         )
         st.session_state["word_translations_version"] = 1
@@ -685,10 +736,10 @@ def _run_full_translation():
         st.session_state["word_role_toggles"] = toggles
         st.session_state["word_skip_roles"]   = skip_roles
 
-        # Validate output DOCX
+        # Validate output DOCX (so sánh media với bản gốc — P2.7)
         try:
             out_bytes = apply_translations(docx_bytes, blocks, translations)
-            val = validate_docx_output(out_bytes)
+            val = validate_docx_output(out_bytes, original_bytes=docx_bytes)
             st.session_state["word_validation"] = val
             st.session_state["word_translated_bytes_cache"] = {
                 "version": 1, "bytes": out_bytes,
@@ -718,59 +769,36 @@ def _run_full_translation():
 # ══════════════════════════════════════════════════════════════════════════════
 def _run_partial(missed: list, label: str, heading: str, log_heading: str,
                  stat_label: str, success_msg: str):
-    """Generic partial-translation runner (rescan / H-F). Có TM lookup."""
+    """Generic partial-translation runner (rescan / H-F)."""
     if not missed:
         st.info("✨ Không có đoạn nào cần xử lý!")
         return
 
     doc_context  = st.session_state["word_doc_context"]
-    target_lang  = LANG_EN[st.session_state["word_lang"]]
+    target_lang  = st.session_state.get("word_target_lang") or LANG_EN[st.session_state["word_lang"]]
+    source_lang  = st.session_state.get("word_source_lang") or _resolve_langs()[1]
     glossary     = st.session_state.get("word_glossary")
     custom_rules = st.session_state.get("word_custom_rules")
-    tm           = _ensure_tm()
     translations = st.session_state["word_translations"]
-
-    cached, remaining = tm_lookup(missed, tm, target_lang)
 
     timer_ph, prog, render_stats, add_log = _make_job_ui(
         heading, stat_label, log_heading,
     )
-    if cached:
-        add_log(f"💾 TM hit: {len(cached):,}/{len(missed):,} đoạn dùng cache")
-    add_log(f"📝 Cần gọi API cho {len(remaining):,} đoạn")
+    add_log(f"📝 Cần gọi API cho {len(missed):,} đoạn")
 
-    # Apply TM hits ngay
-    if cached:
-        translations.update(cached)
-
-    if not remaining:
-        # Full TM hit — không cần API
-        st.session_state["word_translations"] = translations
-        st.session_state["word_translations_version"] = (
-            st.session_state.get("word_translations_version", 0) + 1
-        )
-        prog.progress(100, text="✅ Full TM hit!")
-        timer_ph.markdown(
-            timer_done_html(0, f"Apply {len(cached):,} TM hit!"),
-            unsafe_allow_html=True,
-        )
-        add_log(f"🎉 Toàn bộ {len(missed):,} đoạn dùng TM — không gọi API")
-        st.success(f"✅ {len(missed):,} đoạn từ TM cache — chi phí $0!")
-        return
-
-    chunks = chunk_blocks(remaining)
+    chunks = chunk_blocks(missed)
     add_log(f"📦 Chia thành {len(chunks)} chunk — {MAX_WORD_WORKERS} luồng")
 
     try:
         new_translations, tok_in, tok_out, elapsed = _run_translation(
             chunks, target_lang, doc_context,
             timer_ph, prog, render_stats, add_log,
-            len(remaining), prefix_label=label,
+            len(missed), prefix_label=label,
             glossary=glossary,
             custom_rules=custom_rules or None,
+            source_lang=source_lang,
         )
         translations.update(new_translations)
-        tm_added = tm_store(remaining, new_translations, tm, target_lang)
         st.session_state["word_translations"] = translations
         st.session_state["word_tok_in"]      += tok_in
         st.session_state["word_tok_out"]     += tok_out
@@ -778,16 +806,19 @@ def _run_partial(missed: list, label: str, heading: str, log_heading: str,
             st.session_state.get("word_translations_version", 0) + 1
         )
         _finalize_job(timer_ph, prog, add_log, elapsed,
-                      len(missed), label, tok_in, tok_out, tm_added=tm_added)
+                      len(missed), label, tok_in, tok_out)
 
-        # Validate updated output
+        # Validate updated output (so sánh media với bản gốc — P2.7)
         try:
             out_bytes = apply_translations(
                 st.session_state["word_docx_bytes"],
                 st.session_state["word_blocks"],
                 translations,
             )
-            val = validate_docx_output(out_bytes)
+            val = validate_docx_output(
+                out_bytes,
+                original_bytes=st.session_state["word_docx_bytes"],
+            )
             st.session_state["word_validation"] = val
             new_version = st.session_state["word_translations_version"]
             st.session_state["word_translated_bytes_cache"] = {
@@ -827,20 +858,6 @@ def _run_rescan():
     )
 
 
-def _run_hf_translation():
-    blocks       = st.session_state["word_blocks"]
-    translations = st.session_state["word_translations"]
-    hf_missed    = find_missed(blocks, translations, hf_only=True)
-    _run_partial(
-        hf_missed,
-        label="Dịch H/F",
-        heading=f"### 🌐 Dịch Header & Footer — {len(hf_missed):,} đoạn",
-        log_heading="### 📋 Nhật ký dịch H/F",
-        stat_label="H/F đoạn",
-        success_msg="✅ Đã dịch {n:,} đoạn Header/Footer!",
-    )
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # CACHED TRANSLATED BYTES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -859,132 +876,26 @@ def _get_cached_translated_bytes() -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PREVIEW & INLINE EDIT
-# ══════════════════════════════════════════════════════════════════════════════
-ROLE_LABEL = {
-    "title":           "Title",
-    "section_heading": "Heading",
-    "paragraph":       "Paragraph",
-    "bullet":          "Bullet",
-    "table_cell":      "Cell",
-    "note":            "Note",
-    "toc":             "TOC",
-    "textbox":         "🔲 Text-box",
-    "header":          "📌 Header",
-    "footer":          "📌 Footer",
-    "body_repeated":   "🔁 Lặp lại",
-    "footnote":        "📝 Footnote",
-    "endnote":         "📝 Endnote",
-    "comment":         "💬 Comment",
-    "image_alt":       "🖼 Image alt",
-}
-
-
-def _render_editor():
-    blocks       = st.session_state["word_blocks"]
-    translations = st.session_state["word_translations"]
-
-    col_f1, col_f2 = st.columns(2)
-    with col_f1:
-        only_missed = st.checkbox("📍 Chỉ hiển thị đoạn chưa dịch",
-                                  key="word_only_missed_filter")
-    with col_f2:
-        show_hf = st.checkbox("📌 Hiện cả Header/Footer",
-                              value=True, key="word_show_hf_filter")
-
-    skip_roles = st.session_state.get("word_skip_roles") or set(NO_TRANSLATE_ROLES)
-    display_blocks = []
-    for b in blocks:
-        is_hf = b["role"] in skip_roles
-        if is_hf and not show_hf:
-            continue
-        tr = translations.get(b["id"], "")
-        is_missed = (not tr) or tr == b["text"]
-        if only_missed and not is_missed:
-            continue
-        display_blocks.append(b)
-
-    if not display_blocks:
-        st.info("✨ Tất cả đoạn đã dịch — không có gì để hiển thị.")
-        return
-
-    def _label(b):
-        base = ROLE_LABEL.get(b["role"], b["role"])
-        tc   = b.get("table_cell")
-        if tc:
-            return f"{base} (T{tc[0]}R{tc[1]}C{tc[2]})"
-        return base
-
-    df = pd.DataFrame([
-        {
-            "ID":       b["id"],
-            "Vai trò":  _label(b),
-            "Gốc":      b["text"],
-            "Bản dịch": translations.get(b["id"], ""),
-        }
-        for b in display_blocks
-    ])
-
-    parts      = ["missed" if only_missed else "all",
-                  "hf" if show_hf else "nohf"]
-    version    = st.session_state.get("word_editor_version", 0)
-    editor_key = f"word_editor_v{version}_{'_'.join(parts)}"
-
-    edited = st.data_editor(
-        df,
-        column_config={
-            "ID":       st.column_config.TextColumn("ID", disabled=True, width="small"),
-            "Vai trò":  st.column_config.TextColumn("Vai trò", disabled=True, width="small"),
-            "Gốc":      st.column_config.TextColumn("Tiếng gốc", disabled=True, width="large"),
-            "Bản dịch": st.column_config.TextColumn("Bản dịch", width="large"),
-        },
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        height=480,
-        key=editor_key,
-    )
-
-    changes = 0
-    for _, row in edited.iterrows():
-        bid     = row["ID"]
-        new_val = row["Bản dịch"]
-        if translations.get(bid) != new_val:
-            translations[bid] = new_val
-            changes += 1
-    if changes:
-        st.session_state["word_translations"] = translations
-        st.session_state["word_translations_version"] = (
-            st.session_state.get("word_translations_version", 0) + 1
-        )
-        st.caption(f"💾 Đã ghi nhận {changes} thay đổi — bấm **Tải Word đã dịch** ở trên.")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # MAIN UI
 # ══════════════════════════════════════════════════════════════════════════════
 def _clear_state():
     for k in SS_KEYS:
         st.session_state.pop(k, None)
-    st.session_state.pop("word_translated_bytes_cache", None)
-    st.session_state.pop("word_translations_version", None)
-    st.session_state.pop("word_validation", None)
-    st.session_state.pop("word_role_toggles", None)
-    st.session_state.pop("word_skip_roles", None)
+    for k in ("word_translated_bytes_cache", "word_translations_version",
+              "word_validation", "word_role_toggles", "word_skip_roles",
+              "word_glossary_editor_ver",
+              "word_image_ocr", "word_ocr_state",
+              "word_batch_result"):
+        st.session_state.pop(k, None)
     for k in list(st.session_state.keys()):
-        if k.startswith("word_editor") or k in ("word_only_missed_filter",
-                                                  "word_show_hf_filter",
-                                                  "word_glossary_editor"):
+        if k.startswith("word_glossary_editor"):
             st.session_state.pop(k, None)
-    st.session_state["word_editor_version"] = 0
-    # KHÔNG xóa "word_tm" — TM persist xuyên suốt session
 
 
-def _run_batch(uploaded_files, lang_word):
-    """Batch-translate multiple DOCX files, sharing TM across all files."""
+def _run_batch(uploaded_files, lang_word, source_lang: str, target_lang: str):
+    """Batch-translate multiple DOCX files."""
     st.markdown("### 📚 Dịch theo lô")
 
-    target_lang = LANG_EN[lang_word]
     file_status = {f.name: "⏳ Chờ" for f in uploaded_files}
     status_ph   = st.empty()
     results     = {}  # name → bytes
@@ -1000,14 +911,12 @@ def _run_batch(uploaded_files, lang_word):
             blocks      = extract_docx_blocks(docx_bytes)
             doc_context = build_doc_context(blocks)
             client      = get_client()
-            glossary    = build_glossary(client, blocks, target_lang)
-            tm          = _ensure_tm()
+            glossary    = build_glossary(client, blocks, target_lang, source_lang)
             translatable = [b for b in blocks if b["role"] not in NO_TRANSLATE_ROLES]
-            cached, remaining = tm_lookup(translatable, tm, target_lang)
-            translations = dict(cached)
+            translations: dict = {}
 
-            if remaining:
-                chunks = chunk_blocks(remaining)
+            if translatable:
+                chunks = chunk_blocks(translatable)
                 timer_ph  = st.empty()
                 prog_ph   = st.empty()
 
@@ -1017,11 +926,11 @@ def _run_batch(uploaded_files, lang_word):
                 new_tr, _, _, _ = _run_translation(
                     chunks, target_lang, doc_context,
                     timer_ph, prog_ph, _noop_stats, _noop_log,
-                    len(remaining), prefix_label=uploaded.name[:20],
+                    len(translatable), prefix_label=uploaded.name[:20],
                     glossary=glossary,
+                    source_lang=source_lang,
                 )
                 translations.update(new_tr)
-                tm_store(remaining, new_tr, tm, target_lang)
                 timer_ph.empty()
                 prog_ph.empty()
 
@@ -1036,20 +945,74 @@ def _run_batch(uploaded_files, lang_word):
             "Trạng thái": list(file_status.values()),
         })
 
+    # Lưu kết quả vào session_state để hiện summary + download persist qua rerun.
+    # Sanitize tên file (P3.7): basename only, không cho `..`/`/`/`\`, đảm bảo unique.
     if results:
         buf = io.BytesIO()
+        used: set[str] = set()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for fname, data in results.items():
-                zf.writestr(fname.replace(".docx", f"_{lang_word[:2]}.docx"), data)
+                safe = _safe_zip_name(fname, lang_word, used)
+                used.add(safe)
+                zf.writestr(safe, data)
         buf.seek(0)
-        st.download_button(
+        # zip_name: chỉ chứa ascii an toàn, slug từ lang_word
+        import re as _re_slug
+        lang_slug = _re_slug.sub(r"[^A-Za-z0-9_-]+", "", lang_word)[:8] or "out"
+        st.session_state["word_batch_result"] = {
+            "zip_bytes": buf.getvalue(),
+            "zip_name":  f"translated_{lang_slug}.zip",
+            "status":    dict(file_status),
+            "lang":      lang_word,
+            "ok_count":  sum(1 for v in file_status.values() if v.startswith("✅")),
+            "fail_count": sum(1 for v in file_status.values() if v.startswith("❌")),
+        }
+    else:
+        # Mọi file đều fail — vẫn lưu status để hiển thị
+        st.session_state["word_batch_result"] = {
+            "zip_bytes": None, "zip_name": None,
+            "status":    dict(file_status),
+            "lang":      lang_word,
+            "ok_count":  0,
+            "fail_count": sum(1 for v in file_status.values() if v.startswith("❌")),
+        }
+
+
+def _render_batch_result():
+    """Render summary + download cho batch result đã chạy xong (persist qua rerun)."""
+    res = st.session_state.get("word_batch_result")
+    if not res:
+        return
+
+    n = len(res["status"])
+    if res["fail_count"] == 0:
+        st.success(f"✅ Batch xong: {res['ok_count']}/{n} file dịch thành công.")
+    elif res["ok_count"] == 0:
+        st.error(f"❌ Batch fail: 0/{n} file thành công.")
+    else:
+        st.warning(f"⚠️ Batch xong: {res['ok_count']}/{n} thành công, "
+                   f"{res['fail_count']}/{n} fail.")
+
+    # Status table
+    st.table({
+        "File":       list(res["status"].keys()),
+        "Trạng thái": list(res["status"].values()),
+    })
+
+    cols = st.columns([3, 1])
+    if res["zip_bytes"]:
+        cols[0].download_button(
             "⬇️ Tải ZIP tất cả file đã dịch",
-            data=buf.getvalue(),
-            file_name=f"translated_{lang_word[:8]}.zip",
+            data=res["zip_bytes"],
+            file_name=res["zip_name"],
             mime="application/zip",
             use_container_width=True,
             key="word_batch_zip_dl",
         )
+    if cols[1].button("🗑 Xoá kết quả batch", use_container_width=True,
+                      key="word_batch_clear"):
+        st.session_state.pop("word_batch_result", None)
+        st.rerun()
 
 
 def render():
@@ -1062,17 +1025,17 @@ def render():
     )
     # Backward compat: treat single file the same as before
     uploaded_docx = uploaded_files[0] if uploaded_files and len(uploaded_files) == 1 else None
-    lang_word = st.selectbox("🌐 Ngôn ngữ đích", LANGUAGES, key="word_lang_select")
 
-    # TM status sidebar info
-    tm_size = len(st.session_state.get("word_tm", {}))
-    if tm_size > 0:
-        cols = st.columns([3, 1])
-        cols[0].caption(f"💾 Translation Memory hiện có **{tm_size:,}** entries (persist trong session)")
-        if cols[1].button("🗑 Xóa TM", help="Reset Translation Memory",
-                          key="word_tm_clear"):
-            st.session_state.pop("word_tm", None)
-            st.rerun()
+    direction_label = st.radio(
+        "🌐 Hướng dịch",
+        [d[0] for d in TRANSLATION_DIRECTIONS],
+        horizontal=True,
+        key="word_direction",
+    )
+    _, source_lang, target_lang = _resolve_langs(direction_label)
+    # Backward-compat label cho session_state["word_lang"]:
+    # giữ "Tiếng Anh"/"Tiếng Việt" để code download/filename không phải đổi nhiều.
+    lang_word = "Tiếng Anh" if target_lang == "English" else "Tiếng Việt"
 
     st.divider()
 
@@ -1080,40 +1043,47 @@ def render():
     if uploaded_files and len(uploaded_files) > 1:
         if st.button("📚  Dịch tất cả file (batch)", use_container_width=True,
                      type="primary", key="word_batch_btn"):
-            _run_batch(uploaded_files, lang_word)
-        elif not st.session_state.get("word_batch_zip_dl"):
+            st.session_state.pop("word_batch_result", None)
+            _run_batch(uploaded_files, lang_word, source_lang, target_lang)
+            st.rerun()
+        elif "word_batch_result" not in st.session_state:
             st.info(f"📁 Đã chọn {len(uploaded_files)} file — bấm **Dịch tất cả file (batch)** để dịch.")
+        if "word_batch_result" in st.session_state:
+            st.divider()
+            _render_batch_result()
         return  # don't show single-file UI when batch
 
-    # ── PHASE 1: Phân tích ────────────────────────────────────────────────
-    col_a, col_b = st.columns(2)
-    with col_a:
-        analyze_clicked = st.button(
-            "🔬  Phân tích + Glossary",
+    # Single-file mode: nếu batch result còn → clear (user vừa giảm xuống 1 file)
+    if uploaded_files and len(uploaded_files) <= 1 and "word_batch_result" in st.session_state:
+        st.session_state.pop("word_batch_result", None)
+
+    # ── 2 NÚT: Dịch cơ bản / Dịch nâng cao ───────────────────────────────
+    col_basic, col_adv = st.columns(2)
+    with col_basic:
+        basic_clicked = st.button(
+            "🚀  Dịch cơ bản",
             disabled=(uploaded_docx is None),
-            use_container_width=True, key="word_analyze",
-            help="Extract paragraphs + build glossary từ thuật ngữ lặp lại",
+            use_container_width=True, type="primary", key="word_basic",
+            help="Dịch nhanh với cài đặt mặc định — không cần chọn gì thêm",
         )
-    with col_b:
-        # Quick mode: phân tích + dịch luôn (skip glossary review)
-        quick_clicked = st.button(
-            "⚡  Phân tích & dịch luôn",
+    with col_adv:
+        advanced_clicked = st.button(
+            "⚙️  Dịch nâng cao",
             disabled=(uploaded_docx is None),
-            use_container_width=True, key="word_quick",
-            help="Dùng glossary auto-build, không cần review",
+            use_container_width=True, key="word_advanced",
+            help="Xem stats + chỉnh glossary, role, custom rules, TM... trước khi dịch",
         )
 
-    if analyze_clicked:
+    if basic_clicked:
         _clear_state()
-        _run_analysis(uploaded_docx, lang_word)
-
-    if quick_clicked:
-        _clear_state()
-        _run_analysis(uploaded_docx, lang_word)
-        # Sau analysis xong, session_state["word_analysis"] đã có
-        # Trigger Phase 2 ngay — nhưng cần rerun trước để UI hiển thị analysis
-        # Quick mode set flag → Phase 1 done → render() check flag → run Phase 2
+        # Cơ bản = phân tích + dịch luôn. Set quick-mode TRƯỚC khi
+        # _run_analysis() trigger st.rerun() (nếu set sau, flag bị mất).
         st.session_state["word_quick_mode"] = True
+        _run_analysis(uploaded_docx, lang_word, source_lang, target_lang)
+
+    if advanced_clicked:
+        _clear_state()
+        _run_analysis(uploaded_docx, lang_word, source_lang, target_lang)
 
     # ── PHASE 1 RESULT: stats + glossary editor + Dịch button ───────────
     if "word_analysis" in st.session_state:
@@ -1125,289 +1095,448 @@ def render():
         else:
             _render_analysis_panel()
 
-    # ── PHASE 2 RESULT: download + rescan + H/F + editor ────────────────
+    # ── PHASE 2 RESULT: download + rescan + OCR ─────────────────────────
     if "word_translations" in st.session_state:
         st.divider()
-        st.success(st.session_state["word_summary"])
 
-        val = st.session_state.get("word_validation")
-        if val:
-            if val["valid"]:
-                st.success(f"✅ Output validated: {val['block_count']:,} paragraph, "
-                           f"{val['image_count']} ảnh")
-            else:
-                st.error("❌ Output có lỗi — KHÔNG nên download:")
-                for err in val["errors"]:
-                    st.code(err)
+        val          = st.session_state.get("word_validation")
+        blocks       = st.session_state["word_blocks"]
+        translations = st.session_state["word_translations"]
+        missed       = find_missed(blocks, translations)
+
+        # 1) Validation errors (chỉ show khi LỖI — user không nên download)
+        if val and not val["valid"]:
+            st.error("❌ Output có lỗi — KHÔNG nên download:")
+            for err in val["errors"]:
+                st.code(err)
             for warn in val.get("warnings", []):
                 st.warning(warn)
 
-        blocks       = st.session_state["word_blocks"]
-        translations = st.session_state["word_translations"]
-
-        # ── Quality check report ──────────────────────────────────────────
-        issues = quality_check(blocks, translations)
-        if issues:
-            with st.expander(f"⚠️ Quality check: {len(issues)} đoạn nghi vấn", expanded=False):
-                for item in issues[:30]:
-                    st.markdown(f"**🔴 {', '.join(item['issues'])}**")
-                    col1, col2 = st.columns(2)
-                    col1.text_area("Gốc", item["text"], height=60, disabled=True,
-                                   key=f"qc_orig_{item['id']}")
-                    col2.text_area("Dịch", item["translation"], height=60, disabled=True,
-                                   key=f"qc_tr_{item['id']}")
-
-        # ── Phase 2 review editor (auto-learn to TM) ─────────────────────
-        with st.expander("✏️ Review & lưu vào TM", expanded=False):
-            # Build or restore review DataFrame
-            review_version = st.session_state.get("word_translations_version", 0)
-            stored_rv = st.session_state.get("word_review_df_version")
-            if stored_rv != review_version or "word_review_df" not in st.session_state:
-                skip_roles_v = st.session_state.get("word_skip_roles") or set(NO_TRANSLATE_ROLES)
-                translatable_blocks = [b for b in blocks if b["role"] not in skip_roles_v]
-                st.session_state["word_review_df"] = pd.DataFrame([
-                    {
-                        "id":          b["id"],
-                        "role":        b["role"],
-                        "original":    b["text"],
-                        "translation": translations.get(b["id"], ""),
-                    }
-                    for b in translatable_blocks
-                ])
-                st.session_state["word_review_df_version"] = review_version
-
-            review_df = st.session_state["word_review_df"]
-            edited_review = st.data_editor(
-                review_df,
-                column_config={
-                    "id":          st.column_config.TextColumn("ID", disabled=True, width="small"),
-                    "role":        st.column_config.TextColumn("Vai trò", disabled=True, width="small"),
-                    "original":    st.column_config.TextColumn("Gốc", disabled=True, width="large"),
-                    "translation": st.column_config.TextColumn("Bản dịch", width="large"),
-                },
-                use_container_width=True,
-                hide_index=True,
-                num_rows="fixed",
-                height=400,
-                key="word_review_editor",
-            )
-
-            st.markdown("---")
-            st.markdown("**🔄 Dịch lại đoạn cụ thể** (tuỳ chọn — dùng prompt bổ sung):")
-            skip_roles_v2 = st.session_state.get("word_skip_roles") or set(NO_TRANSLATE_ROLES)
-            all_block_ids = [
-                b["id"] for b in st.session_state["word_blocks"]
-                if b["role"] not in skip_roles_v2
-                and st.session_state["word_translations"].get(b["id"])
-            ]
-            blocks_by_id_lookup = {b["id"]: b for b in st.session_state["word_blocks"]}
-            selected_ids = st.multiselect(
-                "Chọn đoạn cần dịch lại:",
-                options=all_block_ids,
-                format_func=lambda bid: (
-                    f"{bid} — "
-                    + (blocks_by_id_lookup.get(bid, {}).get("text", "")[:60])
-                ),
-                key="word_regen_select",
-            )
-            extra_inst = st.text_input(
-                "Hướng dẫn bổ sung (vd: 'dịch trang trọng hơn'):",
-                key="word_regen_instruction",
-            )
-            if st.button("🔄 Dịch lại các đoạn đã chọn", key="word_regen_btn",
-                         disabled=not selected_ids):
-                from word_backend import translate_chunk
-                chunk = [blocks_by_id_lookup[bid] for bid in selected_ids]
-                rules = {"_extra": extra_inst} if extra_inst.strip() else None
-                with st.spinner(f"Dịch lại {len(chunk)} đoạn..."):
-                    try:
-                        new_tr, _, _ = translate_chunk(
-                            get_client(), chunk,
-                            LANG_EN[st.session_state["word_lang"]],
-                            st.session_state["word_doc_context"],
-                            glossary=st.session_state.get("word_glossary"),
-                            custom_rules=rules,
-                        )
-                        st.session_state["word_translations"].update(new_tr)
-                        st.session_state["word_translations_version"] = (
-                            st.session_state.get("word_translations_version", 0) + 1
-                        )
-                        st.session_state.pop("word_review_df", None)
-                        st.success(f"Đã dịch lại {len(new_tr)} đoạn")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(str(e))
-
-            if st.button("✅ Xác nhận & lưu vào TM", key="word_review_confirm_btn",
-                         use_container_width=True):
-                tm = _ensure_tm()
-                target_lang = LANG_EN[st.session_state["word_lang"]]
-                changed = 0
-                for _, row in edited_review.iterrows():
-                    orig_tr = translations.get(row["id"], "")
-                    new_tr  = row["translation"]
-                    if new_tr and new_tr != orig_tr:
-                        translations[row["id"]] = new_tr
-                        # Also save to TM
-                        tm[tm_key(row["original"], target_lang)] = new_tr
-                        changed += 1
-                if changed:
-                    st.session_state["word_translations"] = translations
-                    st.session_state["word_translations_version"] = (
-                        st.session_state.get("word_translations_version", 0) + 1
-                    )
-                    st.session_state.pop("word_review_df", None)
-                    st.success(f"✅ Đã cập nhật {changed} bản dịch và lưu vào TM")
-                else:
-                    st.info("Không có thay đổi nào.")
-
-        with st.expander("🖼 OCR & dịch text trong ảnh (tuỳ chọn)", expanded=False):
-            st.caption(
-                "Quét tất cả ảnh trong DOCX, OCR chữ và dịch sang ngôn ngữ đích. "
-                "Xử lý song song — có thể tốn thêm chi phí Gemini Vision."
-            )
-            if st.button("🔍 Quét và dịch ảnh", key="word_ocr_btn"):
-                from word_backend import extract_images_from_docx, ocr_and_translate_images
-                imgs = extract_images_from_docx(st.session_state["word_docx_bytes"])
-                if not imgs:
-                    st.info("Không có ảnh trong DOCX.")
-                else:
-                    progress_bar = st.progress(0, text=f"Đang OCR 0/{len(imgs)} ảnh...")
-                    _ocr_counter = [0]
-
-                    def _on_progress(done, total):
-                        _ocr_counter[0] = done
-                        progress_bar.progress(done / total,
-                                              text=f"Đang OCR {done}/{total} ảnh...")
-
-                    results = ocr_and_translate_images(
-                        get_client(), imgs,
-                        LANG_EN[st.session_state["word_lang"]],
-                        progress_callback=_on_progress,
-                    )
-                    progress_bar.empty()
-                    st.session_state["word_image_ocr"] = (imgs, results)
-
-            if "word_image_ocr" in st.session_state:
-                imgs, results = st.session_state["word_image_ocr"]
-                shown = 0
-                for img in imgs:
-                    r = results.get(img["id"], {})
-                    if not r.get("has_text"):
-                        continue
-                    shown += 1
-                    with st.container(border=True):
-                        c1, c2 = st.columns([1, 2])
-                        c1.image(img["data"], width=200, caption=img["filename"])
-                        c2.markdown(f"**OCR (gốc):**\n```\n{r['ocr']}\n```")
-                        c2.markdown(f"**Dịch:**\n```\n{r['translation']}\n```")
-                        if r.get("error"):
-                            c2.warning(f"⚠️ Lỗi: {r['error']}")
-
-                errors = [r for r in results.values() if r.get("error") and not r.get("has_text")]
-                if shown == 0 and not errors:
-                    st.info(f"Đã quét {len(imgs)} ảnh — không phát hiện text.")
-                if errors:
-                    st.warning(f"⚠️ {len(errors)} ảnh gặp lỗi khi OCR.")
-
-                if shown > 0:
-                    if st.checkbox("📎 Chèn bản dịch OCR vào file DOCX output", key="word_ocr_insert"):
-                        from word_backend import insert_ocr_captions_into_docx
-                        base_bytes = _get_cached_translated_bytes()
-                        ocr_docx = insert_ocr_captions_into_docx(base_bytes, imgs, results)
-                        out_name = st.session_state["word_filename"].replace(
-                            ".docx",
-                            f"_translated_{st.session_state['word_lang'][:2]}_ocr.docx",
-                        )
-                        st.download_button(
-                            label="⬇️  Tải Word đã dịch + OCR caption",
-                            data=ocr_docx,
-                            file_name=out_name,
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            use_container_width=True,
-                            key="word_ocr_download",
-                        )
-
+        # 2) DOWNLOAD — top, tách biệt, primary
         translated_bytes = _get_cached_translated_bytes()
         out_name = st.session_state["word_filename"].replace(
             ".docx", f"_translated_{st.session_state['word_lang'][:2]}.docx"
         )
-
         st.download_button(
             label="⬇️  Tải Word đã dịch",
             data=translated_bytes,
             file_name=out_name,
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
+            type="primary",
         )
 
-        bilingual_bytes = export_bilingual_docx(
-            st.session_state["word_docx_bytes"],
-            st.session_state["word_blocks"],
-            st.session_state["word_translations"],
-        )
-        bi_name = st.session_state["word_filename"].replace(
-            ".docx", f"_bilingual_{st.session_state['word_lang'][:2]}.docx"
-        )
-        st.download_button(
-            label="📊  Tải DOCX so sánh song ngữ",
-            data=bilingual_bytes,
-            file_name=bi_name,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-            key="word_dl_bilingual",
+        # 3) Rescan button — header/footer giờ dịch chung với body, không tách
+        rescan_clicked = st.button(
+            f"🔍  Quét bỏ sót ({len(missed)})",
+            disabled=(len(missed) == 0),
+            use_container_width=True, key="word_rescan_btn",
+            help="Dịch lại các đoạn bị API bỏ sót / fail",
         )
 
-        missed_body  = find_missed(blocks, translations, hf_only=False)
-        missed_hf    = find_missed(blocks, translations, hf_only=True)
-        total_hf     = sum(1 for b in blocks if b["role"] in NO_TRANSLATE_ROLES)
+        # 4) OCR — section riêng, tách biệt (user dùng thường xuyên)
+        _render_ocr_section()
 
-        rescan_clicked = hf_clicked = False
-        if total_hf > 0:
-            col_rs, col_hf = st.columns(2)
-            with col_rs:
-                rescan_clicked = st.button(
-                    f"🔍  Quét bỏ sót ({len(missed_body)})",
-                    disabled=(len(missed_body) == 0),
-                    use_container_width=True, key="word_rescan_btn",
-                    help="Dịch lại các đoạn body API fail (TM auto)",
-                )
-            with col_hf:
-                hf_clicked = st.button(
-                    f"🌐  Dịch Header / Footer ({len(missed_hf)}/{total_hf})",
-                    disabled=(len(missed_hf) == 0),
-                    use_container_width=True, key="word_hf_btn",
-                    help="Dịch Header, Footer và đoạn lặp trong body (TM auto)",
-                )
-        else:
-            rescan_clicked = st.button(
-                f"🔍  Quét bỏ sót ({len(missed_body)})",
-                disabled=(len(missed_body) == 0),
-                use_container_width=True, key="word_rescan_btn",
-            )
-
-        if len(missed_body) > 0:
-            st.warning(f"⚠️ Còn {len(missed_body):,} đoạn body chưa dịch. "
-                       f"Bấm **Quét bỏ sót** để dịch lại.")
-        if total_hf > 0 and len(missed_hf) > 0:
-            st.info(f"📌 {len(missed_hf):,}/{total_hf:,} Header/Footer chưa dịch. "
-                    f"Bấm **Dịch Header/Footer** nếu muốn dịch.")
-
-        with st.expander("📋  Xem & sửa bản dịch inline", expanded=False):
-            _render_editor()
+        # 5) Tiny status — 1 dòng caption, không expander
+        summary_line = st.session_state.get("word_summary", "")
+        if summary_line:
+            st.caption(summary_line)
 
         if rescan_clicked:
             _run_rescan()
-            st.session_state["word_editor_version"] = (
-                st.session_state.get("word_editor_version", 0) + 1
-            )
-            st.rerun()
-        if hf_clicked:
-            _run_hf_translation()
-            st.session_state["word_editor_version"] = (
-                st.session_state.get("word_editor_version", 0) + 1
-            )
             st.rerun()
 
     elif not uploaded_files:
         st.info("👆 Vui lòng upload file Word (.docx) để bắt đầu")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OCR SECTION (P2.1, P2.2, P3.1, U1-U4)
+# ══════════════════════════════════════════════════════════════════════════════
+def _ocr_state() -> dict:
+    """Lazy-init `word_ocr_state` (P0.2 — single source of truth)."""
+    if "word_ocr_state" not in st.session_state:
+        st.session_state["word_ocr_state"] = {
+            "occurrences":   [],
+            "results":       {},
+            "selection":     {},   # occ_id → bool (đưa vào output)
+            "keep_original": {},   # occ_id → bool (giữ ảnh gốc, caption mode)
+            "edited":        {},   # occ_id → str (bản dịch user sửa)
+            "estimate":      None,
+            "mode":          "caption",  # "caption" | "overlay"
+            "phase":         "idle",     # idle | preflight | done
+        }
+    return st.session_state["word_ocr_state"]
+
+
+def _reset_ocr_state():
+    st.session_state.pop("word_ocr_state", None)
+
+
+def _render_ocr_section():
+    from word_backend import (
+        extract_image_occurrences, estimate_ocr_cost,
+        ocr_and_translate_images,
+        insert_ocr_captions_into_docx,
+    )
+
+    state = _ocr_state()
+    phase = state["phase"]
+
+    with st.expander("🖼  OCR & dịch text trong ảnh", expanded=False):
+        # ── Phase: idle → run preflight ───────────────────────────────
+        if phase == "idle":
+            if st.button("📊 Quét ảnh & ước tính chi phí",
+                         key="word_ocr_preflight_btn",
+                         use_container_width=True):
+                occs = extract_image_occurrences(st.session_state["word_docx_bytes"])
+                state["occurrences"] = occs
+                state["estimate"]    = estimate_ocr_cost(occs)
+                state["phase"]       = "preflight"
+                # Default: tick mọi ảnh ≥ ngưỡng
+                state["selection"] = {
+                    o["id"]: (len(o["data"]) >= 5_000) for o in occs
+                }
+                state["keep_original"] = {o["id"]: True for o in occs}
+                st.rerun()
+            else:
+                st.caption(
+                    "Quét tất cả ảnh trong DOCX, OCR chữ và dịch sang ngôn ngữ đích. "
+                    "Bước 1: ước tính chi phí. Bước 2: chạy OCR. Bước 3: review + xuất."
+                )
+
+        # ── Phase: preflight → confirm + run OCR ──────────────────────
+        elif phase == "preflight":
+            est = state["estimate"]
+            occs = state["occurrences"]
+            if not occs:
+                st.info("Không có ảnh trong DOCX.")
+                if st.button("↩️ Đóng", key="word_ocr_close_empty"):
+                    _reset_ocr_state()
+                    st.rerun()
+            else:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Ảnh tổng", f"{est['n_total']:,}")
+                c2.metric("Sẽ OCR", f"{est['n_to_ocr']:,}",
+                          help=f"Skip {est['n_skipped']:,} ảnh nhỏ < 5KB (icon/decor)")
+                c3.metric("Ước tính", f"${est['usd']:.4f}",
+                          help=f"≈ {est['vnd']:,.0f} VND  ·  "
+                               f"{est['input_tokens']:,} in / {est['output_tokens']:,} out tokens")
+
+                st.caption(
+                    "Ước tính tính theo kích thước ảnh × giá Gemini Vision. "
+                    "Chi phí thực tế lấy từ `usage_metadata` sau khi chạy xong."
+                )
+
+                confirm = st.checkbox(
+                    "✅ Tôi đồng ý chạy OCR và phát sinh chi phí Gemini",
+                    key="word_ocr_confirm_cost",
+                )
+                cc1, cc2 = st.columns([3, 1])
+                if cc1.button("🚀 Chạy OCR", disabled=not confirm,
+                              type="primary", use_container_width=True,
+                              key="word_ocr_run_btn"):
+                    _run_ocr(state)
+                    st.rerun()
+                if cc2.button("↩️ Huỷ", use_container_width=True,
+                              key="word_ocr_cancel_btn"):
+                    _reset_ocr_state()
+                    st.rerun()
+
+        # ── Phase: done → review + export ─────────────────────────────
+        elif phase == "done":
+            _render_ocr_review(state)
+
+
+def _run_ocr(state: dict):
+    """Chạy OCR cho occurrences trong state, lưu results + actual cost."""
+    from word_backend import ocr_and_translate_images
+
+    occs = state["occurrences"]
+    if not occs:
+        state["phase"] = "done"
+        return
+
+    n_to_ocr = state["estimate"]["n_to_ocr"]
+    progress_bar = st.progress(0, text=f"Đang OCR 0/{n_to_ocr} ảnh...")
+
+    def _on_progress(done, total):
+        progress_bar.progress(min(done / max(total, 1), 1.0),
+                              text=f"Đang OCR {done}/{total} ảnh...")
+
+    source_lang = st.session_state.get("word_source_lang") or _resolve_langs()[1]
+    target_lang = (st.session_state.get("word_target_lang")
+                   or LANG_EN[st.session_state["word_lang"]])
+    glossary    = st.session_state.get("word_glossary")
+    subdomains  = st.session_state.get("word_subdomains") or set()
+
+    results = ocr_and_translate_images(
+        get_client(), occs,
+        target_lang=target_lang,
+        source_lang=source_lang,
+        glossary=glossary,
+        subdomains=subdomains,
+        progress_callback=_on_progress,
+    )
+    progress_bar.empty()
+
+    state["results"] = results
+    # Init `edited` từ translation; selection tick những ảnh có text.
+    state["edited"]    = {o["id"]: results.get(o["id"], {}).get("translation", "")
+                          for o in occs}
+    state["selection"] = {
+        o["id"]: bool(results.get(o["id"], {}).get("has_text"))
+        for o in occs
+    }
+    state["phase"] = "done"
+
+
+def _render_ocr_review(state: dict):
+    """P2.1+P2.2+U2+U3+U4: review từng occurrence + chọn mode + download."""
+    occs    = state["occurrences"]
+    results = state["results"]
+    total   = results.get("_total", {})
+
+    # Summary actual cost
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1.metric("Ảnh OCR", f"{total.get('n_called', 0):,}")
+    sc2.metric("Tokens", f"{total.get('tok_in', 0):,} in / {total.get('tok_out', 0):,} out")
+    sc3.metric("USD", f"${total.get('usd', 0):.4f}")
+    sc4.metric("VND", f"{total.get('vnd', 0):,.0f}")
+
+    # Group: có text / không text + lỗi
+    with_text = [o for o in occs if results.get(o["id"], {}).get("has_text")]
+    no_text   = [o for o in occs
+                 if not results.get(o["id"], {}).get("has_text")
+                 and not results.get(o["id"], {}).get("error")]
+    errors    = [o for o in occs if results.get(o["id"], {}).get("error")]
+
+    # Bulk select buttons
+    if with_text:
+        b1, b2, _ = st.columns([1, 1, 2])
+        if b1.button("✅ Chọn tất cả ảnh có chữ", key="word_ocr_select_all"):
+            for o in with_text:
+                state["selection"][o["id"]] = True
+            st.rerun()
+        if b2.button("⬜ Bỏ chọn tất cả", key="word_ocr_deselect_all"):
+            for o in with_text:
+                state["selection"][o["id"]] = False
+            st.rerun()
+
+    # Output mode (U3)
+    mode = st.radio(
+        "Cách đưa OCR vào DOCX",
+        ["Đưa text dưới ảnh", "Dịch trực tiếp trên ảnh"],
+        horizontal=True,
+        key="word_ocr_mode",
+        help="Caption: chèn dòng dịch dưới mỗi ảnh được chọn. "
+             "Overlay: che chữ gốc trong ảnh và vẽ bản dịch lên đúng vùng.",
+    )
+    state["mode"] = "overlay" if mode.startswith("Dịch trực tiếp") else "caption"
+
+    if state["mode"] == "overlay":
+        # Check Pillow availability
+        try:
+            import PIL  # noqa: F401
+            pillow_ok = True
+        except Exception:
+            pillow_ok = False
+        if not pillow_ok:
+            st.warning("⚠️ Mode overlay cần Pillow — hãy cài `pip install Pillow`. "
+                       "Tạm thời sẽ fallback caption.")
+        # Check font hỗ trợ tiếng Việt
+        from word_backend import overlay_font_status
+        fs = overlay_font_status()
+        if not fs["ok"]:
+            st.error(
+                "❌ Hệ thống KHÔNG có font Unicode hỗ trợ tiếng Việt → overlay "
+                "sẽ render chữ thành ô vuông (như screenshot user gửi). "
+                "Cài 1 trong các font sau rồi reload app:\n\n"
+                "- Linux/Streamlit Cloud: `sudo apt install fonts-dejavu fonts-noto` "
+                "(hoặc thêm vào `packages.txt`)\n"
+                "- macOS: thường có sẵn Arial/Helvetica — kiểm tra `/System/Library/Fonts/`\n"
+                "- Windows: cài Arial / Calibri\n\n"
+                "Nếu xuất bây giờ, các ảnh overlay sẽ tự fallback sang caption mode."
+            )
+        elif fs["path"]:
+            st.caption(f"🔤 Font overlay: `{fs['path']}`")
+        bbox_missing = [o for o in with_text
+                        if state["selection"].get(o["id"])
+                        and not results.get(o["id"], {}).get("regions")]
+        if bbox_missing:
+            st.info(f"📌 {len(bbox_missing)} ảnh không có bbox đáng tin → sẽ fallback "
+                    f"sang caption mode cho riêng các ảnh đó.")
+        st.caption("Chữ gốc trong vùng OCR sẽ bị che và thay bằng bản dịch — "
+                   "không làm song ngữ trên ảnh.")
+
+    st.divider()
+
+    # Per-image review (P2.1)
+    if with_text:
+        st.markdown(f"##### 📷 Ảnh có chữ — {len(with_text)}")
+        for o in with_text:
+            r = results.get(o["id"], {})
+            with st.container(border=True):
+                col_img, col_info = st.columns([1, 2])
+                with col_img:
+                    st.image(o["data"], width=220,
+                             caption=f"{o['filename']}  ·  occ #{o['occurrence_index']}")
+                    st.caption(f"Part: `{o['doc_part'].rsplit('/', 1)[-1]}`  ·  "
+                               f"rId: `{o['rId']}`")
+                    st.caption(f"💵 ${r.get('usd', 0):.4f}  ·  "
+                               f"{r.get('tok_in', 0)}+{r.get('tok_out', 0)} tok"
+                               + (f"  ·  conf {r.get('confidence', 0):.2f}"
+                                  if r.get('confidence') else ""))
+                with col_info:
+                    state["selection"][o["id"]] = st.checkbox(
+                        "📎 Đưa ảnh này vào file xuất",
+                        value=state["selection"].get(o["id"], True),
+                        key=f"word_ocr_pick_{o['id']}",
+                    )
+                    if state["mode"] == "caption":
+                        state["keep_original"][o["id"]] = st.checkbox(
+                            "🖼 Giữ ảnh gốc (caption mode)",
+                            value=state["keep_original"].get(o["id"], True),
+                            key=f"word_ocr_keep_{o['id']}",
+                        )
+                    with st.expander("📜 OCR (gốc)", expanded=False):
+                        st.text(r.get("ocr", ""))
+                    state["edited"][o["id"]] = st.text_area(
+                        "✏️ Bản dịch — chỉnh trước khi xuất:",
+                        value=state["edited"].get(o["id"], r.get("translation", "")),
+                        height=120,
+                        key=f"word_ocr_edit_{o['id']}",
+                    )
+
+    # No-text group + errors (collapsed by default — P2.1: nhóm riêng, không chọn)
+    if no_text or errors:
+        with st.expander(
+            f"⚠️ Không phát hiện chữ / lỗi — {len(no_text)} không text · {len(errors)} lỗi",
+            expanded=False,
+        ):
+            for o in no_text[:30]:
+                r = results.get(o["id"], {})
+                with st.container(border=True):
+                    c1, c2 = st.columns([1, 3])
+                    c1.image(o["data"], width=120, caption=o["filename"])
+                    c2.caption(f"Không phát hiện chữ  ·  ${r.get('usd', 0):.4f}")
+            for o in errors[:30]:
+                r = results.get(o["id"], {})
+                with st.container(border=True):
+                    c1, c2 = st.columns([1, 3])
+                    c1.image(o["data"], width=120, caption=o["filename"])
+                    c2.warning(f"Lỗi OCR: {r.get('error', '?')[:150]}")
+
+    # Export (U4)
+    st.divider()
+    selected = [o for o in occs if state["selection"].get(o["id"])]
+    st.caption(
+        f"📤 Sẽ xuất: **{len(selected)} ảnh** vào DOCX dạng "
+        f"**{('overlay' if state['mode']=='overlay' else 'caption')}** "
+        f"· chi phí actual: **${total.get('usd', 0):.4f}** ≈ {total.get('vnd', 0):,.0f} VND"
+    )
+
+    if not selected:
+        st.info("Tick chọn ít nhất 1 ảnh để xuất.")
+    else:
+        if st.button("⬇️ Xuất DOCX với OCR", type="primary",
+                     use_container_width=True, key="word_ocr_export_btn"):
+            base_bytes = _get_cached_translated_bytes()
+            mode = state["mode"]
+            selected_ids = [o["id"] for o in selected]
+            edited       = {oid: state["edited"].get(oid, "") for oid in selected_ids}
+            remove_ids   = [o["id"] for o in selected
+                            if not state["keep_original"].get(o["id"], True)
+                            and mode == "caption"]
+
+            if mode == "overlay":
+                try:
+                    from word_backend import (
+                        replace_docx_image_occurrences, render_translated_overlay,
+                        overlay_font_status, OverlayFontError,
+                    )
+                    overlay_ok = True
+                except Exception:
+                    overlay_ok = False
+                # Pre-check font tiếng Việt — nếu thiếu → ALL ảnh fallback caption
+                font_status = overlay_font_status() if overlay_ok else {"ok": False}
+                if overlay_ok and not font_status["ok"]:
+                    st.warning(
+                        "⚠️ Không tìm thấy font Unicode hỗ trợ tiếng Việt → "
+                        "toàn bộ ảnh sẽ fallback sang caption mode để không bị "
+                        "render ô vuông."
+                    )
+                    overlay_ok = False
+
+                # Build replacements: every selected occ with regions → overlay;
+                # những ảnh thiếu regions → fallback caption
+                if overlay_ok:
+                    replacements: dict[str, tuple[bytes, str]] = {}
+                    caption_fallback_ids: list[str] = []
+                    for o in selected:
+                        r = state["results"].get(o["id"], {})
+                        regions = r.get("regions") or []
+                        if not regions:
+                            caption_fallback_ids.append(o["id"])
+                            continue
+                        # Override translation in regions với edited text khi user đã sửa toàn block
+                        try:
+                            new_bytes, new_ct = render_translated_overlay(
+                                o["data"], o["content_type"],
+                                regions=regions,
+                                edited_translation=edited.get(o["id"], ""),
+                            )
+                            replacements[o["id"]] = (new_bytes, new_ct)
+                        except OverlayFontError:
+                            # Font biến mất giữa preflight và export → fallback hết
+                            caption_fallback_ids.extend([s["id"] for s in selected])
+                            replacements.clear()
+                            break
+                        except Exception as e:
+                            st.warning(f"Overlay fail cho {o['filename']}: {e}; fallback caption.")
+                            caption_fallback_ids.append(o["id"])
+
+                    out_bytes = replace_docx_image_occurrences(
+                        base_bytes, state["occurrences"], replacements,
+                    )
+                    # Apply caption cho ảnh fallback (loại trùng selected_id)
+                    fallback_unique = list(dict.fromkeys(caption_fallback_ids))
+                    if fallback_unique:
+                        out_bytes = insert_ocr_captions_into_docx(
+                            out_bytes, state["occurrences"], state["results"],
+                            selected_ids=fallback_unique,
+                            edited_translations=edited,
+                        )
+                    suffix = "_ocr_overlay"
+                else:
+                    out_bytes = insert_ocr_captions_into_docx(
+                        base_bytes, state["occurrences"], state["results"],
+                        selected_ids=selected_ids,
+                        edited_translations=edited,
+                    )
+                    suffix = "_ocr_caption"
+            else:  # caption
+                out_bytes = insert_ocr_captions_into_docx(
+                    base_bytes, state["occurrences"], state["results"],
+                    selected_ids=selected_ids,
+                    edited_translations=edited,
+                    remove_original_ids=remove_ids,
+                )
+                suffix = "_ocr_caption"
+
+            out_name = st.session_state["word_filename"].replace(
+                ".docx",
+                f"_translated_{st.session_state['word_lang'][:2]}{suffix}.docx",
+            )
+            st.download_button(
+                label=f"📥 Tải {out_name}",
+                data=out_bytes,
+                file_name=out_name,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                key="word_ocr_download_final",
+            )
+
+    if st.button("🔁 Quét lại OCR", key="word_ocr_restart"):
+        _reset_ocr_state()
+        st.rerun()

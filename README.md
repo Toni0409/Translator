@@ -1,13 +1,20 @@
-# ⬡ Translator — PDF & Word
+# ⬡ Translator — Word
 
-App Streamlit dịch file **PDF** và **Microsoft Word (.docx)** sang nhiều ngôn ngữ
-bằng **Gemini**, giữ nguyên layout / format gốc.
+App Streamlit dịch file **Microsoft Word (.docx)** theo 2 hướng **Anh → Việt**
+và **Việt → Anh** bằng **Gemini**, tập trung cho tài liệu kỹ thuật
+**thang máy / thang cuốn**, giữ nguyên layout, hình ảnh và format gốc.
 
-- 📄 **PDF** — extract text spans → **phát hiện bảng** → dịch với context (T# R# C#)
-  → ghi lại đúng vị trí + font + màu + bold
-- 📝 **Word** — extract paragraph → **detect H/F + heuristic repeating** → dịch
-  body song song (4 luồng) → preview + sửa inline → nút riêng dịch H/F
+- 📝 **Word** — extract paragraph → detect H/F + heuristic repeating → auto-detect
+  domain thang máy/thang cuốn → nạp seed glossary → dịch song song (4 luồng)
+  → validate DOCX output → preview + sửa inline
+- 🏗 **Domain glossary** — seed thuật ngữ ngành từ `data/glossary_elevator.json`
+  và `data/glossary_escalator.json`, merge với glossary AI và glossary user import
+- 🖼 **Media preservation** — giữ paragraph chỉ có ảnh/drawing, tránh rebuild run
+  có media, validate media/drawing count so với file gốc
 - 🔐 Password protection · ⏱ Live timer · 🔁 Exponential backoff · 💵 Cost tracking
+
+> Các tính năng **PDF** và **So sánh / Đánh giá** đã chuyển sang `archive/` —
+> không build, không có trong active app. Giữ lại để tham khảo.
 
 ---
 
@@ -21,7 +28,8 @@ cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 streamlit run streamlit_app.py
 ```
 
-App mở tại http://localhost:8501. Nhập password → upload file → chọn ngôn ngữ → dịch.
+App mở tại http://localhost:8501. Nhập password → upload file → chọn hướng dịch
+`Anh → Việt` hoặc `Việt → Anh` → dịch.
 
 ---
 
@@ -41,107 +49,91 @@ Lấy API key tại https://aistudio.google.com/apikey.
 ## 🧩 Cấu trúc module
 
 ```
-streamlit_app.py     # Entry — set config, inject CSS, render 2 tab
-config.py            # Hằng số: API key, model, prices, languages, fonts, thresholds
+streamlit_app.py     # Entry — set config, inject CSS, render tab Word
+config.py            # Hằng số: API key, model, prices, directions, thresholds
 styles.py            # CSS dark theme
 auth.py              # Password gate + logout
 gemini.py            # Shared Gemini client, JSON parser, threaded call helper
 ui_common.py         # timer_box / stat_box / log_adder / calc_cost
-pdf_backend.py       # PDF: extract_line_groups (+ table detection), translate_page
-pdf_tab.py           # PDF: Streamlit UI tab
-word_backend.py      # Word: extract_docx_blocks (+ H/F detection), translate_parallel
+domain_glossary.py   # Seed glossary + domain detection elevator/escalator
+word_backend.py      # Word: extract/apply/validate DOCX, translate_parallel
 word_tab.py          # Word: Streamlit UI tab
-```
+data/
+  glossary_elevator.json
+  glossary_escalator.json
+tests/               # Standalone smoke scripts, no pytest dependency
 
-Mỗi file < 500 dòng, một trách nhiệm rõ ràng → AI / vibe code dễ đọc & sửa.
+archive/             # Tính năng đã bỏ — giữ lại để tham khảo
+  pdf_backend.py
+  pdf_tab.py
+  review_backend.py
+  review_tab.py
+  review_vision_backend.py
+```
 
 ### Sơ đồ phụ thuộc
 
 ```
 streamlit_app.py
   ├── styles
-  ├── auth ──────────────┐
-  ├── pdf_tab            │
-  │     ├── pdf_backend  │
-  │     │     └── gemini ┤
-  │     ├── gemini       │
-  │     ├── ui_common    │
-  │     └── config ──────┤
-  └── word_tab           │
-        ├── word_backend │
-        │     └── gemini │
-        ├── gemini       │
-        ├── ui_common    │
-        └── config ──────┘
-```
-
----
-
-## 📄 Tab PDF — chi tiết tính năng
-
-| Feature | Mô tả |
-|---|---|
-| **Layout-preserving** | Redact text gốc → in lại bản dịch vào đúng bbox cũ |
-| **Font + style** | Auto-detect font Unicode, bold flag, màu chữ giữ nguyên |
-| **Page range** | Nhập "1-5,8,10-12" để dịch page cụ thể |
-| **Table detection** | `page.find_tables()` → kèm `(T# R# C#)` vào prompt để AI dịch cell consistent |
-| **Smart prompt** | Khi có bảng → thêm rules: header row ngắn gọn, cùng cột dùng cùng thuật ngữ, giữ nguyên số/đơn vị |
-| **Live timer** | Đếm giây realtime trong lúc chờ Gemini API |
-| **Rate-limit retry** | Exponential backoff 5/10/20/40/80s khi gặp 429 |
-| **Cost tracking** | Token in/out → USD + VND realtime |
-
-### Logic table detection
-
-```
-1. page.find_tables() → list of tables (mỗi table có bbox + cells)
-2. Với mỗi line bbox, tìm cell chứa tâm dòng
-3. Group có cell info → format prompt: "[5] (T1 R2 C3) cell text"
-4. AI thấy context bảng → dịch consistent + giữ format số
-5. Bản dịch trả về vẫn theo index [0]...[N-1] — không có prefix (T# R# C#)
+  ├── auth
+  └── word_tab
+        ├── word_backend
+        │     └── gemini
+        ├── domain_glossary
+        ├── gemini
+        ├── ui_common
+        └── config
 ```
 
 ---
 
 ## 📝 Tab Word — chi tiết tính năng
 
-### Flow 2 phase (NEW)
+### Flow 2 phase
 
 ```
-[Upload + lang]
+[Upload + direction]
    ▼
-[🔬 Phân tích + Glossary]   ──or──  [⚡ Phân tích & dịch luôn]
+[🚀 Dịch cơ bản]   ──or──  [⚙️ Dịch nâng cao]
+   │                            │
+   ▼                            ▼
+[Analyze + source/target + domain detect + seed glossary]
    ▼                                       │
-[Stats: body/H-F/textbox/cells]            │
+[Stats: body/H-F/textbox/cells/media]      │
 [💾 TM preview]                            │
-[📚 Glossary editor inline (optional)]     │
+[📚 Glossary editor + restore seed]        │
    ▼                                       │
 [▶ Dịch X đoạn]  ◀────────────────────────┘
    ▼
-[Download + Rescan + H/F + Inline editor]
+[Validate media/format + Download + Rescan + H/F + Inline editor]
 ```
 
 ### Feature table
 
 | Feature | Mô tả |
 |---|---|
-| **2-phase flow** | Phân tích (extract+glossary) → review glossary → Dịch. Có nút `⚡ Phân tích & dịch luôn` để skip review. |
-| **Glossary editor** | Hiển thị top-30 thuật ngữ AI suggest → user sửa/xóa/thêm trước khi dịch → bắt buộc terminology cụ thể. |
-| **Translation Memory** | Hash text + target_lang → cache. Dịch lại doc cũ = 100% TM hit, $0 API. Persist xuyên session, có nút clear. |
-| **Text-box / shapes** | NEW — extract paragraphs inside `w:txbxContent` (text-box, shape) → dịch và ghi lại đúng vị trí. |
+| **Direction picker** | UI chỉ còn 2 hướng `Anh → Việt` và `Việt → Anh`; prompt truyền rõ `source_lang` + `target_lang`. |
+| **2-phase flow** | `Dịch cơ bản` phân tích rồi dịch ngay; `Dịch nâng cao` cho review glossary, role toggles, TM, custom rules trước khi dịch. |
+| **Seed domain glossary** | Auto-detect elevator/escalator → nạp thuật ngữ chuẩn ngành từ `data/`, sau đó merge với AI glossary và user import. |
+| **Glossary editor** | User sửa/xóa/thêm thuật ngữ trước khi dịch; có nút khôi phục seed thuật ngữ ngành mà không xoá edit của user. |
+| **Translation Memory** | Hash text + role + target_lang → cache. Dịch lại doc cũ = TM hit, giảm chi phí API. Persist xuyên session, có nút clear. |
+| **Media preservation** | Paragraph chỉ có ảnh/drawing được đánh role `media_only`, không gửi AI, không rebuild run; output validate media count với file gốc. |
+| **Text-box / shapes** | Extract paragraphs inside `w:txbxContent` (text-box, shape) → dịch và ghi lại đúng vị trí. |
 | **Table-aware translation** | Mỗi cell gắn prefix `(T# R# C#)` trong prompt → AI dịch consistent theo column, R1 = header ngắn gọn, giữ số/đơn vị. Auto-strip prefix ở output. |
-| **Inline format** | Bold/italic/underline encode `<b><i><u>` tags → AI preserve qua dịch → rebuild runs giữ font/size/color |
+| **Inline format** | Bold/italic/underline encode `<b><i><u>` tags → AI preserve qua dịch → rebuild runs bằng deep-copy `w:rPr` khi an toàn. |
 | **Cross-chunk glossary** | 1 Gemini call build glossary → inject mọi chunk prompt → consistent terminology cross-chunk |
 | **Parallel chunks** | `ThreadPoolExecutor` dịch 4 chunk cùng lúc → giảm thời gian ~4× |
 | **Adaptive chunking** | Chia theo ký tự (~8k chars/chunk), min 8 / max 40 paragraph/chunk |
 | **Per-chunk retry** | Mỗi chunk fail sẽ retry tối đa 3 lần với backoff 1s/2s/4s |
-| **Thread-safe model fallback** | `gemini-2.5-flash-lite` → `flash` → `2.0-flash` → ... (lock-protected) |
+| **Thread-safe model fallback** | `gemini-3.5-flash` → `2.5-flash-lite` → `2.5-flash` → `2.0-flash` → ... (lock-protected) |
 | **Cached DOCX rebuild** | Version counter → `apply_translations` chỉ chạy khi translations thay đổi |
 | **H/F detection** | Detect cả H/F thật (docx structure) **và** text lặp lại ≥3 lần trong body (heuristic) |
 | **Skip H/F by default** | Lần dịch đầu chỉ làm body. Nút riêng để dịch H/F (cũng dùng TM auto) |
 | **Quét bỏ sót** | Phát hiện đoạn API fail (translation == original) → dịch lại (TM auto) |
 | **Inline edit** | `data_editor` — sửa trực tiếp bản dịch, cả body + H/F. Vai trò hiện kèm coord bảng (T#R#C#) |
 | **Filter editor** | "Chỉ hiển thị đoạn chưa dịch" + "Hiện cả Header/Footer" |
-| **Token + cost** | Cộng dồn input/output tokens → quy đổi USD/VND realtime |
+| **Token + cost** | Cộng dồn input/output tokens → quy đổi USD/VND realtime từ pricing source-of-truth trong `config.py`. |
 | **Role badges** | Header / Footer / 🔁 Lặp lại / 🔲 Text-box / Heading / Bullet / TOC / Cell / Note |
 
 ### Logic H/F detection
@@ -160,11 +152,30 @@ streamlit_app.py
 ### Logic cross-chunk glossary
 
 ```
-1. Sau extract, trích noun phrases + technical terms lặp lại ≥ 3 lần
-2. Gọi Gemini 1 lần để dịch top-30 thuật ngữ → {en: vi}
-3. User review/sửa ở data_editor inline (Phase 1) — optional
-4. Inject glossary vào mỗi chunk prompt ("USE THESE EXACT translations")
-5. Rescan + H/F translation tái dùng glossary đã edit (stored in session_state)
+1. Sau extract, detect subdomain elevator/escalator từ keyword trong tài liệu
+2. Nạp seed glossary theo hướng dịch từ:
+   - data/glossary_elevator.json
+   - data/glossary_escalator.json
+3. Gọi Gemini 1 lần để gợi ý thêm thuật ngữ lặp lại trong document
+4. Merge glossary theo precedence: user-imported > seed chuẩn > AI-extracted
+5. Inject glossary vào mỗi chunk prompt ("USE THESE EXACT translations")
+6. Rescan + H/F translation tái dùng glossary đã edit (stored in session_state)
+```
+
+### Logic domain thang máy / thang cuốn
+
+```
+1. domain_glossary.detect_subdomain(blocks) quét 200 block đầu
+2. Nếu đủ keyword elevator/lift/hoistway/cabin/thang máy/giếng thang...
+   → domain = elevator
+3. Nếu đủ keyword escalator/handrail/comb plate/thang cuốn/tay vịn/tấm lược...
+   → domain = escalator
+4. seed_for_direction(subdomains, source_lang, target_lang) chọn en_vi hoặc vi_en
+5. build_doc_context() inject style guide kỹ thuật:
+   - giữ nguyên unit: mm, m, m/s, kg, kN, V, Hz, °C
+   - giữ nguyên standard: EN 81-20, EN 81-50, ISO 22201, ASME A17.1, TCVN 6395
+   - giữ part number, drawing number, revision code
+   - văn phong kỹ thuật chính thức, tránh dịch văn nói
 ```
 
 ### Logic Translation Memory
@@ -195,7 +206,8 @@ streamlit_app.py
 2. prompt: thêm rule "PRESERVE <b><i><u> tags in translation"
 3. AI giữ nguyên hoặc dịch text quanh tags
 4. apply: replace_paragraph_with_tagged() parse tags → rebuild runs với format
-   Fallback về first-run-wins nếu paragraph có hyperlink/field
+5. Nếu paragraph/run có drawing/pict/object → fallback sang path giữ XML để không mất ảnh
+6. validate_docx_output(out, original_bytes=orig) so media/drawing count với file gốc
 ```
 
 ---
@@ -204,19 +216,58 @@ streamlit_app.py
 
 | Bạn muốn… | Sửa file |
 |---|---|
-| Đổi Gemini model | `config.py` → `PDF_MODEL`, `WORD_MODELS` |
-| Thêm ngôn ngữ | `config.py` → `LANGUAGES`, `LANG_EN` |
+| Đổi Gemini model | `config.py` → `WORD_MODELS` (model đầu tiên = ưu tiên) |
+| Đổi hướng dịch hiển thị | `config.py` → `TRANSLATION_DIRECTIONS` |
+| Sửa glossary thang máy | `data/glossary_elevator.json` |
+| Sửa glossary thang cuốn | `data/glossary_escalator.json` |
+| Sửa keyword detect domain | `domain_glossary.py` |
 | Đổi giá / tỉ giá | `config.py` → `PRICE_INPUT`, `PRICE_OUTPUT`, `USD_TO_VND` |
-| Đổi chunk size Word | `config.py` → `TARGET_CHUNK_CHARS`, `MIN_CHUNK_BLOCKS`, `MAX_CHUNK_BLOCKS` |
-| Đổi số luồng song song Word | `config.py` → `MAX_WORD_WORKERS` |
+| Đổi chunk size | `config.py` → `TARGET_CHUNK_CHARS`, `MIN_CHUNK_BLOCKS`, `MAX_CHUNK_BLOCKS` |
+| Đổi số luồng song song | `config.py` → `MAX_WORD_WORKERS` |
 | Đổi số lần retry mỗi chunk | `config.py` → `CHUNK_RETRIES` |
 | Đổi ngưỡng H/F repeating | `config.py` → `HF_REPEAT_THRESHOLD`, `HF_REPEAT_MIN_CHARS` |
 | Đổi role bị bỏ qua | `config.py` → `NO_TRANSLATE_ROLES` |
 | Đổi theme / màu | `styles.py` |
-| Tinh chỉnh prompt PDF | `pdf_backend.py` → `translate_page` |
-| Tinh chỉnh prompt Word | `word_backend.py` → `_build_chunk_prompt` |
+| Tinh chỉnh prompt | `word_backend.py` → `_build_chunk_prompt` |
 | Thay đổi heuristic H/F | `word_backend.py` → `_mark_repeating_as_hf` |
-| Thay đổi table detection | `pdf_backend.py` → `detect_tables_on_page` |
+
+---
+
+## 🧪 Smoke tests
+
+Không dùng pytest để giữ runtime dependencies gọn. Chạy toàn bộ smoke scripts:
+
+```bash
+python tests/run_smoke.py
+```
+
+Các nhóm hiện có:
+
+- `smoke_config.py` — import config không cần secrets thật, pricing, directions, roles
+- `smoke_direction.py` — direction resolver + batch ZIP filename sanitizer
+- `smoke_docx.py` — extract/apply/validate DOCX, media preservation
+- `smoke_domain.py` — detect domain, seed glossary, doc context domain rules
+- `smoke_checkpoint.py` — checkpoint path portable + save/load/clear
+- `smoke_ocr.py` — cost helpers (tile/token), prompt builder (source_lang + domain + glossary), occurrence extraction, caption selection + dedupe + edit override, overlay Pillow render, replace-by-occurrence với clone media khi shared
+
+---
+
+## 🖼 OCR ảnh trong DOCX
+
+Sau khi dịch xong, expander **OCR & dịch text trong ảnh** cho 3 bước:
+
+1. **Quét ảnh & ước tính chi phí** — liệt kê occurrence (mỗi `r:embed` trong `<w:p>` là 1 occurrence; cùng ảnh dùng nhiều nơi vẫn ra nhiều occurrence), hiển thị USD/VND ước tính theo kích thước ảnh × giá Gemini Vision.
+2. **Xác nhận chi phí + chạy OCR** — Gemini Vision OCR + dịch song song, lưu actual cost per-image từ `usage_metadata` + aggregate batch.
+3. **Review & xuất**:
+   - Mỗi ảnh: checkbox **Đưa vào file xuất**, checkbox **Giữ ảnh gốc** (caption mode), text_area chỉnh bản dịch.
+   - Nhóm "Không phát hiện chữ / lỗi" collapsed riêng, default không chọn.
+   - Chọn tất cả / bỏ chọn tất cả.
+   - Output mode (radio):
+     - **Đưa text dưới ảnh** (default): chèn caption `[OCR] <text>` ngay dưới mỗi ảnh được chọn, italic, căn giữa. Dedupe khi xuất lại nhiều lần. Có thể chọn xoá ảnh gốc (chỉ giữ caption).
+     - **Dịch trực tiếp trên ảnh**: che chữ gốc trong từng vùng OCR (Pillow `ImageDraw`, fill bằng avg color của vùng), vẽ bản dịch lên đúng bbox. Không làm song ngữ trên ảnh. Ảnh thiếu bbox → fallback caption per-image.
+   - Replace ảnh trong DOCX theo **occurrence** — khi ảnh dùng nhiều chỗ (cùng `rId`), clone media file mới + tạo rId mới cho occurrence sau lần đầu, đảm bảo không thay nhầm ảnh khác.
+
+File download riêng: `*_translated_<lang>_ocr_caption.docx` hoặc `*_translated_<lang>_ocr_overlay.docx`.
 
 ---
 
@@ -224,9 +275,10 @@ streamlit_app.py
 
 - `streamlit` — UI framework
 - `google-genai` — Gemini SDK
-- `pymupdf` (fitz) — PDF parsing + writing + table detection
 - `python-docx` — DOCX parsing + writing
 - `pandas` — `data_editor` cho tab Word
+- `lxml` — DOCX XML manipulation
+- `Pillow` — image overlay rendering (OCR overlay mode) + đọc kích thước ảnh để estimate tokens
 
 ---
 
@@ -235,6 +287,52 @@ streamlit_app.py
 - **Không commit** `.streamlit/secrets.toml` (đã có trong `.gitignore`).
 - App có password gate cơ bản — chỉ phù hợp dùng nội bộ. Không dùng cho production
   public mà chưa bổ sung HTTPS + rate limiting + audit log.
+
+---
+
+## 🗺 Roadmap
+
+### Chất lượng
+
+- Terminology QA so với glossary đã chốt trước khi xuất file.
+- Post-edit pass riêng cho tài liệu kỹ thuật thang máy/thang cuốn.
+- Consistency check cross-chunk cho thuật ngữ, số liệu, đơn vị, standard.
+- Style-guide injection theo loại tài liệu: spec, manual, checklist, report.
+
+### Tốc độ / chi phí
+
+- Gemini Batch API cho tài liệu lớn để giảm chi phí.
+- Prompt/context caching cho glossary + document context.
+- Dashboard TM hit-rate để biết đoạn nào tiết kiệm API.
+- Smarter chunk sizing theo độ phức tạp thay vì chỉ theo ký tự.
+
+### Format / layout
+
+- Bổ sung sample thật cho table image, textbox image, footnote/endnote, track changes.
+- Kiểm tra comment anchor, nested table, drawing canvas, SmartArt.
+- Mở rộng xử lý equation/OMML cho text label quanh công thức.
+- Verify image alt-text pipeline trên tài liệu thực tế.
+
+### UX / editor
+
+- Side-by-side preview file gốc vs bản dịch.
+- Diff bản dịch cũ vs bản mới khi rescan.
+- Undo per paragraph trong inline editor.
+- Batch UI rõ hơn cho nhiều file lớn.
+- Export bilingual theo styles.
+
+---
+
+## 🗂 Archive
+
+Các tính năng đã ngừng dùng được giữ lại trong `archive/`:
+
+- `pdf_backend.py` + `pdf_tab.py` — dịch PDF (extract spans → translate → redact + rewrite)
+- `review_backend.py` + `review_tab.py` + `review_vision_backend.py` — so sánh/đánh giá bản dịch
+
+Để bật lại: di chuyển ra khỏi `archive/`, thêm lại import vào `streamlit_app.py`,
+restore deps trong `requirements.txt` (`pymupdf`) và `packages.txt`
+(`libreoffice-writer`, `libreoffice-core`, fonts).
 
 ---
 
