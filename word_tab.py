@@ -832,10 +832,9 @@ def _ocr_state() -> dict:
             "occurrences":   [],
             "results":       {},
             "selection":     {},   # occ_id → bool (đưa vào output)
-            "keep_original": {},   # occ_id → bool (giữ ảnh gốc, caption mode)
+            "keep_original": {},   # occ_id → bool (giữ ảnh gốc)
             "edited":        {},   # occ_id → str (bản dịch user sửa)
             "estimate":      None,
-            "mode":          "caption",  # "caption" | "overlay"
             "phase":         "idle",     # idle | done
             "export":        None,       # {"bytes": ..., "name": ...} sau khi xuất
             "export_error":  None,       # lỗi xuất (nếu có) — show ở UI
@@ -957,51 +956,6 @@ def _render_ocr_review(state: dict):
             st.rerun()
 
     # Output mode (U3)
-    mode = st.radio(
-        "Cách đưa OCR vào DOCX",
-        ["Đưa text dưới ảnh", "Dịch trực tiếp trên ảnh"],
-        horizontal=True,
-        key="word_ocr_mode",
-        help="Caption: chèn dòng dịch dưới mỗi ảnh được chọn. "
-             "Overlay: che chữ gốc trong ảnh và vẽ bản dịch lên đúng vùng.",
-    )
-    state["mode"] = "overlay" if mode.startswith("Dịch trực tiếp") else "caption"
-
-    if state["mode"] == "overlay":
-        # Check Pillow availability
-        try:
-            import PIL  # noqa: F401
-            pillow_ok = True
-        except Exception:
-            pillow_ok = False
-        if not pillow_ok:
-            st.warning("⚠️ Mode overlay cần Pillow — hãy cài `pip install Pillow`. "
-                       "Tạm thời sẽ fallback caption.")
-        # Check font hỗ trợ tiếng Việt
-        from word_backend import overlay_font_status
-        fs = overlay_font_status()
-        if not fs["ok"]:
-            st.error(
-                "❌ Hệ thống KHÔNG có font Unicode hỗ trợ tiếng Việt → overlay "
-                "sẽ render chữ thành ô vuông (như screenshot user gửi). "
-                "Cài 1 trong các font sau rồi reload app:\n\n"
-                "- Linux/Streamlit Cloud: `sudo apt install fonts-dejavu fonts-noto` "
-                "(hoặc thêm vào `packages.txt`)\n"
-                "- macOS: thường có sẵn Arial/Helvetica — kiểm tra `/System/Library/Fonts/`\n"
-                "- Windows: cài Arial / Calibri\n\n"
-                "Nếu xuất bây giờ, các ảnh overlay sẽ tự fallback sang caption mode."
-            )
-        elif fs["path"]:
-            st.caption(f"🔤 Font overlay: `{fs['path']}`")
-        bbox_missing = [o for o in with_text
-                        if state["selection"].get(o["id"])
-                        and not results.get(o["id"], {}).get("regions")]
-        if bbox_missing:
-            st.info(f"📌 {len(bbox_missing)} ảnh không có bbox đáng tin → sẽ fallback "
-                    f"sang caption mode cho riêng các ảnh đó.")
-        st.caption("Chữ gốc trong vùng OCR sẽ bị che và thay bằng bản dịch — "
-                   "không làm song ngữ trên ảnh.")
-
     st.divider()
 
     # Per-image review (P2.1)
@@ -1026,12 +980,11 @@ def _render_ocr_review(state: dict):
                         value=state["selection"].get(o["id"], True),
                         key=f"word_ocr_pick_{o['id']}",
                     )
-                    if state["mode"] == "caption":
-                        state["keep_original"][o["id"]] = st.checkbox(
-                            "🖼 Giữ ảnh gốc (caption mode)",
-                            value=state["keep_original"].get(o["id"], True),
-                            key=f"word_ocr_keep_{o['id']}",
-                        )
+                    state["keep_original"][o["id"]] = st.checkbox(
+                        "🖼 Giữ ảnh gốc",
+                        value=state["keep_original"].get(o["id"], True),
+                        key=f"word_ocr_keep_{o['id']}",
+                    )
                     with st.expander("📜 OCR (gốc)", expanded=False):
                         st.text(r.get("ocr", ""))
                     state["edited"][o["id"]] = st.text_area(
@@ -1064,8 +1017,7 @@ def _render_ocr_review(state: dict):
     st.divider()
     selected = [o for o in occs if state["selection"].get(o["id"])]
     st.caption(
-        f"📤 Sẽ xuất: **{len(selected)} ảnh** vào DOCX dạng "
-        f"**{('overlay' if state['mode']=='overlay' else 'caption')}** "
+        f"📤 Sẽ xuất: **{len(selected)} ảnh** — chèn bản dịch dưới mỗi ảnh "
         f"· chi phí actual: **${total.get('usd', 0):.4f}** ≈ {total.get('vnd', 0):,.0f} VND"
     )
 
@@ -1110,80 +1062,16 @@ def _render_ocr_review(state: dict):
 
 
 def _build_ocr_export_bytes(state: dict, selected: list[dict]) -> tuple[bytes, str]:
-    """Build DOCX bytes cho OCR export — caption hoặc overlay mode.
+    """Build DOCX bytes cho OCR export — caption mode (chèn bản dịch dưới ảnh).
     Trả (bytes, suffix). Raise Exception nếu fail — caller hiển thị lỗi.
     """
     from word_backend import insert_ocr_captions_into_docx
 
     base_bytes   = _get_cached_translated_bytes()
-    mode         = state["mode"]
     selected_ids = [o["id"] for o in selected]
     edited       = {oid: state["edited"].get(oid, "") for oid in selected_ids}
     remove_ids   = [o["id"] for o in selected
-                    if not state["keep_original"].get(o["id"], True)
-                    and mode == "caption"]
-
-    if mode == "overlay":
-        try:
-            from word_backend import (
-                replace_docx_image_occurrences, render_translated_overlay,
-                overlay_font_status, OverlayFontError,
-            )
-            overlay_ok = True
-        except Exception:
-            overlay_ok = False
-
-        font_status = overlay_font_status() if overlay_ok else {"ok": False}
-        if overlay_ok and not font_status["ok"]:
-            st.warning(
-                "⚠️ Không tìm thấy font Unicode hỗ trợ tiếng Việt → "
-                "toàn bộ ảnh sẽ fallback sang caption mode để không bị "
-                "render ô vuông."
-            )
-            overlay_ok = False
-
-        if overlay_ok:
-            replacements: dict[str, tuple[bytes, str]] = {}
-            caption_fallback_ids: list[str] = []
-            for o in selected:
-                r = state["results"].get(o["id"], {})
-                regions = r.get("regions") or []
-                if not regions:
-                    caption_fallback_ids.append(o["id"])
-                    continue
-                try:
-                    new_bytes, new_ct = render_translated_overlay(
-                        o["data"], o["content_type"],
-                        regions=regions,
-                        edited_translation=edited.get(o["id"], ""),
-                    )
-                    replacements[o["id"]] = (new_bytes, new_ct)
-                except OverlayFontError:
-                    caption_fallback_ids.extend([s["id"] for s in selected])
-                    replacements.clear()
-                    break
-                except Exception as e:
-                    st.warning(f"Overlay fail cho {o['filename']}: {e}; fallback caption.")
-                    caption_fallback_ids.append(o["id"])
-
-            out_bytes = replace_docx_image_occurrences(
-                base_bytes, state["occurrences"], replacements,
-            )
-            fallback_unique = list(dict.fromkeys(caption_fallback_ids))
-            if fallback_unique:
-                out_bytes = insert_ocr_captions_into_docx(
-                    out_bytes, state["occurrences"], state["results"],
-                    selected_ids=fallback_unique,
-                    edited_translations=edited,
-                )
-            return out_bytes, "_ocr_overlay"
-
-        out_bytes = insert_ocr_captions_into_docx(
-            base_bytes, state["occurrences"], state["results"],
-            selected_ids=selected_ids,
-            edited_translations=edited,
-        )
-        return out_bytes, "_ocr_caption"
+                    if not state["keep_original"].get(o["id"], True)]
 
     out_bytes = insert_ocr_captions_into_docx(
         base_bytes, state["occurrences"], state["results"],
