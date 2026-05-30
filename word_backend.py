@@ -24,7 +24,7 @@ from docx.text.paragraph import Paragraph
 from docx.oxml.ns import qn
 
 from config import (
-    WORD_MODELS, MAX_WORD_TOKENS, NO_TRANSLATE_ROLES,
+    WORD_MODELS, MAX_WORD_TOKENS, MAX_WORD_WORKERS, NO_TRANSLATE_ROLES,
     CHUNK_RETRIES, TARGET_CHUNK_CHARS, MIN_CHUNK_BLOCKS, MAX_CHUNK_BLOCKS,
     HF_REPEAT_THRESHOLD, HF_REPEAT_MIN_CHARS,
 )
@@ -1843,7 +1843,7 @@ def ocr_and_translate_images(
     glossary: dict | None = None,
     subdomains: set[str] | None = None,
     progress_callback=None,
-    max_workers: int = 4,
+    max_workers: int = MAX_WORD_WORKERS,
     skip_under_bytes: int = 5_000,
 ) -> dict:
     """OCR + translate parallel. Trả dict {occ_id: result_dict_per_image} + key

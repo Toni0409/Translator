@@ -36,7 +36,15 @@ WORD_MODELS = [
 ]
 MAX_WORD_TOKENS    = 8_192     # output limit thực tế của Gemini Flash family
                                # (65k cũ gây JSON cut khi chunk lớn)
-MAX_WORD_WORKERS   = 4         # số chunk dịch song song
+MAX_WORD_WORKERS   = 16        # số chunk dịch song song (ThreadPoolExecutor).
+                               # Đây là ĐÒN BẨY TỐC ĐỘ chính: thời gian dịch ≈
+                               # ⌈số_chunk / workers⌉ × latency_mỗi_chunk.
+                               # Tăng workers KHÔNG đổi chất lượng — mỗi chunk dịch
+                               # độc lập, cùng prompt + glossary + doc context.
+                               # 16 an toàn cho Gemini paid Tier 1+ (~1000 RPM);
+                               # retry/backoff đã xử lý 429 nếu lỡ chạm rate limit.
+                               # → Gặp 429 liên tục thì hạ về 8; tier cao + doc
+                               #   rất lớn có thể nâng 24–32.
 CHUNK_RETRIES      = 3         # số lần retry mỗi chunk khi lỗi
 TARGET_CHUNK_CHARS = 8_000     # mục tiêu ký tự / chunk (adaptive)
 MIN_CHUNK_BLOCKS   = 8         # tối thiểu paragraph / chunk

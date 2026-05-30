@@ -438,7 +438,7 @@ def _run_full_translation():
             add_log(f"📦 Chia thành {num_chunks} chunk (~{avg_chars:,} chars/chunk)")
             if glossary:
                 add_log(f"📖 Áp dụng glossary {len(glossary)} thuật ngữ")
-            add_log(f"⚡ Dịch song song {MAX_WORD_WORKERS} luồng")
+            add_log(f"⚡ Dịch song song {min(MAX_WORD_WORKERS, num_chunks)} luồng")
 
             def _save_ckpt(tr_so_far):
                 checkpoint_save(docx_bytes, target_lang, dict(tr_so_far))
@@ -570,7 +570,7 @@ def _run_partial(missed: list, label: str, heading: str, log_heading: str,
     add_log(f"📝 Cần gọi API cho {len(missed):,} đoạn")
 
     chunks = chunk_blocks(missed)
-    add_log(f"📦 Chia thành {len(chunks)} chunk — {MAX_WORD_WORKERS} luồng")
+    add_log(f"📦 Chia thành {len(chunks)} chunk — {min(MAX_WORD_WORKERS, len(chunks))} luồng")
 
     try:
         new_translations, tok_in, tok_out, elapsed = _run_translation(
