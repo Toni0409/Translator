@@ -21,6 +21,7 @@ SCRIPTS = [
     "smoke_direction.py",
     "smoke_missed_scan.py",
     "smoke_ocr.py",
+    "smoke_sdt_hf.py",
 ]
 
 

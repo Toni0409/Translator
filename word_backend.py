@@ -124,24 +124,60 @@ def _iter_blocks_with_meta(doc):
     for tbl in doc.tables:
         t_counter[0] += 1
         yield from _walk_table(tbl, t_counter[0], "body")
-    # Headers + footers
+    # Block-level content controls (w:sdt) trong BODY — python-docx KHÔNG đi vào
+    # <w:sdt> nên auto-TOC (Word bọc Table of Contents trong sdtContent) và
+    # rich-text content control bị bỏ sót hoàn toàn (→ "mục lục chưa dịch").
+    # Chỉ duyệt sdt TOP-LEVEL (không lồng trong sdt khác) rồi yield mọi <w:p> bên
+    # trong → mỗi đoạn yield đúng 1 lần. Dedup bằng quan hệ ANCESTOR, KHÔNG dùng
+    # id() proxy lxml: id() bất ổn/đụng độ cross-walk (xem chú thích đầu hàm) →
+    # nếu dùng sẽ yield số đoạn khác nhau giữa extract↔apply, lệch hết para_idx.
+    _SDT, _SDTC, _TXBX = qn("w:sdt"), qn("w:sdtContent"), qn("w:txbxContent")
+
+    def _has_ancestor(el, tag, stop) -> bool:
+        a = el.getparent()
+        while a is not None and a is not stop:
+            if a.tag == tag:
+                return True
+            a = a.getparent()
+        return False
+
+    body_el = doc.element.body
+    for sdt in body_el.iter(_SDT):
+        if _has_ancestor(sdt, _SDT, body_el):          # nested sdt → để sdt cha xử lý
+            continue
+        content = sdt.find(_SDTC)
+        if content is None:
+            continue
+        for p_elem in content.iter(qn("w:p")):
+            if _has_ancestor(p_elem, _TXBX, content):  # text-box xử lý ở sweep riêng
+                continue
+            para = Paragraph(p_elem, parent=doc)
+            hint = "toc" if _is_toc_paragraph(para) else "body"
+            yield para, {"role_hint": hint, "in_table": False, "table_cell": None}
+    # Headers + footers — TẤT CẢ loại: default + first-page + even-page.
+    # python-docx `section.header/footer` CHỈ trả header/footer mặc định →
+    # bỏ sót bảng title-page (first-page header) và footer trang đầu/chẵn khi doc
+    # bật "different first page" (titlePg). `is_linked_to_previous` = phần này kế
+    # thừa từ section trước (đã xử lý rồi) → skip để khỏi dịch trùng.
     for section in doc.sections:
-        try:
-            for para in section.header.paragraphs:
-                yield para, {"role_hint": "header", "in_table": False, "table_cell": None}
-            for tbl in section.header.tables:
-                t_counter[0] += 1
-                yield from _walk_table(tbl, t_counter[0], "header")
-        except Exception:
-            pass
-        try:
-            for para in section.footer.paragraphs:
-                yield para, {"role_hint": "footer", "in_table": False, "table_cell": None}
-            for tbl in section.footer.tables:
-                t_counter[0] += 1
-                yield from _walk_table(tbl, t_counter[0], "footer")
-        except Exception:
-            pass
+        for hf, hint in (
+            (section.header,            "header"),
+            (section.first_page_header, "header"),
+            (section.even_page_header,  "header"),
+            (section.footer,            "footer"),
+            (section.first_page_footer, "footer"),
+            (section.even_page_footer,  "footer"),
+        ):
+            try:
+                if hf.is_linked_to_previous:
+                    continue
+                for para in hf.paragraphs:
+                    yield para, {"role_hint": hint, "in_table": False, "table_cell": None}
+                for tbl in hf.tables:
+                    t_counter[0] += 1
+                    yield from _walk_table(tbl, t_counter[0], hint)
+            except Exception:
+                pass
     # Text-boxes / shapes trong body document part
     # (text-boxes trong header/footer parts chưa cover ở iteration này)
     # parent=doc để `para.style` resolve được qua doc.part.styles
