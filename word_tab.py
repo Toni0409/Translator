@@ -17,7 +17,7 @@ import streamlit as st
 
 from config import (
     LANGUAGES, LANG_EN, TRANSLATION_DIRECTIONS,
-    MAX_WORD_WORKERS, NO_TRANSLATE_ROLES, AUTO_RESCAN_PASSES,
+    MAX_WORD_WORKERS, NO_TRANSLATE_ROLES,
 )
 from gemini import get_client
 from ui_common import (
@@ -108,20 +108,6 @@ def _make_job_ui(heading: str, stat_col1_label: str,
     return timer_ph, prog, render_stats, add_log
 
 
-def _finalize_job(timer_ph, prog, add_log,
-                  elapsed: float, count: int, label: str,
-                  tok_in: int, tok_out: int):
-    usd, vnd = calc_cost(tok_in, tok_out)
-    prog.progress(100, text=f"✅ {label} xong!")
-    timer_ph.markdown(
-        timer_done_html(elapsed, f"{label} {count:,} đoạn xong!"),
-        unsafe_allow_html=True,
-    )
-    add_log("─" * 44)
-    add_log(f"🎉 Xong {count:,} đoạn trong {elapsed:.1f}s")
-    add_log(f"💵 Chi phí: ${usd:.4f} USD ≈ {vnd:,.0f} VND")
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # CORE TRANSLATION LOOP
 # ══════════════════════════════════════════════════════════════════════════════
@@ -200,60 +186,6 @@ def _run_translation(chunks, target_lang, doc_context,
         raise RuntimeError(holder["error"])
 
     return holder["translations"], holder["tok_in"], holder["tok_out"], time.time() - t0
-
-
-def _auto_rescan_missed(blocks: list[dict], translations: dict,
-                        source_lang: str, target_lang: str,
-                        doc_context: str, glossary: dict | None,
-                        custom_rules: dict | None,
-                        timer_ph, prog_ph, render_stats, add_log) -> tuple[int, int, float, list]:
-    """Automatically translate blocks still detected as missed after the main pass."""
-    total_in = total_out = 0
-    total_elapsed = 0.0
-    remaining_missed: list = []
-
-    for pass_no in range(1, AUTO_RESCAN_PASSES + 1):
-        missed = find_missed(
-            blocks, translations,
-            source_lang=source_lang,
-            target_lang=target_lang,
-        )
-        if not missed:
-            if pass_no == 1:
-                add_log("✅ Auto scan: không còn đoạn bỏ sót")
-            break
-
-        remaining_missed = missed
-        add_log(f"🔍 Auto scan {pass_no}/{AUTO_RESCAN_PASSES}: "
-                f"phát hiện {len(missed):,} đoạn cần dịch bù")
-        chunks = chunk_blocks(missed)
-        add_log(f"📦 Quét bù: {len(chunks)} chunk")
-
-        new_tr, tok_in, tok_out, elapsed = _run_translation(
-            chunks, target_lang, doc_context,
-            timer_ph, prog_ph, render_stats, add_log,
-            len(missed), prefix_label=f"Quét {pass_no}",
-            glossary=glossary,
-            custom_rules=custom_rules or None,
-            source_lang=source_lang,
-        )
-        translations.update(new_tr)
-        total_in += tok_in
-        total_out += tok_out
-        total_elapsed += elapsed
-
-    remaining_missed = find_missed(
-        blocks, translations,
-        source_lang=source_lang,
-        target_lang=target_lang,
-    )
-    if remaining_missed:
-        add_log(f"⚠️ Auto scan vẫn còn {len(remaining_missed):,} đoạn nghi chưa sạch "
-                "sau giới hạn quét bù")
-    elif total_in or total_out:
-        add_log("✅ Auto scan: đã dịch bù xong, không còn đoạn nghi bỏ sót")
-
-    return total_in, total_out, total_elapsed, remaining_missed
 
 
 def _find_output_coverage_missed(docx_bytes: bytes, blocks: list[dict],
@@ -462,15 +394,6 @@ def _run_full_translation():
             )
             prog.progress(100, text="✅ Done!")
 
-        extra_in, extra_out, extra_elapsed, remaining_missed = _auto_rescan_missed(
-            translatable, translations, source_lang, target_lang,
-            doc_context, glossary, custom_rules,
-            timer_ph, prog, render_stats, add_log,
-        )
-        tok_in += extra_in
-        tok_out += extra_out
-        elapsed += extra_elapsed
-
         usd, vnd = calc_cost(tok_in, tok_out)
         render_stats(len(translatable), num_chunks, num_chunks, tok_in, tok_out)
         prog.progress(100, text="✅ Hoàn thành!")
@@ -498,7 +421,6 @@ def _run_full_translation():
         st.session_state["word_num_chunks"]   = num_chunks
         st.session_state["word_glossary"]     = glossary
         st.session_state["word_custom_rules"] = custom_rules
-        st.session_state["word_auto_missed_remaining"] = len(remaining_missed)
         st.session_state["word_summary"]      = (
             f"✅ Dịch xong {len(translatable):,} đoạn  "
             f"|  {elapsed:.1f}s  |  ${usd:.4f} USD ≈ {vnd:,.0f} VND"
@@ -548,128 +470,6 @@ def _run_full_translation():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RESCAN + H/F — share TM logic
-# ══════════════════════════════════════════════════════════════════════════════
-def _run_partial(missed: list, label: str, heading: str, log_heading: str,
-                 stat_label: str, success_msg: str):
-    """Generic partial-translation runner (rescan / H-F)."""
-    if not missed:
-        st.info("✨ Không có đoạn nào cần xử lý!")
-        return
-
-    doc_context  = st.session_state["word_doc_context"]
-    target_lang  = st.session_state.get("word_target_lang") or LANG_EN[st.session_state["word_lang"]]
-    source_lang  = st.session_state.get("word_source_lang") or _resolve_langs()[1]
-    glossary     = st.session_state.get("word_glossary")
-    custom_rules = st.session_state.get("word_custom_rules")
-    translations = st.session_state["word_translations"]
-
-    timer_ph, prog, render_stats, add_log = _make_job_ui(
-        heading, stat_label, log_heading,
-    )
-    add_log(f"📝 Cần gọi API cho {len(missed):,} đoạn")
-
-    chunks = chunk_blocks(missed)
-    add_log(f"📦 Chia thành {len(chunks)} chunk — {min(MAX_WORD_WORKERS, len(chunks))} luồng")
-
-    try:
-        new_translations, tok_in, tok_out, elapsed = _run_translation(
-            chunks, target_lang, doc_context,
-            timer_ph, prog, render_stats, add_log,
-            len(missed), prefix_label=label,
-            glossary=glossary,
-            custom_rules=custom_rules or None,
-            source_lang=source_lang,
-        )
-        translations.update(new_translations)
-        st.session_state["word_translations"] = translations
-        st.session_state["word_tok_in"]      += tok_in
-        st.session_state["word_tok_out"]     += tok_out
-        st.session_state["word_translations_version"] = (
-            st.session_state.get("word_translations_version", 0) + 1
-        )
-        _finalize_job(timer_ph, prog, add_log, elapsed,
-                      len(missed), label, tok_in, tok_out)
-
-        # Validate updated output (so sánh media với bản gốc — P2.7)
-        try:
-            out_bytes = apply_translations(
-                st.session_state["word_docx_bytes"],
-                st.session_state["word_blocks"],
-                translations,
-            )
-            val = validate_docx_output(
-                out_bytes,
-                original_bytes=st.session_state["word_docx_bytes"],
-            )
-            skip_roles = st.session_state.get("word_skip_roles", set(NO_TRANSLATE_ROLES))
-            coverage_blocks = [
-                b for b in st.session_state["word_blocks"]
-                if b["role"] not in skip_roles
-            ]
-            coverage_missed = _find_output_coverage_missed(
-                out_bytes,
-                coverage_blocks,
-                translations,
-                source_lang,
-                target_lang,
-            )
-            if coverage_missed:
-                val["warnings"].append(
-                    f"Coverage scan: còn {len(coverage_missed):,} đoạn nghi chưa dịch sạch"
-                )
-            st.session_state["word_validation"] = val
-            st.session_state["word_output_coverage_missed"] = len(coverage_missed)
-            new_version = st.session_state["word_translations_version"]
-            st.session_state["word_translated_bytes_cache"] = {
-                "version": new_version, "bytes": out_bytes,
-            }
-            if not val["valid"]:
-                add_log(f"❌ Validate: {len(val['errors'])} lỗi")
-                for err in val["errors"][:3]:
-                    add_log(f"   • {err}")
-            else:
-                add_log(f"✅ Validate: {val['block_count']:,} paragraph, "
-                        f"{val['image_count']} ảnh — OK")
-            if coverage_missed:
-                add_log(f"⚠️ Coverage scan: {len(coverage_missed):,} đoạn output "
-                        "vẫn có dấu hiệu còn tiếng nguồn")
-            for warn in val["warnings"]:
-                add_log(f"⚠️ {warn}")
-        except Exception as e:
-            add_log(f"⚠️ Validate fail: {e}")
-
-        st.success(success_msg.format(n=len(missed)))
-
-    except Exception as e:
-        add_log(f"❌ Lỗi: {e}")
-        st.error(f"❌ Lỗi: {e}")
-        timer_ph.markdown(timer_error_html(str(e)), unsafe_allow_html=True)
-
-
-def _run_rescan():
-    blocks       = st.session_state["word_blocks"]
-    translations = st.session_state["word_translations"]
-    source_lang  = st.session_state.get("word_source_lang") or _resolve_langs()[1]
-    target_lang  = st.session_state.get("word_target_lang") or LANG_EN[st.session_state["word_lang"]]
-    skip_roles   = st.session_state.get("word_skip_roles", set(NO_TRANSLATE_ROLES))
-    candidates   = [b for b in blocks if b["role"] not in skip_roles]
-    missed       = find_missed(
-        candidates, translations,
-        source_lang=source_lang,
-        target_lang=target_lang,
-    )
-    _run_partial(
-        missed,
-        label="Quét",
-        heading=f"### 🔍 Quét bỏ sót — {len(missed):,} đoạn",
-        log_heading="### 📋 Nhật ký quét",
-        stat_label="Đoạn còn sót",
-        success_msg="✅ Đã dịch thêm {n:,} đoạn bị bỏ sót!",
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # CACHED TRANSLATED BYTES
 # ══════════════════════════════════════════════════════════════════════════════
 def _get_cached_translated_bytes() -> bytes:
@@ -694,7 +494,7 @@ def _clear_state():
         st.session_state.pop(k, None)
     for k in ("word_translated_bytes_cache", "word_translations_version",
               "word_validation", "word_role_toggles", "word_skip_roles",
-              "word_auto_missed_remaining", "word_output_coverage_missed",
+              "word_output_coverage_missed",
               "word_glossary_editor_ver",
               "word_image_ocr", "word_ocr_state",
               "word_batch_result"):
@@ -739,32 +539,6 @@ def _run_batch(uploaded_files, lang_word, source_lang: str, target_lang: str):
                     chunks, target_lang, doc_context,
                     timer_ph, prog_ph, _noop_stats, _noop_log,
                     len(translatable), prefix_label=uploaded.name[:20],
-                    glossary=glossary,
-                    source_lang=source_lang,
-                )
-                translations.update(new_tr)
-                timer_ph.empty()
-                prog_ph.empty()
-
-            for _pass_no in range(1, AUTO_RESCAN_PASSES + 1):
-                missed = find_missed(
-                    blocks, translations,
-                    source_lang=source_lang,
-                    target_lang=target_lang,
-                )
-                if not missed:
-                    break
-                chunks = chunk_blocks(missed)
-                timer_ph = st.empty()
-                prog_ph = st.empty()
-
-                def _noop_stats2(*_a, **_kw): pass
-                def _noop_log2(_msg): pass
-
-                new_tr, _, _, _ = _run_translation(
-                    chunks, target_lang, doc_context,
-                    timer_ph, prog_ph, _noop_stats2, _noop_log2,
-                    len(missed), prefix_label=f"{uploaded.name[:14]} scan",
                     glossary=glossary,
                     source_lang=source_lang,
                 )
@@ -915,18 +689,7 @@ def render():
     if "word_translations" in st.session_state:
         st.divider()
 
-        val          = st.session_state.get("word_validation")
-        blocks       = st.session_state["word_blocks"]
-        translations = st.session_state["word_translations"]
-        source_lang  = st.session_state.get("word_source_lang") or _resolve_langs()[1]
-        target_lang  = st.session_state.get("word_target_lang") or LANG_EN[st.session_state["word_lang"]]
-        skip_roles   = st.session_state.get("word_skip_roles", set(NO_TRANSLATE_ROLES))
-        candidates   = [b for b in blocks if b["role"] not in skip_roles]
-        missed       = find_missed(
-            candidates, translations,
-            source_lang=source_lang,
-            target_lang=target_lang,
-        )
+        val = st.session_state.get("word_validation")
 
         # 1) Validation errors (chỉ show khi LỖI — user không nên download)
         if val and not val["valid"]:
@@ -950,25 +713,13 @@ def render():
             type="primary",
         )
 
-        # 3) Rescan button — header/footer giờ dịch chung với body, không tách
-        rescan_clicked = st.button(
-            f"🔍  Quét bỏ sót ({len(missed)})",
-            disabled=(len(missed) == 0),
-            use_container_width=True, key="word_rescan_btn",
-            help="Dịch lại các đoạn bị API bỏ sót / fail",
-        )
-
-        # 4) OCR — section riêng, tách biệt (user dùng thường xuyên)
+        # 3) OCR — section riêng, tách biệt (user dùng thường xuyên)
         _render_ocr_section()
 
-        # 5) Tiny status — 1 dòng caption, không expander
+        # 4) Tiny status — 1 dòng caption, không expander
         summary_line = st.session_state.get("word_summary", "")
         if summary_line:
             st.caption(summary_line)
-
-        if rescan_clicked:
-            _run_rescan()
-            st.rerun()
 
     elif not uploaded_files:
         st.info("👆 Vui lòng upload file Word (.docx) để bắt đầu")

@@ -129,8 +129,7 @@ streamlit_app.py
 | **Thread-safe model fallback** | `gemini-3.5-flash` → `2.5-flash-lite` → `2.5-flash` → `2.0-flash` → ... (lock-protected) |
 | **Cached DOCX rebuild** | Version counter → `apply_translations` chỉ chạy khi translations thay đổi |
 | **H/F detection** | Detect cả H/F thật (docx structure) **và** text lặp lại ≥3 lần trong body (heuristic) |
-| **Skip H/F by default** | Lần dịch đầu chỉ làm body. Nút riêng để dịch H/F (cũng dùng TM auto) |
-| **Quét bỏ sót** | Phát hiện đoạn API fail (translation == original) → dịch lại (TM auto) |
+| **Coverage scan (thụ động)** | Sau khi dịch, quét output cảnh báo nếu còn đoạn nghi chưa dịch sạch (chỉ log, không tự dịch lại) |
 | **Inline edit** | `data_editor` — sửa trực tiếp bản dịch, cả body + H/F. Vai trò hiện kèm coord bảng (T#R#C#) |
 | **Filter editor** | "Chỉ hiển thị đoạn chưa dịch" + "Hiện cả Header/Footer" |
 | **Token + cost** | Cộng dồn input/output tokens → quy đổi USD/VND realtime từ pricing source-of-truth trong `config.py`. |
@@ -316,7 +315,6 @@ File download riêng: `*_translated_<lang>_ocr_caption.docx` hoặc `*_translate
 ### UX / editor
 
 - Side-by-side preview file gốc vs bản dịch.
-- Diff bản dịch cũ vs bản mới khi rescan.
 - Undo per paragraph trong inline editor.
 - Batch UI rõ hơn cho nhiều file lớn.
 - Export bilingual theo styles.
