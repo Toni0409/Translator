@@ -827,57 +827,61 @@ def _run_ocr(state: dict):
 
 
 def _render_ocr_review(state: dict):
-    """P2.1+P2.2+U2+U3+U4: review từng occurrence + chọn mode + download."""
+    """Review từng occurrence + chọn ảnh + sửa bản dịch + xuất (caption mode).
+
+    Layout: ảnh to, OCR gốc & ô bản dịch đặt CẠNH NHAU; cost gom 1 dòng + nút
+    Xuất / Tải / Quét lại gom vào 1 hàng cho gọn.
+    """
     occs    = state["occurrences"]
     results = state["results"]
     total   = results.get("_total", {})
 
-    # Summary actual cost
-    sc1, sc2, sc3, sc4 = st.columns(4)
-    sc1.metric("Ảnh OCR", f"{total.get('n_called', 0):,}")
-    sc2.metric("Tokens", f"{total.get('tok_in', 0):,} in / {total.get('tok_out', 0):,} out")
-    sc3.metric("USD", f"${total.get('usd', 0):.4f}")
-    sc4.metric("VND", f"{total.get('vnd', 0):,.0f}")
-
-    # Group: có text / không text + lỗi
+    # Group: có text / không text / lỗi
     with_text = [o for o in occs if results.get(o["id"], {}).get("has_text")]
     no_text   = [o for o in occs
                  if not results.get(o["id"], {}).get("has_text")
                  and not results.get(o["id"], {}).get("error")]
     errors    = [o for o in occs if results.get(o["id"], {}).get("error")]
 
-    # Bulk select buttons
+    # ── Thanh trên: cost gom 1 dòng + chọn tất cả / bỏ chọn ─────────────
+    bar_l, bar_m, bar_r = st.columns([3, 1, 1])
+    bar_l.markdown(
+        f"**{total.get('n_called', 0):,} ảnh OCR**  ·  "
+        f"{total.get('tok_in', 0):,} in / {total.get('tok_out', 0):,} out tok  ·  "
+        f"**${total.get('usd', 0):.4f}** ≈ {total.get('vnd', 0):,.0f} VND"
+    )
     if with_text:
-        b1, b2, _ = st.columns([1, 1, 2])
-        if b1.button("✅ Chọn tất cả ảnh có chữ", key="word_ocr_select_all"):
+        if bar_m.button("✅ Chọn tất cả", key="word_ocr_select_all",
+                        use_container_width=True):
             for o in with_text:
                 state["selection"][o["id"]] = True
             st.rerun()
-        if b2.button("⬜ Bỏ chọn tất cả", key="word_ocr_deselect_all"):
+        if bar_r.button("⬜ Bỏ chọn", key="word_ocr_deselect_all",
+                        use_container_width=True):
             for o in with_text:
                 state["selection"][o["id"]] = False
             st.rerun()
 
-    # Output mode (U3)
-    st.divider()
-
-    # Per-image review (P2.1)
+    # ── Review từng ảnh: ảnh to + OCR & bản dịch cạnh nhau ──────────────
     if with_text:
         st.markdown(f"##### 📷 Ảnh có chữ — {len(with_text)}")
         for o in with_text:
             r = results.get(o["id"], {})
             with st.container(border=True):
-                col_img, col_info = st.columns([1, 2])
-                with col_img:
-                    st.image(o["data"], width=220,
-                             caption=f"{o['filename']}  ·  occ #{o['occurrence_index']}")
-                    st.caption(f"Part: `{o['doc_part'].rsplit('/', 1)[-1]}`  ·  "
-                               f"rId: `{o['rId']}`")
-                    st.caption(f"💵 ${r.get('usd', 0):.4f}  ·  "
-                               f"{r.get('tok_in', 0)}+{r.get('tok_out', 0)} tok"
-                               + (f"  ·  conf {r.get('confidence', 0):.2f}"
-                                  if r.get('confidence') else ""))
-                with col_info:
+                img_col, meta_col = st.columns([3, 2])
+                with img_col:
+                    st.image(o["data"], use_container_width=True)
+                with meta_col:
+                    st.caption(
+                        f"`{o['filename']}`  ·  occ #{o['occurrence_index']}  ·  "
+                        f"part `{o['doc_part'].rsplit('/', 1)[-1]}`"
+                    )
+                    st.caption(
+                        f"💵 ${r.get('usd', 0):.4f}  ·  "
+                        f"{r.get('tok_in', 0)}+{r.get('tok_out', 0)} tok"
+                        + (f"  ·  conf {r.get('confidence', 0):.2f}"
+                           if r.get('confidence') else "")
+                    )
                     state["selection"][o["id"]] = st.checkbox(
                         "📎 Đưa ảnh này vào file xuất",
                         value=state["selection"].get(o["id"], True),
@@ -888,16 +892,22 @@ def _render_ocr_review(state: dict):
                         value=state["keep_original"].get(o["id"], True),
                         key=f"word_ocr_keep_{o['id']}",
                     )
-                    with st.expander("📜 OCR (gốc)", expanded=False):
-                        st.text(r.get("ocr", ""))
-                    state["edited"][o["id"]] = st.text_area(
-                        "✏️ Bản dịch — chỉnh trước khi xuất:",
-                        value=state["edited"].get(o["id"], r.get("translation", "")),
-                        height=120,
-                        key=f"word_ocr_edit_{o['id']}",
-                    )
+                ocr_col, tr_col = st.columns(2)
+                ocr_col.text_area(
+                    "📜 OCR (gốc)",
+                    value=r.get("ocr", ""),
+                    height=170,
+                    disabled=True,
+                    key=f"word_ocr_src_{o['id']}",
+                )
+                state["edited"][o["id"]] = tr_col.text_area(
+                    "✏️ Bản dịch — sửa trước khi xuất:",
+                    value=state["edited"].get(o["id"], r.get("translation", "")),
+                    height=170,
+                    key=f"word_ocr_edit_{o['id']}",
+                )
 
-    # No-text group + errors (collapsed by default — P2.1: nhóm riêng, không chọn)
+    # ── Không phát hiện chữ / lỗi (gập sẵn) ─────────────────────────────
     if no_text or errors:
         with st.expander(
             f"⚠️ Không phát hiện chữ / lỗi — {len(no_text)} không text · {len(errors)} lỗi",
@@ -916,19 +926,16 @@ def _render_ocr_review(state: dict):
                     c1.image(o["data"], width=120, caption=o["filename"])
                     c2.warning(f"Lỗi OCR: {r.get('error', '?')[:150]}")
 
-    # Export (U4)
+    # ── Khu xuất gom gọn: summary + Xuất / Tải / Quét lại trên 1 hàng ───
     st.divider()
     selected = [o for o in occs if state["selection"].get(o["id"])]
-    st.caption(
-        f"📤 Sẽ xuất: **{len(selected)} ảnh** — chèn bản dịch dưới mỗi ảnh "
-        f"· chi phí actual: **${total.get('usd', 0):.4f}** ≈ {total.get('vnd', 0):,.0f} VND"
-    )
+    st.caption(f"📤 Sẽ xuất **{len(selected)} ảnh** — chèn bản dịch dưới mỗi ảnh.")
 
-    if not selected:
-        st.info("Tick chọn ít nhất 1 ảnh để xuất.")
-    else:
+    exp_col, dl_col, rs_col = st.columns([2, 2, 1])
+    with exp_col:
         if st.button("⬇️ Xuất DOCX với OCR", type="primary",
-                     use_container_width=True, key="word_ocr_export_btn"):
+                     use_container_width=True, key="word_ocr_export_btn",
+                     disabled=not selected):
             state["export"]       = None
             state["export_error"] = None
             try:
@@ -942,26 +949,32 @@ def _render_ocr_review(state: dict):
                 import traceback
                 state["export_error"] = f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
             st.rerun()
+    with dl_col:
+        if state.get("export"):
+            st.download_button(
+                label="📥 Tải file đã xuất",
+                data=state["export"]["bytes"],
+                file_name=state["export"]["name"],
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                key="word_ocr_download_final",
+            )
+        else:
+            st.button("📥 Tải file đã xuất", disabled=True,
+                      use_container_width=True, key="word_ocr_dl_placeholder")
+    with rs_col:
+        if st.button("🔁 Quét lại", use_container_width=True,
+                     key="word_ocr_restart"):
+            _reset_ocr_state()
+            st.rerun()
 
-    # Persist download / error qua rerun
+    if not selected:
+        st.caption("ℹ️ Tick chọn ít nhất 1 ảnh để bật nút xuất.")
     if state.get("export_error"):
         st.error("❌ Xuất DOCX thất bại:")
         st.code(state["export_error"])
     elif state.get("export"):
-        exp = state["export"]
-        st.success(f"✅ Đã tạo file `{exp['name']}` — bấm để tải.")
-        st.download_button(
-            label=f"📥 Tải {exp['name']}",
-            data=exp["bytes"],
-            file_name=exp["name"],
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-            key="word_ocr_download_final",
-        )
-
-    if st.button("🔁 Quét lại OCR", key="word_ocr_restart"):
-        _reset_ocr_state()
-        st.rerun()
+        st.success(f"✅ Đã tạo `{state['export']['name']}` — bấm 📥 Tải file đã xuất.")
 
 
 def _build_ocr_export_bytes(state: dict, selected: list[dict]) -> tuple[bytes, str]:
