@@ -843,67 +843,43 @@ def _render_ocr_review(state: dict):
                  and not results.get(o["id"], {}).get("error")]
     errors    = [o for o in occs if results.get(o["id"], {}).get("error")]
 
-    # ── Thanh trên: cost gom 1 dòng + chọn tất cả / bỏ chọn ─────────────
-    bar_l, bar_m, bar_r = st.columns([3, 1, 1])
-    bar_l.markdown(
+    # ── Cost gom 1 dòng ─────────────────────────────────────────────────
+    st.markdown(
         f"**{total.get('n_called', 0):,} ảnh OCR**  ·  "
         f"{total.get('tok_in', 0):,} in / {total.get('tok_out', 0):,} out tok  ·  "
         f"**${total.get('usd', 0):.4f}** ≈ {total.get('vnd', 0):,.0f} VND"
     )
-    if with_text:
-        if bar_m.button("✅ Chọn tất cả", key="word_ocr_select_all",
-                        use_container_width=True):
-            for o in with_text:
-                state["selection"][o["id"]] = True
-            st.rerun()
-        if bar_r.button("⬜ Bỏ chọn", key="word_ocr_deselect_all",
-                        use_container_width=True):
-            for o in with_text:
-                state["selection"][o["id"]] = False
-            st.rerun()
 
-    # ── Review từng ảnh: ảnh to + OCR & bản dịch cạnh nhau ──────────────
+    # ── Review từng ảnh: ảnh + OCR gốc & bản dịch cạnh nhau ─────────────
     if with_text:
         st.markdown(f"##### 📷 Ảnh có chữ — {len(with_text)}")
+        st.caption(
+            "Mỗi ảnh sẽ được chèn bản dịch ở DƯỚI ảnh khi xuất. "
+            "Muốn bỏ ảnh nào → xoá trống ô bản dịch của ảnh đó."
+        )
         for o in with_text:
             r = results.get(o["id"], {})
             with st.container(border=True):
-                img_col, meta_col = st.columns([3, 2])
-                with img_col:
-                    st.image(o["data"], use_container_width=True)
-                with meta_col:
-                    st.caption(
-                        f"`{o['filename']}`  ·  occ #{o['occurrence_index']}  ·  "
-                        f"part `{o['doc_part'].rsplit('/', 1)[-1]}`"
-                    )
-                    st.caption(
-                        f"💵 ${r.get('usd', 0):.4f}  ·  "
-                        f"{r.get('tok_in', 0)}+{r.get('tok_out', 0)} tok"
-                        + (f"  ·  conf {r.get('confidence', 0):.2f}"
-                           if r.get('confidence') else "")
-                    )
-                    state["selection"][o["id"]] = st.checkbox(
-                        "📎 Đưa ảnh này vào file xuất",
-                        value=state["selection"].get(o["id"], True),
-                        key=f"word_ocr_pick_{o['id']}",
-                    )
-                    state["keep_original"][o["id"]] = st.checkbox(
-                        "🖼 Giữ ảnh gốc",
-                        value=state["keep_original"].get(o["id"], True),
-                        key=f"word_ocr_keep_{o['id']}",
-                    )
-                ocr_col, tr_col = st.columns(2)
+                st.caption(
+                    f"📄 `{o['filename']}`  ·  occ #{o['occurrence_index']}  ·  "
+                    f"part `{o['doc_part'].rsplit('/', 1)[-1]}`  ·  "
+                    f"💵 ${r.get('usd', 0):.4f}"
+                    + (f"  ·  conf {r.get('confidence', 0):.2f}"
+                       if r.get('confidence') else "")
+                )
+                img_col, ocr_col, tr_col = st.columns([6, 4, 5])
+                img_col.image(o["data"], use_container_width=True)
                 ocr_col.text_area(
                     "📜 OCR (gốc)",
                     value=r.get("ocr", ""),
-                    height=170,
+                    height=180,
                     disabled=True,
                     key=f"word_ocr_src_{o['id']}",
                 )
                 state["edited"][o["id"]] = tr_col.text_area(
-                    "✏️ Bản dịch — sửa trước khi xuất:",
+                    "✏️ Bản dịch (xoá trống = bỏ ảnh này)",
                     value=state["edited"].get(o["id"], r.get("translation", "")),
-                    height=170,
+                    height=180,
                     key=f"word_ocr_edit_{o['id']}",
                 )
 
@@ -928,7 +904,7 @@ def _render_ocr_review(state: dict):
 
     # ── Khu xuất gom gọn: summary + Xuất / Tải / Quét lại trên 1 hàng ───
     st.divider()
-    selected = [o for o in occs if state["selection"].get(o["id"])]
+    selected = [o for o in occs if (state["edited"].get(o["id"]) or "").strip()]
     st.caption(f"📤 Sẽ xuất **{len(selected)} ảnh** — chèn bản dịch dưới mỗi ảnh.")
 
     exp_col, dl_col, rs_col = st.columns([2, 2, 1])
@@ -969,7 +945,7 @@ def _render_ocr_review(state: dict):
             st.rerun()
 
     if not selected:
-        st.caption("ℹ️ Tick chọn ít nhất 1 ảnh để bật nút xuất.")
+        st.caption("ℹ️ Chưa có ảnh nào có bản dịch để xuất (mọi ô bản dịch đang trống).")
     if state.get("export_error"):
         st.error("❌ Xuất DOCX thất bại:")
         st.code(state["export_error"])
@@ -986,8 +962,7 @@ def _build_ocr_export_bytes(state: dict, selected: list[dict]) -> tuple[bytes, s
     base_bytes   = _get_cached_translated_bytes()
     selected_ids = [o["id"] for o in selected]
     edited       = {oid: state["edited"].get(oid, "") for oid in selected_ids}
-    remove_ids   = [o["id"] for o in selected
-                    if not state["keep_original"].get(o["id"], True)]
+    remove_ids   = []   # caption mode: luôn giữ ảnh gốc (caption nằm dưới ảnh)
 
     out_bytes = insert_ocr_captions_into_docx(
         base_bytes, state["occurrences"], state["results"],
