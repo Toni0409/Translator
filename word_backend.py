@@ -1295,9 +1295,136 @@ def validate_docx_output(docx_bytes: bytes,
     return result
 
 
-def _is_untranslated(b: dict, translations: dict) -> bool:
-    tr = translations.get(b["id"], "")
-    return (not tr) or tr == b["text"]
+_ASCII_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z']*\b")
+_VI_DIACRITIC_RE = re.compile(
+    r"[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệ"
+    r"íìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]",
+    re.IGNORECASE,
+)
+
+_EN_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "before", "by",
+    "for", "from", "has", "have", "if", "in", "into", "is", "it", "must",
+    "of", "on", "or", "shall", "should", "that", "the", "this", "to",
+    "was", "were", "when", "where", "which", "with",
+}
+_EN_TECH_TERMS = {
+    "assembly", "brake", "buffer", "button", "cabin", "cable", "call",
+    "car", "chain", "comb", "commissioning", "control", "controller",
+    "current", "device", "dimension", "door", "drawing", "drive",
+    "elevator", "escalator", "floor", "frequency", "governor", "guide",
+    "handrail", "hoistway", "inspection", "installation", "landing",
+    "load", "machine", "maintenance", "motor", "operation", "panel",
+    "pit", "power", "pulley", "rail", "requirement", "revision", "room",
+    "rope", "safety", "shaft", "speed", "standard", "step", "supply",
+    "switch", "test", "voltage", "warning",
+}
+_PROTECTED_EN_TOKENS = {
+    "ac", "ag", "api", "asme", "dc", "din", "en", "iec", "iso", "jis",
+    "led", "pdf", "qr", "tcvn", "ui", "url", "usb", "vnd",
+}
+_VI_COMMON_WORDS = {
+    "cua", "va", "la", "cho", "duoc", "khong", "trong", "voi", "tu",
+    "den", "khi", "neu", "thi", "phai", "can", "cac", "mot", "nhung",
+    "chua", "kiem", "tra", "van", "hanh", "thang", "may",
+}
+
+
+def _norm_text(text: str) -> str:
+    """Normalize for untranslated comparison."""
+    text = strip_tags(str(text or ""))
+    text = _TABLE_PREFIX_RE.sub("", text)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _strip_protected_english_spans(text: str) -> str:
+    """Remove codes/standards that are allowed to stay in English."""
+    text = re.sub(
+        r"\b(?:EN|ISO|ASME|TCVN|IEC|DIN|JIS)\s*[-:/A-Z0-9.]*\d[-:/A-Z0-9.]*\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\b[A-Z]{2,}[-_/]?\d[A-Z0-9._/-]*\b", " ", text)
+    text = re.sub(r"\b\d+(?:[.,]\d+)?\s*(?:mm|cm|m|kg|kn|v|hz|kw|rpm|m/s|c)\b", " ", text, flags=re.IGNORECASE)
+    return text
+
+
+def _english_residue(text: str) -> bool:
+    cleaned = _strip_protected_english_spans(strip_tags(str(text or "")))
+    tokens_raw = _ASCII_WORD_RE.findall(cleaned)
+    candidates: list[str] = []
+
+    for raw in tokens_raw:
+        token = raw.strip("'")
+        lower = token.lower()
+        if len(lower) <= 2:
+            continue
+        if lower in _PROTECTED_EN_TOKENS:
+            continue
+        if token.isupper() and len(token) <= 6:
+            continue
+        candidates.append(lower)
+
+    if not candidates:
+        return False
+
+    stop_hits = sum(1 for t in candidates if t in _EN_STOPWORDS)
+    tech_hits = sum(1 for t in candidates if t in _EN_TECH_TERMS)
+
+    if stop_hits >= 2:
+        return True
+    if stop_hits >= 1 and len(candidates) >= 3:
+        return True
+    if tech_hits >= 2:
+        return True
+
+    return False
+
+
+def _vietnamese_residue(text: str) -> bool:
+    raw = str(text or "")
+    if _VI_DIACRITIC_RE.search(raw):
+        return True
+    tokens = [t.lower() for t in _ASCII_WORD_RE.findall(raw)]
+    return sum(1 for t in tokens if t in _VI_COMMON_WORDS) >= 2
+
+
+def has_source_language_residue(text: str,
+                                source_lang: str | None = None,
+                                target_lang: str | None = None) -> bool:
+    """Heuristic guard for translations that still contain source language."""
+    source = (source_lang or "").lower()
+    target = (target_lang or "").lower()
+    if source == "english" and target == "vietnamese":
+        return _english_residue(text)
+    if source == "vietnamese" and target == "english":
+        return _vietnamese_residue(text)
+    return False
+
+
+def _is_untranslated(b: dict, translations: dict,
+                     source_lang: str | None = None,
+                     target_lang: str | None = None,
+                     output_block: dict | None = None) -> bool:
+    tr = _resolve_translation(b, translations) or ""
+    if not str(tr).strip():
+        return True
+
+    if _norm_text(tr) == _norm_text(b["text"]):
+        return True
+
+    if has_source_language_residue(tr, source_lang, target_lang):
+        return True
+
+    if output_block is not None:
+        out_text = output_block.get("text", "")
+        if _norm_text(out_text) == _norm_text(b["text"]):
+            return True
+        if has_source_language_residue(out_text, source_lang, target_lang):
+            return True
+
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1341,11 +1468,22 @@ def checkpoint_clear(docx_bytes: bytes, target_lang: str) -> None:
         pass
 
 
-def find_missed(blocks: list[dict], translations: dict) -> list[dict]:
-    """Trả list block translatable chưa dịch (translation rỗng hoặc bằng text gốc)."""
-    return [b for b in blocks
-            if b["role"] not in NO_TRANSLATE_ROLES
-            and _is_untranslated(b, translations)]
+def find_missed(blocks: list[dict], translations: dict,
+                source_lang: str | None = None,
+                target_lang: str | None = None,
+                output_blocks: list[dict] | None = None) -> list[dict]:
+    """Return translatable blocks that still look untranslated."""
+    output_by_id = {b["id"]: b for b in (output_blocks or [])}
+    return [
+        b for b in blocks
+        if b["role"] not in NO_TRANSLATE_ROLES
+        and _is_untranslated(
+            b, translations,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            output_block=output_by_id.get(b["id"]),
+        )
+    ]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

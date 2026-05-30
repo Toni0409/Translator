@@ -19,6 +19,7 @@ SCRIPTS = [
     "smoke_domain.py",
     "smoke_checkpoint.py",
     "smoke_direction.py",
+    "smoke_missed_scan.py",
     "smoke_ocr.py",
 ]
 

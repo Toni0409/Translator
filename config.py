@@ -41,6 +41,7 @@ CHUNK_RETRIES      = 3         # số lần retry mỗi chunk khi lỗi
 TARGET_CHUNK_CHARS = 8_000     # mục tiêu ký tự / chunk (adaptive)
 MIN_CHUNK_BLOCKS   = 8         # tối thiểu paragraph / chunk
 MAX_CHUNK_BLOCKS   = 40        # tối đa paragraph / chunk
+AUTO_RESCAN_PASSES = 2         # tự quét/dịch bù sau full translation
 
 # H/F detection: text lặp lại ≥ HF_REPEAT_THRESHOLD lần (và dài ≥ HF_REPEAT_MIN_CHARS)
 # → đánh dấu là body_repeated. Vẫn dịch (xem `NO_TRANSLATE_ROLES`).
