@@ -46,6 +46,12 @@ MAX_WORD_WORKERS   = 16        # số chunk dịch song song (ThreadPoolExecutor
                                # → Gặp 429 liên tục thì hạ về 8; tier cao + doc
                                #   rất lớn có thể nâng 24–32.
 CHUNK_RETRIES      = 3         # số lần retry mỗi chunk khi lỗi
+# Dịch bù (coverage backfill): sau khi dịch 1 chunk, block nào model TRẢ VỀ THIẾU
+# (JSON rỗng/hỏng/bỏ sót item) hoặc bản dịch CÒN tiếng nguồn sẽ được dịch lại theo
+# sub-chunk nhỏ. Đây là lưới an toàn chống "dịch sót" — nguyên nhân chính khiến cả
+# 1 chunk đôi khi giữ nguyên tiếng Anh khi model trả response lỗi/rỗng.
+COVERAGE_RETRY_ROUNDS = 2      # số vòng dịch bù tối đa (0 = tắt)
+RETRY_SUBCHUNK_BLOCKS = 6      # kích thước sub-chunk khi dịch bù (nhỏ → ít lỗi lặp lại)
 TARGET_CHUNK_CHARS = 8_000     # mục tiêu ký tự / chunk (adaptive)
 MIN_CHUNK_BLOCKS   = 8         # tối thiểu paragraph / chunk
 MAX_CHUNK_BLOCKS   = 40        # tối đa paragraph / chunk

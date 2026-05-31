@@ -26,6 +26,7 @@ from config import (
     WORD_MODELS, MAX_WORD_TOKENS, MAX_WORD_WORKERS, NO_TRANSLATE_ROLES,
     CHUNK_RETRIES, TARGET_CHUNK_CHARS, MIN_CHUNK_BLOCKS, MAX_CHUNK_BLOCKS,
     HF_REPEAT_THRESHOLD, HF_REPEAT_MIN_CHARS,
+    COVERAGE_RETRY_ROUNDS, RETRY_SUBCHUNK_BLOCKS,
 )
 from gemini import generate, usage_tokens, parse_json_loose
 
@@ -1041,7 +1042,13 @@ def translate_chunk(client, chunk: list[dict], target_lang: str,
                     source_lang: str | None = None) -> tuple[dict, int, int]:
     """
     Dịch 1 chunk → (translations_dict, in_tokens, out_tokens).
-    RAISE exception nếu API fail. Block bị model bỏ sót → fallback giữ text gốc.
+    RAISE exception nếu API fail.
+
+    `translations_dict` CHỈ chứa các id mà model THỰC SỰ trả về (text non-empty,
+    đã strip prefix). Block bị model bỏ sót / trả rỗng sẽ KHÔNG có trong dict —
+    `translate_chunk_with_retry` chịu trách nhiệm dịch bù hoặc backfill text gốc.
+    (Trước đây hàm này tự `setdefault` text gốc → response rỗng/hỏng bị "nuốt"
+    thành công giả, khiến cả chunk giữ nguyên tiếng nguồn mà không ai phát hiện.)
     """
     prompt = _build_chunk_prompt(
         chunk, target_lang, doc_context,
@@ -1055,13 +1062,29 @@ def translate_chunk(client, chunk: list[dict], target_lang: str,
     result = {}
     for item in parsed:
         if isinstance(item, dict) and item.get("id") and item.get("text") is not None:
-            text = str(item["text"])
-            text = _TABLE_PREFIX_RE.sub("", text)   # AI lỡ giữ prefix → strip
-            result[item["id"]] = text
-    for b in chunk:
-        # Fallback: nếu có tagged thì dùng tagged để preserve format khi không dịch được
-        result.setdefault(b["id"], b.get("text_tagged") or b["text"])
+            text = _TABLE_PREFIX_RE.sub("", str(item["text"]))   # AI lỡ giữ prefix → strip
+            if text.strip():
+                result[item["id"]] = text
     return result, in_t, out_t
+
+
+def _subchunks(blocks: list[dict], size: int) -> list[list[dict]]:
+    """Chia list block thành các sub-chunk ≤ size phần tử."""
+    size = max(1, size)
+    return [blocks[i:i + size] for i in range(0, len(blocks), size)]
+
+
+def _pending_blocks(chunk: list[dict], result: dict,
+                    source_lang: str | None, target_lang: str | None) -> list[dict]:
+    """Block cần dịch (lại): model trả thiếu/rỗng, hoặc bản dịch CÒN tiếng nguồn."""
+    pending = []
+    for b in chunk:
+        tr = result.get(b["id"])
+        if not tr or not str(tr).strip():
+            pending.append(b)                                  # model bỏ sót
+        elif has_source_language_residue(tr, source_lang, target_lang):
+            pending.append(b)                                  # còn tiếng nguồn
+    return pending
 
 
 def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
@@ -1073,13 +1096,20 @@ def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
                                source_lang: str | None = None,
                                ) -> tuple[dict, int, int, str | None]:
     """
-    Wrapper với exponential backoff. Trả về (translations, in_t, out_t, error).
-    Nếu hết retries:
-    - Nếu chunk có >1 block: thử dịch lại từng block riêng lẻ (smart fallback).
-    - Nếu block đơn hoặc smart fallback cũng fail → giữ text gốc + error message.
+    Dịch 1 chunk, đảm bảo COVERAGE. Trả về (translations, in_t, out_t, error).
+
+    1. Dịch cả chunk, retry exponential backoff khi API raise.
+    2. Dịch bù: block nào model bỏ sót / trả về còn tiếng nguồn → dịch lại theo
+       sub-chunk nhỏ (RETRY_SUBCHUNK_BLOCKS), tối đa COVERAGE_RETRY_ROUNDS vòng.
+       Sub-chunk nhỏ tránh lặp lại lỗi "cả chunk lớn trả rỗng/hỏng" — đây là
+       lưới an toàn chính chống dịch sót.
+    3. Last resort: block vẫn chưa dịch được → giữ text gốc (preserve format).
     """
+    result: dict = {}
     last_err = None
     tok_in_total = tok_out_total = 0
+
+    # Phase 1 — dịch cả chunk, retry khi API lỗi
     for attempt in range(retries):
         try:
             t, in_t, out_t = translate_chunk(
@@ -1087,32 +1117,46 @@ def translate_chunk_with_retry(client, chunk: list[dict], target_lang: str,
                 glossary=glossary, custom_rules=custom_rules,
                 source_lang=source_lang,
             )
-            return t, in_t, out_t, None
+            result.update(t)
+            tok_in_total  += in_t
+            tok_out_total += out_t
+            last_err = None
+            break
         except Exception as e:
             last_err = str(e)
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)   # 1s, 2s, 4s
 
-    # Final failure — smart fallback: retry each block individually
-    if fallback_individually and len(chunk) > 1:
-        result = {}
-        for block in chunk:
-            try:
-                t_single, in_t, out_t = translate_chunk(
-                    client, [block], target_lang, doc_context,
-                    glossary=glossary, custom_rules=custom_rules,
-                    source_lang=source_lang,
-                )
-                result.update(t_single)
-                tok_in_total  += in_t
-                tok_out_total += out_t
-            except Exception:
-                # Individual block failed — keep original
-                result[block["id"]] = block.get("text_tagged") or block["text"]
-        return result, tok_in_total, tok_out_total, last_err
+    # Phase 2 — dịch bù theo sub-chunk nhỏ cho block bị sót / còn tiếng nguồn
+    if fallback_individually and COVERAGE_RETRY_ROUNDS > 0:
+        rounds = 0
+        pending = _pending_blocks(chunk, result, source_lang, target_lang)
+        while pending and rounds < COVERAGE_RETRY_ROUNDS:
+            rounds += 1
+            for sub in _subchunks(pending, RETRY_SUBCHUNK_BLOCKS):
+                try:
+                    t, in_t, out_t = translate_chunk(
+                        client, sub, target_lang, doc_context,
+                        glossary=glossary, custom_rules=custom_rules,
+                        source_lang=source_lang,
+                    )
+                    result.update(t)
+                    tok_in_total  += in_t
+                    tok_out_total += out_t
+                except Exception as e:
+                    last_err = str(e)
+            pending = _pending_blocks(chunk, result, source_lang, target_lang)
 
-    fallback = {b["id"]: b.get("text_tagged") or b["text"] for b in chunk}
-    return fallback, 0, 0, last_err
+    # Phase 3 — last resort: giữ text gốc cho block vẫn chưa dịch được
+    n_missing = 0
+    for b in chunk:
+        if b["id"] not in result:
+            result[b["id"]] = b.get("text_tagged") or b["text"]
+            n_missing += 1
+    if n_missing and not last_err:
+        last_err = f"{n_missing} đoạn không dịch được (giữ nguyên gốc)"
+
+    return result, tok_in_total, tok_out_total, last_err
 
 
 # ══════════════════════════════════════════════════════════════════════════════
