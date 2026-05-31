@@ -89,6 +89,29 @@ def main() -> int:
             ),
         )
 
+        # Mã/số/đơn vị/tên riêng giữ nguyên → KHÔNG phải 'sót' (giảm báo động giả)
+        report.check(
+            "model code unchanged is NOT missed",
+            not find_missed([block("p2", "MMF049")], {"p2": "MMF049"},
+                            "English", "Vietnamese"),
+        )
+        report.check(
+            "number+unit unchanged is NOT missed",
+            not find_missed([block("p3", "707 x 425 x 151 mm")],
+                            {"p3": "707 x 425 x 151 mm"}, "English", "Vietnamese"),
+        )
+        report.check(
+            "company name unchanged is NOT missed",
+            not find_missed([block("p4", "INVENTIO AG")], {"p4": "INVENTIO AG"},
+                            "English", "Vietnamese"),
+        )
+        # Văn xuôi thật mà giữ nguyên gốc → VẪN phải báo sót
+        report.check(
+            "real prose unchanged IS still missed",
+            bool(find_missed([block("p5", "Final check")], {"p5": "Final check"},
+                             "English", "Vietnamese")),
+        )
+
         return report.summary()
     finally:
         cleanup()

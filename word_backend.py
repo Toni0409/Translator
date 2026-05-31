@@ -1429,6 +1429,26 @@ def _strip_protected_english_spans(text: str) -> str:
     return text
 
 
+# Run ≥3 chữ cái (kể cả có dấu tiếng Việt), KHÔNG gồm chữ số / gạch dưới.
+_WORDISH_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
+
+
+def _has_translatable_text(text: str) -> bool:
+    """True nếu text còn 'chữ cần dịch' — tức có từ ngữ thường, KHÔNG phải chỉ
+    mã/số/đơn vị/acronym/tên riêng viết HOA (vd: 'MMF049', '32 kg', 'INVENTIO AG',
+    '707 x 425 x 151 mm', 'VAP033').
+
+    Dùng để KHÔNG coi đoạn mã/số giữ nguyên là 'dịch sót' (giảm báo động giả của
+    find_missed). Một token tính là 'chữ cần dịch' nếu dài ≥3 và có ÍT NHẤT 1 chữ
+    thường — đủ để loại acronym/mã viết hoa toàn bộ nhưng vẫn nhận diện văn xuôi.
+    """
+    cleaned = _strip_protected_english_spans(strip_tags(str(text or "")))
+    for w in _WORDISH_RE.findall(cleaned):
+        if any(ch.islower() for ch in w):
+            return True
+    return False
+
+
 def _english_residue(text: str) -> bool:
     cleaned = _strip_protected_english_spans(strip_tags(str(text or "")))
     tokens_raw = _ASCII_WORD_RE.findall(cleaned)
@@ -1490,7 +1510,12 @@ def _is_untranslated(b: dict, translations: dict,
     if not str(tr).strip():
         return True
 
-    if _norm_text(tr) == _norm_text(b["text"]):
+    src = b["text"]
+    # Giữ NGUYÊN gốc chỉ tính là 'sót' khi gốc thực sự có chữ cần dịch — mã/số/
+    # đơn vị/tên riêng (MMF049, 32 kg, INVENTIO AG) giữ nguyên là ĐÚNG, bỏ qua.
+    src_translatable = _has_translatable_text(src)
+
+    if src_translatable and _norm_text(tr) == _norm_text(src):
         return True
 
     if has_source_language_residue(tr, source_lang, target_lang):
@@ -1498,7 +1523,7 @@ def _is_untranslated(b: dict, translations: dict,
 
     if output_block is not None:
         out_text = output_block.get("text", "")
-        if _norm_text(out_text) == _norm_text(b["text"]):
+        if src_translatable and _norm_text(out_text) == _norm_text(src):
             return True
         if has_source_language_residue(out_text, source_lang, target_lang):
             return True
