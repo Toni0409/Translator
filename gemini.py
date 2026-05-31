@@ -1,6 +1,5 @@
-"""Shared Gemini client + low-level helpers (threaded call, JSON parsing)."""
+"""Shared Gemini client + low-level helpers (generate, token usage, JSON parsing)."""
 import json
-import threading
 
 import streamlit as st
 from google import genai
@@ -11,20 +10,8 @@ from config import API_KEY
 
 @st.cache_resource
 def get_client():
-    """Single Gemini client cho cả PDF và Word tab."""
+    """Single Gemini client (cached) cho Word tab."""
     return genai.Client(api_key=API_KEY)
-
-
-def call_in_thread(target, *args) -> dict:
-    """
-    Chạy `target(result_holder, *args)` trong thread riêng.
-    `target` phải set `result_holder["result"]` hoặc `result_holder["error"]`.
-    Trả về dict {thread, result_holder} để caller poll.
-    """
-    holder = {}
-    t = threading.Thread(target=target, args=(holder, *args), daemon=True)
-    t.start()
-    return {"thread": t, "holder": holder}
 
 
 def generate(client, model: str, prompt: str,
